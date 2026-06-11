@@ -1,0 +1,50 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+WHISPER="$HOME/tools/whisper.cpp/build/bin/whisper-cli"
+MODEL="$HOME/tools/whisper.cpp/models/ggml-base.en.bin"
+
+TMP_DIR="/tmp/voice-prompt"
+mkdir -p "$TMP_DIR"
+
+AUDIO="$TMP_DIR/prompt.wav"
+OUT="$TMP_DIR/prompt"
+
+echo "Press Enter to start recording."
+read -r
+
+echo "Recording... press Enter to stop."
+
+arecord -f S16_LE -r 16000 -c 1 "$AUDIO" >/dev/null 2>&1 &
+REC_PID=$!
+
+read -r
+
+kill "$REC_PID" 2>/dev/null || true
+wait "$REC_PID" 2>/dev/null || true
+
+echo "Transcribing..."
+
+"$WHISPER" \
+  -m "$MODEL" \
+  -f "$AUDIO" \
+  -otxt \
+  -of "$OUT" \
+  -nt \
+  -np >/dev/null 2>&1
+
+TEXT="$(cat "$OUT.txt" | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')"
+
+echo
+echo "$TEXT"
+echo
+
+if command -v wl-copy >/dev/null 2>&1; then
+  printf "%s" "$TEXT" | wl-copy
+  echo "Copied to clipboard with wl-copy."
+elif command -v xclip >/dev/null 2>&1; then
+  printf "%s" "$TEXT" | xclip -selection clipboard
+  echo "Copied to clipboard with xclip."
+else
+  echo "Clipboard tool not found. Install wl-clipboard or xclip."
+fi
