@@ -1,0 +1,45 @@
+{
+  "version": 1,
+  "rules": [
+    {
+      "spoken": "next js",
+      "replacement": "Next.js",
+      "enabled": true
+    },
+    {
+      "spoken": "typescript",
+      "replacement": "TypeScript",
+      "enabled": true
+    },
+    {
+      "spoken": "tailwind",
+      "replacement": "Tailwind",
+      "enabled": true
+    },
+    {
+      "spoken": "postgres",
+      "replacement": "PostgreSQL",
+      "enabled": true
+    },
+    {
+      "spoken": "super base",
+      "replacement": "Supabase",
+      "enabled": true
+    },
+    {
+      "spoken": "open router",
+      "replacement": "OpenRouter",
+      "enabled": true
+    },
+    {
+      "spoken": "github actions",
+      "replacement": "GitHub Actions",
+      "enabled": true
+    },
+    {
+      "spoken": "whisper cpp",
+      "replacement": "whisper.cpp",
+      "enabled": true
+    }
+  ]
+}
