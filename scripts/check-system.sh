@@ -1,9 +1,28 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-WHISPER_CLI="${WHISPER_CLI:-$HOME/tools/whisper.cpp/build/bin/whisper-cli}"
-WHISPER_MODEL="${WHISPER_MODEL:-$HOME/tools/whisper.cpp/models/ggml-base.en.bin}"
-TMP_DIR="${VIBEVOICE_TMP_DIR:-/tmp/vibevoice}"
+DATA_HOME="${XDG_DATA_HOME:-$HOME/.local/share}"
+ENGINE_ROOT="${VIBEVOICE_ENGINE_DIR:-$DATA_HOME/vibevoice/engines/whisper.cpp}"
+LEGACY_ROOT="$HOME/tools/whisper.cpp"
+WHISPER_CLI="${WHISPER_CLI:-}"
+WHISPER_MODEL="${WHISPER_MODEL:-}"
+TMP_DIR="${VIBEVOICE_TMP_DIR:-${TMPDIR:-/tmp}/vibevoice}"
+
+if [[ -z "$WHISPER_CLI" ]]; then
+  if [[ -x "$ENGINE_ROOT/build/bin/whisper-cli" ]]; then
+    WHISPER_CLI="$ENGINE_ROOT/build/bin/whisper-cli"
+  else
+    WHISPER_CLI="$LEGACY_ROOT/build/bin/whisper-cli"
+  fi
+fi
+
+if [[ -z "$WHISPER_MODEL" ]]; then
+  if [[ -f "$ENGINE_ROOT/models/ggml-base.en.bin" ]]; then
+    WHISPER_MODEL="$ENGINE_ROOT/models/ggml-base.en.bin"
+  else
+    WHISPER_MODEL="$LEGACY_ROOT/models/ggml-base.en.bin"
+  fi
+fi
 
 if [[ -r /etc/os-release ]]; then
   # shellcheck disable=SC1091
@@ -42,9 +61,12 @@ echo "vibevoice.check=1"
 status "platform" "$(uname -s)"
 status "distro" "${ID:-unknown}"
 status "tmp_dir" "$TMP_DIR"
+status "engine_root" "$ENGINE_ROOT"
 status "whisper_cli" "$(present "$WHISPER_CLI")"
+status "whisper_cli_path" "$WHISPER_CLI"
 status "whisper_model" "$(present_file "$WHISPER_MODEL")"
-status "arecord" "$(command_present arecord)"
+status "whisper_model_path" "$WHISPER_MODEL"
+status "alsa_devel" "$(pkg-config --exists alsa 2>/dev/null && printf present || printf missing)"
 status "git" "$(command_present git)"
 status "cmake" "$(command_present cmake)"
 status "make" "$(command_present make)"
@@ -69,14 +91,7 @@ else
   status "critical.whisper_model" "present"
 fi
 
-if ! command -v arecord >/dev/null 2>&1; then
-  status "critical.arecord" "missing"
-  missing_critical=1
-else
-  status "critical.arecord" "present"
-fi
-
-if [[ -d "$HOME/tools/whisper.cpp" ]]; then
+if [[ -d "$ENGINE_ROOT" || -d "$LEGACY_ROOT" ]]; then
   status "whisper_repo" "present"
 else
   status "whisper_repo" "missing"

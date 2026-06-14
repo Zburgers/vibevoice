@@ -1,20 +1,30 @@
 use chrono::{DateTime, Utc};
+use cpal::{
+    traits::{DeviceTrait, HostTrait, StreamTrait},
+    SampleFormat, Stream,
+};
 use serde::{Deserialize, Serialize};
 use std::{
-    fs,
-    io,
+    fs, io,
     path::{Path, PathBuf},
-    process::{Child, Command, Stdio},
+    process::{Command, Stdio},
     str::FromStr,
-    sync::Mutex,
+    sync::{
+        atomic::{AtomicU32, Ordering},
+        mpsc::{self, Sender},
+        Arc, Mutex,
+    },
+    thread::{self, JoinHandle},
     time::Instant,
 };
 use tauri::{AppHandle, Manager};
 use tauri_plugin_global_shortcut::{Code, GlobalShortcutExt, Modifiers, Shortcut, ShortcutState};
 use uuid::Uuid;
 
-const DEFAULT_WHISPER: &str = "~/tools/whisper.cpp/build/bin/whisper-cli";
-const DEFAULT_MODEL: &str = "~/tools/whisper.cpp/models/ggml-base.en.bin";
+const AUTO_PATH: &str = "auto";
+const MODEL_FILE_NAME: &str = "ggml-base.en.bin";
+const LEGACY_DEFAULT_WHISPER: &str = "~/tools/whisper.cpp/build/bin/whisper-cli";
+const LEGACY_DEFAULT_MODEL: &str = "~/tools/whisper.cpp/models/ggml-base.en.bin";
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "PascalCase")]
@@ -42,8 +52,8 @@ struct Settings {
 impl Default for Settings {
     fn default() -> Self {
         Self {
-            whisper_binary_path: DEFAULT_WHISPER.to_string(),
-            model_path: DEFAULT_MODEL.to_string(),
+            whisper_binary_path: AUTO_PATH.to_string(),
+            model_path: AUTO_PATH.to_string(),
             hotkey: "Ctrl+Alt+Space".to_string(),
             recording_mode: "toggle".to_string(),
             auto_paste: true,
@@ -61,6 +71,10 @@ struct Diagnostics {
     mic_available: bool,
     clipboard_tool: Option<String>,
     paste_tool: Option<String>,
+    whisper_path: Option<String>,
+    model_path: Option<String>,
+    recorder: Option<String>,
+    platform: String,
     last_error: Option<String>,
 }
 
@@ -92,15 +106,24 @@ struct AppStateSnapshot {
     dictionary: Vec<DictionaryRule>,
     last_transcript: Option<String>,
     last_error: Option<String>,
+    mic_level: f32,
     recording_started_at: Option<DateTime<Utc>>,
 }
 
 struct RecordingSession {
-    child: Child,
     audio_path: PathBuf,
     output_prefix: PathBuf,
     started: Instant,
     started_at: DateTime<Utc>,
+    stream: Stream,
+    writer_tx: Sender<AudioWriterMessage>,
+    writer_thread: Option<JoinHandle<Result<(), String>>>,
+    mic_level: Arc<AtomicU32>,
+}
+
+enum AudioWriterMessage {
+    Samples(Vec<i16>),
+    Stop,
 }
 
 struct RuntimeState {
@@ -108,6 +131,7 @@ struct RuntimeState {
     recording: Option<RecordingSession>,
     last_transcript: Option<String>,
     last_error: Option<String>,
+    mic_level: f32,
 }
 
 impl Default for RuntimeState {
@@ -117,6 +141,7 @@ impl Default for RuntimeState {
             recording: None,
             last_transcript: None,
             last_error: None,
+            mic_level: 0.0,
         }
     }
 }
@@ -132,6 +157,11 @@ fn get_app_state(app: AppHandle, data: tauri::State<AppData>) -> Result<AppState
     let history = load_history(&app)?;
     let runtime = data.runtime.lock().map_err(|error| error.to_string())?;
     let recording_started_at = runtime.recording.as_ref().map(|session| session.started_at);
+    let mic_level = runtime
+        .recording
+        .as_ref()
+        .map(|session| session.mic_level.load(Ordering::Relaxed) as f32 / 1000.0)
+        .unwrap_or(runtime.mic_level);
     Ok(AppStateSnapshot {
         voice_state: runtime.voice_state.clone(),
         settings: settings.clone(),
@@ -140,6 +170,7 @@ fn get_app_state(app: AppHandle, data: tauri::State<AppData>) -> Result<AppState
         dictionary,
         last_transcript: runtime.last_transcript.clone(),
         last_error: runtime.last_error.clone(),
+        mic_level,
         recording_started_at,
     })
 }
@@ -154,32 +185,25 @@ fn save_settings(app: AppHandle, settings: Settings) -> Result<(), String> {
 fn start_recording(app: AppHandle, data: tauri::State<AppData>) -> Result<(), String> {
     let settings = load_settings(&app)?;
     ensure_engine_ready(&settings)?;
-    let tmp = PathBuf::from("/tmp/vibevoice");
+    let tmp = temp_workspace();
     fs::create_dir_all(&tmp).map_err(|error| error.to_string())?;
     let stem = format!("recording-{}", Uuid::new_v4());
     let audio_path = tmp.join(format!("{stem}.wav"));
     let output_prefix = tmp.join(stem);
-    let child = Command::new("arecord")
-        .args(["-f", "S16_LE", "-r", "16000", "-c", "1"])
-        .arg(&audio_path)
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .spawn()
-        .map_err(|error| format!("Recording failed: {error}"))?;
+    let mut session = start_audio_capture(audio_path.clone(), output_prefix.clone())?;
 
     let mut runtime = data.runtime.lock().map_err(|error| error.to_string())?;
     if let Some(mut existing) = runtime.recording.take() {
-        let _ = existing.child.kill();
+        let _ = stop_audio_capture(&mut existing);
     }
+    session
+        .stream
+        .play()
+        .map_err(|error| format!("Recording failed to start: {error}"))?;
     runtime.voice_state = VoiceState::Recording;
     runtime.last_error = None;
-    runtime.recording = Some(RecordingSession {
-        child,
-        audio_path,
-        output_prefix,
-        started: Instant::now(),
-        started_at: Utc::now(),
-    });
+    runtime.mic_level = 0.0;
+    runtime.recording = Some(session);
     Ok(())
 }
 
@@ -194,8 +218,7 @@ fn stop_recording(app: AppHandle, data: tauri::State<AppData>) -> Result<History
             .ok_or_else(|| "No active recording to stop.".to_string())?
     };
 
-    let _ = session.child.kill();
-    let _ = session.child.wait();
+    stop_audio_capture(&mut session)?;
     let settings = load_settings(&app)?;
     let dictionary = load_dictionary(&app)?;
     let raw_transcript = transcribe(&settings, &session.audio_path, &session.output_prefix)?;
@@ -246,7 +269,10 @@ fn stop_recording(app: AppHandle, data: tauri::State<AppData>) -> Result<History
     };
     append_history(&app, item.clone())?;
 
-    let mut runtime = data.runtime.lock().map_err(|lock_error| lock_error.to_string())?;
+    let mut runtime = data
+        .runtime
+        .lock()
+        .map_err(|lock_error| lock_error.to_string())?;
     runtime.voice_state = if insert_status.starts_with("inserted") {
         VoiceState::Inserted
     } else if insert_status == "copied" || insert_status.starts_with("copied") {
@@ -323,13 +349,27 @@ fn set_dictionary_rule_enabled(app: AppHandle, id: String, enabled: bool) -> Res
 
 #[tauri::command]
 fn run_setup_script(app: AppHandle, data: tauri::State<AppData>) -> Result<String, String> {
-    let script = find_repo_file(&app, "scripts/install-fedora.sh")
-        .ok_or_else(|| "Setup script not found: scripts/install-fedora.sh".to_string())?;
+    let script_name = if cfg!(target_os = "windows") {
+        "scripts/install-windows.ps1"
+    } else {
+        "scripts/install-engine.sh"
+    };
+    let script = find_repo_file(&app, script_name)
+        .ok_or_else(|| format!("Setup script not found: {script_name}"))?;
     if !script.exists() {
         return Err(format!("Setup script not found: {}", script.display()));
     }
-    let output = Command::new("bash")
-        .arg(script)
+    let mut command = if cfg!(target_os = "windows") {
+        let mut command = Command::new("powershell");
+        command.args(["-NoProfile", "-ExecutionPolicy", "Bypass", "-File"]);
+        command.arg(script);
+        command
+    } else {
+        let mut command = Command::new("bash");
+        command.arg(script);
+        command
+    };
+    let output = command
         .output()
         .map_err(|error| format!("Setup failed to start: {error}"))?;
     let combined = format!(
@@ -387,10 +427,11 @@ fn history_path(app: &AppHandle) -> Result<PathBuf, String> {
 }
 
 fn config_dir(app: &AppHandle) -> Result<PathBuf, String> {
-    let dir = app
-        .path()
-        .app_config_dir()
-        .unwrap_or_else(|_| dirs::config_dir().unwrap_or_else(|| PathBuf::from(".")).join("vibevoice"));
+    let dir = app.path().app_config_dir().unwrap_or_else(|_| {
+        dirs::config_dir()
+            .unwrap_or_else(|| PathBuf::from("."))
+            .join("vibevoice")
+    });
     fs::create_dir_all(&dir).map_err(|error| error.to_string())?;
     Ok(dir)
 }
@@ -436,44 +477,83 @@ fn write_json<T: Serialize>(path: PathBuf, value: &T) -> Result<(), String> {
     fs::write(path, content).map_err(|error| error.to_string())
 }
 
+#[derive(Debug, Clone)]
+struct EnginePaths {
+    whisper_binary: PathBuf,
+    model: PathBuf,
+}
+
 fn expand_home(path: &str) -> PathBuf {
-    if let Some(rest) = path.strip_prefix("~/") {
-        dirs::home_dir().unwrap_or_else(|| PathBuf::from(".")).join(rest)
+    let expanded = if let Some(rest) = path.strip_prefix("~/") {
+        dirs::home_dir()
+            .unwrap_or_else(|| PathBuf::from("."))
+            .join(rest)
+    } else if let Some(rest) = path.strip_prefix("$HOME/") {
+        dirs::home_dir()
+            .unwrap_or_else(|| PathBuf::from("."))
+            .join(rest)
+    } else if let Some(rest) = path.strip_prefix("%USERPROFILE%\\") {
+        dirs::home_dir()
+            .unwrap_or_else(|| PathBuf::from("."))
+            .join(rest)
+    } else if let Some(rest) = path.strip_prefix("%LOCALAPPDATA%\\") {
+        dirs::data_local_dir()
+            .unwrap_or_else(|| PathBuf::from("."))
+            .join(rest)
     } else {
         PathBuf::from(path)
-    }
+    };
+    expanded
 }
 
 fn diagnostics(settings: &Settings, last_error: Option<String>) -> Diagnostics {
+    let resolved = resolve_engine_paths(settings).ok();
     Diagnostics {
-        whisper_found: expand_home(&settings.whisper_binary_path).is_file(),
-        model_found: expand_home(&settings.model_path).is_file(),
-        mic_available: command_exists("arecord"),
-        clipboard_tool: first_command(&["wl-copy", "xclip"]),
-        paste_tool: first_command(&["wtype", "xdotool", "ydotool"]),
+        whisper_found: resolved
+            .as_ref()
+            .is_some_and(|paths| paths.whisper_binary.is_file()),
+        model_found: resolved.as_ref().is_some_and(|paths| paths.model.is_file()),
+        mic_available: default_input_device_available(),
+        clipboard_tool: clipboard_tool_name(),
+        paste_tool: paste_tool_name(),
+        whisper_path: resolved
+            .as_ref()
+            .map(|paths| paths.whisper_binary.display().to_string()),
+        model_path: resolved
+            .as_ref()
+            .map(|paths| paths.model.display().to_string()),
+        recorder: Some("cpal".to_string()),
+        platform: std::env::consts::OS.to_string(),
         last_error,
     }
 }
 
 fn ensure_engine_ready(settings: &Settings) -> Result<(), String> {
-    let whisper = expand_home(&settings.whisper_binary_path);
-    let model = expand_home(&settings.model_path);
-    if !whisper.is_file() {
-        return Err(format!("Whisper binary missing: {}", whisper.display()));
+    let paths = resolve_engine_paths(settings)?;
+    if !paths.whisper_binary.is_file() {
+        return Err(format!(
+            "Whisper binary missing: {}",
+            paths.whisper_binary.display()
+        ));
     }
-    if !model.is_file() {
-        return Err(format!("Model file missing: {}", model.display()));
+    if !paths.model.is_file() {
+        return Err(format!("Model file missing: {}", paths.model.display()));
     }
-    if !command_exists("arecord") {
-        return Err("Microphone recorder missing: install alsa-utils for arecord.".to_string());
+    if !default_input_device_available() {
+        return Err("No default microphone input device is available.".to_string());
     }
     Ok(())
 }
 
-fn transcribe(settings: &Settings, audio_path: &Path, output_prefix: &Path) -> Result<String, String> {
-    let output = Command::new(expand_home(&settings.whisper_binary_path))
+fn transcribe(
+    settings: &Settings,
+    audio_path: &Path,
+    output_prefix: &Path,
+) -> Result<String, String> {
+    let paths = resolve_engine_paths(settings)?;
+    let output = Command::new(paths.whisper_binary)
         .arg("-m")
-        .arg(expand_home(&settings.model_path))
+        .arg(paths.model)
         .arg("-f")
         .arg(audio_path)
         .args(["-otxt", "-nt", "-np"])
@@ -490,6 +570,327 @@ fn transcribe(settings: &Settings, audio_path: &Path, output_prefix: &Path) -> R
     }
     fs::read_to_string(output_prefix.with_extension("txt"))
         .map_err(|error| format!("Transcript file missing: {error}"))
+}
+
+fn resolve_engine_paths(settings: &Settings) -> Result<EnginePaths, String> {
+    resolve_engine_paths_with_candidates(settings, &candidate_engine_roots())
+}
+
+fn resolve_engine_paths_with_candidates(
+    settings: &Settings,
+    extra_candidates: &[PathBuf],
+) -> Result<EnginePaths, String> {
+    let whisper_explicit = explicit_path(&settings.whisper_binary_path);
+    let model_explicit = explicit_path(&settings.model_path);
+
+    if let Some(path) = whisper_explicit.as_ref() {
+        if !path.is_file() {
+            return Err(format!(
+                "Configured Whisper binary does not exist: {}",
+                path.display()
+            ));
+        }
+    }
+    if let Some(path) = model_explicit.as_ref() {
+        if !path.is_file() {
+            return Err(format!(
+                "Configured model file does not exist: {}",
+                path.display()
+            ));
+        }
+    }
+
+    if let (Some(whisper_binary), Some(model)) = (whisper_explicit.clone(), model_explicit.clone())
+    {
+        return Ok(EnginePaths {
+            whisper_binary,
+            model,
+        });
+    }
+
+    let mut roots = Vec::new();
+    roots.extend(extra_candidates.iter().cloned());
+    roots.extend(candidate_engine_roots());
+
+    let discovered = discover_engine_in_roots(&roots);
+    let whisper_binary = whisper_explicit
+        .or_else(|| {
+            discovered
+                .as_ref()
+                .map(|paths| paths.whisper_binary.clone())
+        })
+        .ok_or_else(|| "Whisper binary not found. Run setup to install whisper.cpp.".to_string())?;
+    let model = model_explicit
+        .or_else(|| model_near_binary(&whisper_binary))
+        .or_else(|| discovered.as_ref().map(|paths| paths.model.clone()))
+        .ok_or_else(|| format!("{MODEL_FILE_NAME} not found. Run setup to download the model."))?;
+
+    Ok(EnginePaths {
+        whisper_binary,
+        model,
+    })
+}
+
+fn explicit_path(value: &str) -> Option<PathBuf> {
+    let trimmed = value.trim();
+    if trimmed.is_empty()
+        || trimmed.eq_ignore_ascii_case(AUTO_PATH)
+        || trimmed == LEGACY_DEFAULT_WHISPER
+        || trimmed == LEGACY_DEFAULT_MODEL
+    {
+        None
+    } else {
+        Some(expand_home(trimmed))
+    }
+}
+
+fn candidate_engine_roots() -> Vec<PathBuf> {
+    let mut roots = Vec::new();
+    for name in ["VIBEVOICE_ENGINE_DIR", "WHISPER_ROOT", "WHISPER_CPP_ROOT"] {
+        if let Ok(value) = std::env::var(name) {
+            if !value.trim().is_empty() {
+                roots.push(expand_home(&value));
+            }
+        }
+    }
+    if let Some(data_dir) = dirs::data_local_dir() {
+        roots.push(data_dir.join("vibevoice").join("engines"));
+        roots.push(data_dir.join("VibeVoice").join("engines"));
+    }
+    if let Some(home) = dirs::home_dir() {
+        roots.push(home.join("tools"));
+        roots.push(
+            home.join(".local")
+                .join("share")
+                .join("vibevoice")
+                .join("engines"),
+        );
+    }
+    if let Ok(current) = std::env::current_dir() {
+        roots.push(current);
+    }
+    roots
+}
+
+fn discover_engine_in_roots(roots: &[PathBuf]) -> Option<EnginePaths> {
+    for base in roots {
+        for root in whisper_root_candidates(base) {
+            if let Some(paths) = engine_paths_under_root(&root) {
+                return Some(paths);
+            }
+        }
+    }
+    None
+}
+
+fn whisper_root_candidates(base: &Path) -> Vec<PathBuf> {
+    vec![
+        base.to_path_buf(),
+        base.join("whisper.cpp"),
+        base.join("engines").join("whisper.cpp"),
+        base.join("tools").join("whisper.cpp"),
+    ]
+}
+
+fn engine_paths_under_root(root: &Path) -> Option<EnginePaths> {
+    let binary_name = executable_name("whisper-cli");
+    let binary_candidates = [
+        root.join("build").join("bin").join(&binary_name),
+        root.join("build")
+            .join("bin")
+            .join("Release")
+            .join(&binary_name),
+        root.join(&binary_name),
+    ];
+    let model = root.join("models").join(MODEL_FILE_NAME);
+    binary_candidates
+        .into_iter()
+        .find(|binary| binary.is_file() && model.is_file())
+        .map(|whisper_binary| EnginePaths {
+            whisper_binary,
+            model,
+        })
+}
+
+fn model_near_binary(binary: &Path) -> Option<PathBuf> {
+    for ancestor in binary.ancestors().take(6) {
+        let model = ancestor.join("models").join(MODEL_FILE_NAME);
+        if model.is_file() {
+            return Some(model);
+        }
+    }
+    None
+}
+
+fn executable_name(base: &str) -> String {
+    if cfg!(target_os = "windows") && !base.ends_with(".exe") {
+        format!("{base}.exe")
+    } else {
+        base.to_string()
+    }
+}
+
+fn temp_workspace() -> PathBuf {
+    std::env::temp_dir().join("vibevoice")
+}
+
+fn default_input_device_available() -> bool {
+    cpal::default_host().default_input_device().is_some()
+}
+
+fn start_audio_capture(
+    audio_path: PathBuf,
+    output_prefix: PathBuf,
+) -> Result<RecordingSession, String> {
+    let host = cpal::default_host();
+    let device = host
+        .default_input_device()
+        .ok_or_else(|| "No default microphone input device found.".to_string())?;
+    let supported_config = device
+        .default_input_config()
+        .map_err(|error| format!("Microphone config unavailable: {error}"))?;
+    let sample_format = supported_config.sample_format();
+    let config: cpal::StreamConfig = supported_config.into();
+    let channels = config.channels as usize;
+    let sample_rate = config.sample_rate.0;
+    let mic_level = Arc::new(AtomicU32::new(0));
+    let (writer_tx, writer_rx) = mpsc::channel::<AudioWriterMessage>();
+    let writer_path = audio_path.clone();
+    let writer_thread = thread::spawn(move || -> Result<(), String> {
+        let spec = hound::WavSpec {
+            channels: 1,
+            sample_rate,
+            bits_per_sample: 16,
+            sample_format: hound::SampleFormat::Int,
+        };
+        let mut writer = hound::WavWriter::create(&writer_path, spec)
+            .map_err(|error| format!("Could not create WAV file: {error}"))?;
+        while let Ok(message) = writer_rx.recv() {
+            match message {
+                AudioWriterMessage::Samples(samples) => {
+                    for sample in samples {
+                        writer
+                            .write_sample(sample)
+                            .map_err(|error| format!("Could not write WAV sample: {error}"))?;
+                    }
+                }
+                AudioWriterMessage::Stop => break,
+            }
+        }
+        writer
+            .finalize()
+            .map_err(|error| format!("Could not finalize WAV file: {error}"))
+    });
+
+    let stream = match sample_format {
+        SampleFormat::F32 => {
+            let stream_tx = writer_tx.clone();
+            let stream_level = Arc::clone(&mic_level);
+            device.build_input_stream(
+                &config,
+                move |data: &[f32], _| {
+                    write_mono_samples(data, channels, &stream_tx, &stream_level, f32_to_i16)
+                },
+                audio_stream_error,
+                None,
+            )
+        }
+        SampleFormat::I16 => {
+            let stream_tx = writer_tx.clone();
+            let stream_level = Arc::clone(&mic_level);
+            device.build_input_stream(
+                &config,
+                move |data: &[i16], _| {
+                    write_mono_samples(data, channels, &stream_tx, &stream_level, |sample| sample)
+                },
+                audio_stream_error,
+                None,
+            )
+        }
+        SampleFormat::U16 => {
+            let stream_tx = writer_tx.clone();
+            let stream_level = Arc::clone(&mic_level);
+            device.build_input_stream(
+                &config,
+                move |data: &[u16], _| {
+                    write_mono_samples(data, channels, &stream_tx, &stream_level, u16_to_i16)
+                },
+                audio_stream_error,
+                None,
+            )
+        }
+        _ => {
+            return Err(format!(
+                "Unsupported microphone sample format: {sample_format:?}"
+            ))
+        }
+    }
+    .map_err(|error| format!("Could not open microphone stream: {error}"))?;
+
+    Ok(RecordingSession {
+        audio_path,
+        output_prefix,
+        started: Instant::now(),
+        started_at: Utc::now(),
+        stream,
+        writer_tx,
+        writer_thread: Some(writer_thread),
+        mic_level,
+    })
+}
+
+fn audio_stream_error(error: cpal::StreamError) {
+    eprintln!("VibeVoice audio stream error: {error}");
+}
+
+fn stop_audio_capture(session: &mut RecordingSession) -> Result<(), String> {
+    let _ = session.stream.pause();
+    let _ = session.writer_tx.send(AudioWriterMessage::Stop);
+    if let Some(writer_thread) = session.writer_thread.take() {
+        writer_thread
+            .join()
+            .map_err(|_| "Audio writer thread panicked.".to_string())??;
+    }
+    Ok(())
+}
+
+fn write_mono_samples<T, F>(
+    data: &[T],
+    channels: usize,
+    writer_tx: &Sender<AudioWriterMessage>,
+    mic_level: &Arc<AtomicU32>,
+    convert: F,
+) where
+    T: Copy,
+    F: Fn(T) -> i16,
+{
+    if channels == 0 {
+        return;
+    }
+    let mut output = Vec::with_capacity(data.len() / channels.max(1));
+    let mut peak = 0_u32;
+    for frame in data.chunks(channels) {
+        let sum = frame
+            .iter()
+            .map(|sample| convert(*sample) as i32)
+            .sum::<i32>();
+        let mono = (sum / frame.len() as i32).clamp(i16::MIN as i32, i16::MAX as i32) as i16;
+        peak = peak.max(mono.unsigned_abs() as u32);
+        output.push(mono);
+    }
+    mic_level.store(
+        ((peak as f32 / i16::MAX as f32) * 1000.0) as u32,
+        Ordering::Relaxed,
+    );
+    let _ = writer_tx.send(AudioWriterMessage::Samples(output));
+}
+
+fn f32_to_i16(sample: f32) -> i16 {
+    (sample.clamp(-1.0, 1.0) * i16::MAX as f32) as i16
+}
+
+fn u16_to_i16(sample: u16) -> i16 {
+    (sample as i32 - 32768).clamp(i16::MIN as i32, i16::MAX as i32) as i16
 }
 
 fn cleanup_transcript(text: &str) -> String {
@@ -537,6 +938,30 @@ fn replace_case_insensitive(input: &str, needle: &str, replacement: &str) -> Str
 }
 
 fn copy_to_clipboard(text: &str) -> Result<String, String> {
+    if cfg!(target_os = "windows") {
+        let mut child = Command::new("powershell")
+            .args([
+                "-NoProfile",
+                "-Command",
+                "Set-Clipboard -Value ([Console]::In.ReadToEnd())",
+            ])
+            .stdin(Stdio::piped())
+            .spawn()
+            .map_err(|error| format!("Set-Clipboard failed: {error}"))?;
+        use std::io::Write;
+        child
+            .stdin
+            .as_mut()
+            .ok_or_else(|| "Set-Clipboard stdin unavailable.".to_string())?
+            .write_all(text.as_bytes())
+            .map_err(|error| error.to_string())?;
+        let status = child.wait().map_err(|error| error.to_string())?;
+        return if status.success() {
+            Ok("powershell:Set-Clipboard".to_string())
+        } else {
+            Err("Set-Clipboard exited with an error.".to_string())
+        };
+    }
     if command_exists("wl-copy") {
         let mut child = Command::new("wl-copy")
             .stdin(Stdio::piped())
@@ -580,6 +1005,25 @@ fn copy_to_clipboard(text: &str) -> Result<String, String> {
 }
 
 fn paste_from_clipboard() -> Result<String, String> {
+    if cfg!(target_os = "windows") {
+        let status = Command::new("powershell")
+            .args([
+                "-STA",
+                "-NoProfile",
+                "-Command",
+                "Add-Type -AssemblyName System.Windows.Forms; [System.Windows.Forms.SendKeys]::SendWait('^v')",
+            ])
+            .status()
+            .map_err(|error| format!("Windows paste failed: {error}"))?;
+        return if status.success() {
+            Ok("powershell:SendKeys".to_string())
+        } else {
+            Err(
+                "Windows paste command exited with an error. Transcript remains in clipboard."
+                    .to_string(),
+            )
+        };
+    }
     let candidates: [(&str, &[&str]); 3] = [
         ("wtype", &["-M", "ctrl", "v", "-m", "ctrl"]),
         ("xdotool", &["key", "ctrl+v"]),
@@ -594,7 +1038,9 @@ fn paste_from_clipboard() -> Result<String, String> {
             return if status.success() {
                 Ok(cmd.to_string())
             } else {
-                Err(format!("{cmd} exited with an error. Transcript remains in clipboard."))
+                Err(format!(
+                    "{cmd} exited with an error. Transcript remains in clipboard."
+                ))
             };
         }
     }
@@ -602,9 +1048,21 @@ fn paste_from_clipboard() -> Result<String, String> {
 }
 
 fn command_exists(name: &str) -> bool {
+    if cfg!(target_os = "windows") {
+        return Command::new("where")
+            .arg(name)
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status()
+            .map(|status| status.success())
+            .unwrap_or(false);
+    }
     Command::new("sh")
         .arg("-c")
-        .arg(format!("command -v '{}' >/dev/null 2>&1", name.replace('\'', "")))
+        .arg(format!(
+            "command -v '{}' >/dev/null 2>&1",
+            name.replace('\'', "")
+        ))
         .status()
         .map(|status| status.success())
         .unwrap_or(false)
@@ -615,6 +1073,20 @@ fn first_command(names: &[&str]) -> Option<String> {
         .iter()
         .find(|name| command_exists(name))
         .map(|name| (*name).to_string())
+}
+
+fn clipboard_tool_name() -> Option<String> {
+    if cfg!(target_os = "windows") {
+        return command_exists("powershell").then(|| "powershell:Set-Clipboard".to_string());
+    }
+    first_command(&["wl-copy", "xclip"])
+}
+
+fn paste_tool_name() -> Option<String> {
+    if cfg!(target_os = "windows") {
+        return command_exists("powershell").then(|| "powershell:SendKeys".to_string());
+    }
+    first_command(&["wtype", "xdotool", "ydotool"])
 }
 
 fn default_dictionary() -> Vec<DictionaryRule> {
@@ -659,7 +1131,10 @@ fn parse_hotkey(hotkey: &str) -> Result<Shortcut, String> {
         .replace(' ', "");
     Shortcut::from_str(&normalized).or_else(|_| {
         if normalized.eq_ignore_ascii_case("Control+Alt+Space") {
-            Ok(Shortcut::new(Some(Modifiers::CONTROL | Modifiers::ALT), Code::Space))
+            Ok(Shortcut::new(
+                Some(Modifiers::CONTROL | Modifiers::ALT),
+                Code::Space,
+            ))
         } else {
             Err(format!("Unsupported hotkey: {hotkey}. Try Ctrl+Alt+Space."))
         }
@@ -729,4 +1204,60 @@ pub fn run() {
         })
         .run(tauri::generate_context!())
         .expect("error while running VibeVoice");
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn resolves_explicit_existing_engine_paths_first() {
+        let root = std::env::temp_dir().join(format!("vibevoice-test-{}", Uuid::new_v4()));
+        let bin_dir = root.join("bin");
+        let model_dir = root.join("models");
+        fs::create_dir_all(&bin_dir).unwrap();
+        fs::create_dir_all(&model_dir).unwrap();
+        let whisper = bin_dir.join(executable_name("whisper-cli"));
+        let model = model_dir.join("ggml-base.en.bin");
+        fs::write(&whisper, "").unwrap();
+        fs::write(&model, "").unwrap();
+
+        let settings = Settings {
+            whisper_binary_path: whisper.to_string_lossy().to_string(),
+            model_path: model.to_string_lossy().to_string(),
+            ..Settings::default()
+        };
+
+        let resolved = resolve_engine_paths_with_candidates(&settings, &[]).unwrap();
+
+        assert_eq!(resolved.whisper_binary, whisper);
+        assert_eq!(resolved.model, model);
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn auto_discovers_whisper_from_candidate_roots() {
+        let root = std::env::temp_dir().join(format!("vibevoice-test-{}", Uuid::new_v4()));
+        let whisper_root = root.join("engines").join("whisper.cpp");
+        let bin_dir = whisper_root.join("build").join("bin");
+        let model_dir = whisper_root.join("models");
+        fs::create_dir_all(&bin_dir).unwrap();
+        fs::create_dir_all(&model_dir).unwrap();
+        let whisper = bin_dir.join(executable_name("whisper-cli"));
+        let model = model_dir.join("ggml-base.en.bin");
+        fs::write(&whisper, "").unwrap();
+        fs::write(&model, "").unwrap();
+
+        let settings = Settings {
+            whisper_binary_path: "auto".to_string(),
+            model_path: "auto".to_string(),
+            ..Settings::default()
+        };
+
+        let resolved = resolve_engine_paths_with_candidates(&settings, &[root.clone()]).unwrap();
+
+        assert_eq!(resolved.whisper_binary, whisper);
+        assert_eq!(resolved.model, model);
+        let _ = fs::remove_dir_all(root);
+    }
 }
