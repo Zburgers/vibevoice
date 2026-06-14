@@ -2,43 +2,47 @@
 
 VibeVoice is a local-first voice input layer for a developer workstation.
 
-## Core Assumptions
+## Windows
 
-The MVP is built around the existing local Whisper setup:
+The Tauri app has two windows:
 
-```text
-Binary: ~/tools/whisper.cpp/build/bin/whisper-cli
-Model:  ~/tools/whisper.cpp/models/ggml-base.en.bin
-```
+- `main`: normal desktop app for settings, diagnostics, dictionary, and history
+- `pill`: transparent, undecorated, always-on-top floating widget for recording controls
 
-If both exist, the app should use them directly. If either is missing, the user should be guided through the safe Fedora setup flow.
+Only the `pill` window should be always-on-top.
 
-## Main Pipeline
-
-The MVP pipeline is intentionally small:
+## Pipeline
 
 ```text
-hotkey -> record mic audio -> write temporary WAV -> run whisper-cli -> clean transcript -> insert or copy text
+hotkey or pill -> CPAL mic capture -> local WAV -> whisper-cli -> cleanup -> clipboard/paste -> history
 ```
 
-Temporary audio belongs in `/tmp/vibevoice` and should be discarded after use when possible.
+Recording uses Rust CPAL and writes WAV files with `hound`, so capture is not tied to Linux `arecord`.
+
+## Engine Resolution
+
+Settings default to `auto`. The backend resolves `whisper-cli` and `ggml-base.en.bin` from:
+
+- Existing explicit settings paths
+- `VIBEVOICE_ENGINE_DIR`, `WHISPER_ROOT`, or `WHISPER_CPP_ROOT`
+- User app-data engine directory
+- Legacy `~/tools/whisper.cpp`
+
+The installer writes to the user app-data engine directory by default:
+
+- Windows: `%LOCALAPPDATA%\VibeVoice\engines\whisper.cpp`
+- Linux: `~/.local/share/vibevoice/engines/whisper.cpp`
 
 ## Support Scripts
 
-`scripts/check-system.sh`
+- `scripts/install-windows.ps1`
+- `scripts/install-engine.sh`
+- `scripts/install-fedora.sh` compatibility wrapper
+- `scripts/check-windows.ps1`
+- `scripts/check-system.sh`
 
-- Reports the local state in a machine-readable-ish `key=value` format
-- Marks `whisper-cli`, the model, and `arecord` as critical
-- Exits nonzero only when a critical piece is missing
-
-`scripts/install-fedora.sh`
-
-- Fedora-first bootstrap path
-- Uses `sudo` only for explicit `dnf install`
-- Reuses existing `whisper.cpp` files when they are already present
-- Does not mutate unrelated config files or delete user data
+Setup scripts are packaged as Tauri resources so app-triggered setup works after bundling.
 
 ## Dictionary
 
-`config/default-dictionary.json` provides a small developer-oriented replacement list for transcript cleanup.
-The MVP should keep this local and editable, not tied to a cloud service or model manager.
+`config/default-dictionary.json` provides local developer-oriented replacements for transcript cleanup. Dictionary rules remain local JSON data.

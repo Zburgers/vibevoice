@@ -78,19 +78,9 @@ The current model and engine are enough.
 
 ## Core Technical Assumption
 
-The app should expect this local engine path by default:
+The app should default to automatic engine resolution, not a single hardcoded path.
 
-```text
-~/tools/whisper.cpp/build/bin/whisper-cli
-```
-
-And this model path by default:
-
-```text
-~/tools/whisper.cpp/models/ggml-base.en.bin
-```
-
-The desktop app should detect whether these exist.
+The desktop app should detect explicit settings, environment-configured roots, the user app-data engine directory, and the legacy `~/tools/whisper.cpp` path.
 
 If they exist:
 
@@ -171,9 +161,7 @@ whisper.cpp as external local binary
 
 The app should be lightweight and startup quickly.
 
-The app should support Linux first. Fedora/Linux is the immediate target environment.
-
-Cross-platform support can be considered later, but the MVP should not get blocked trying to support Windows and macOS perfectly.
+The app should support Linux and Windows for the MVP. macOS can be considered later.
 
 ## Desktop App Layout
 
@@ -486,13 +474,13 @@ The app should preserve the previously focused window/input as much as possible.
 
 The recording pipeline should be simple and reliable.
 
-Current shell behavior can be used as reference:
+Current shell behavior can be used as historical reference:
 
 ```text
 arecord → WAV file → whisper-cli → transcript txt
 ```
 
-For MVP, recording can use Linux-native tools or Rust audio libraries as long as it is reliable.
+For MVP, recording should use the Rust audio path so Windows and Linux share the same capture behavior.
 
 The generated audio should be compatible with whisper.cpp.
 
@@ -509,7 +497,7 @@ Temporary files should be stored safely.
 Suggested path:
 
 ```text
-/tmp/vibevoice/
+system temp directory / vibevoice
 ```
 
 The app should clean up temporary files when safe.
@@ -520,19 +508,7 @@ Do not store raw audio permanently in MVP unless explicitly needed for debugging
 
 # 5. Local Whisper.cpp Transcription
 
-The MVP must use the existing local whisper.cpp installation.
-
-Default binary:
-
-```text
-~/tools/whisper.cpp/build/bin/whisper-cli
-```
-
-Default model:
-
-```text
-~/tools/whisper.cpp/models/ggml-base.en.bin
-```
+The MVP must use a local whisper.cpp installation resolved by the app.
 
 The app should call the local binary and parse the output transcript.
 
@@ -583,7 +559,8 @@ The install script must:
 * Not delete unrelated files
 * Not overwrite existing user data
 * Create only expected directories
-* Use `~/tools/whisper.cpp` by default
+* Use the user app-data engine directory by default
+* Keep `~/tools/whisper.cpp` as a compatibility fallback
 * Detect existing installs
 * Download only the required model
 * Build whisper.cpp if needed
@@ -602,20 +579,21 @@ The install script must not:
 * Download multiple models
 * Change the user’s existing Python Whisper install
 
-## Fedora Target Install
+## Linux and Windows Target Install
 
-Fedora install should be first-class.
+Fedora and Windows install should be first-class.
 
 Expected dependencies:
 
 ```bash
-sudo dnf install -y git cmake gcc gcc-c++ make ffmpeg alsa-utils wl-clipboard xclip
+sudo dnf install -y git cmake gcc gcc-c++ make ffmpeg alsa-lib-devel pkgconf-pkg-config wl-clipboard xclip
 ```
 
-Expected setup path:
+Expected setup paths:
 
 ```bash
-~/tools/whisper.cpp
+~/.local/share/vibevoice/engines/whisper.cpp
+%LOCALAPPDATA%\VibeVoice\engines\whisper.cpp
 ```
 
 Expected model:
@@ -1083,7 +1061,7 @@ Everything else supports that.
 
 # 19. Acceptance Criteria
 
-The MVP is accepted when the following demo works on Fedora:
+The MVP is accepted when the following demo works on Fedora and Windows:
 
 1. Start VibeVoice desktop app.
 2. App detects existing `whisper.cpp` and `ggml-base.en.bin`.
