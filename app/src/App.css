@@ -81,11 +81,37 @@ button {
   text-align: left;
 }
 
+.pill-icon-wrap {
+  position: relative;
+  width: 42px;
+  height: 42px;
+  flex: 0 0 auto;
+}
+
+.pill-icon,
+.brand-mark {
+  display: block;
+  object-fit: cover;
+  box-shadow:
+    inset 0 1px 0 rgba(255, 255, 255, 0.16),
+    0 10px 24px rgba(0, 0, 0, 0.32);
+}
+
+.pill-icon {
+  width: 42px;
+  height: 42px;
+  border-radius: 14px;
+}
+
 .pill-dot {
+  position: absolute;
+  right: -1px;
+  bottom: -1px;
   width: 13px;
   height: 13px;
   border-radius: 999px;
   background: currentColor;
+  border: 2px solid #10161d;
   box-shadow: 0 0 0 5px color-mix(in srgb, currentColor 14%, transparent);
 }
 
@@ -206,12 +232,7 @@ button {
 .brand-mark {
   width: 38px;
   height: 38px;
-  border-radius: 12px;
-  display: grid;
-  place-items: center;
-  background: linear-gradient(145deg, var(--accent), var(--accent-strong));
-  color: #081019;
-  font-weight: 800;
+  border-radius: 11px;
 }
 
 .brand-copy {

@@ -2,6 +2,7 @@ import { useEffect, useMemo, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { LogicalSize } from "@tauri-apps/api/dpi";
 import { getCurrentWindow, Window as TauriWindow } from "@tauri-apps/api/window";
+import vibevoiceIcon from "./assets/vibevoice-icon.png";
 import "./App.css";
 
 type TabKey = "main" | "settings" | "history" | "dictionary" | "diagnostics";
@@ -285,7 +286,10 @@ function App() {
         onClick={() => setExpanded((value) => !value)}
         aria-expanded={expanded}
       >
-        <span className="pill-dot" />
+        <span className="pill-icon-wrap">
+          <img className="pill-icon" src={vibevoiceIcon} alt="" aria-hidden="true" />
+          <span className="pill-dot" />
+        </span>
         <span className="pill-copy">
           <span className="pill-title">{phaseCopy[phase]}</span>
           <span className="pill-subtitle">
@@ -472,7 +476,7 @@ function App() {
     <div className="app-shell">
       <aside className="sidebar">
         <div className="brand-block">
-          <div className="brand-mark">V</div>
+          <img className="brand-mark" src={vibevoiceIcon} alt="" aria-hidden="true" />
           <div className="brand-copy">
             <div className="brand-name">VibeVoice</div>
             <div className="brand-subtitle">Local whisper utility</div>
