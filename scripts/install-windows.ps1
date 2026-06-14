@@ -15,6 +15,70 @@ function Test-Command($Name) {
   return $null -ne (Get-Command $Name -ErrorAction SilentlyContinue)
 }
 
+function Add-ProcessPath($Directory) {
+  if ([string]::IsNullOrWhiteSpace($Directory) -or -not (Test-Path $Directory)) {
+    return
+  }
+  $pathParts = $env:Path -split ';' | Where-Object { -not [string]::IsNullOrWhiteSpace($_) }
+  if ($pathParts -notcontains $Directory) {
+    $env:Path = "$Directory;$env:Path"
+  }
+}
+
+function Refresh-ProcessPath {
+  $segments = @($env:Path)
+  $machinePath = [Environment]::GetEnvironmentVariable("Path", "Machine")
+  $userPath = [Environment]::GetEnvironmentVariable("Path", "User")
+  if (-not [string]::IsNullOrWhiteSpace($machinePath)) {
+    $segments += $machinePath
+  }
+  if (-not [string]::IsNullOrWhiteSpace($userPath)) {
+    $segments += $userPath
+  }
+  $env:Path = (($segments -join ';') -split ';' | Where-Object { -not [string]::IsNullOrWhiteSpace($_) } | Select-Object -Unique) -join ';'
+}
+
+function Resolve-Tool($Name, [string[]]$CandidatePaths = @()) {
+  Refresh-ProcessPath
+  $command = Get-Command $Name -ErrorAction SilentlyContinue
+  if ($command) {
+    return $command.Source
+  }
+
+  foreach ($candidate in $CandidatePaths) {
+    if (Test-Path $candidate) {
+      Add-ProcessPath (Split-Path -Parent $candidate)
+      return $candidate
+    }
+  }
+
+  return $null
+}
+
+function Get-CMakeCandidates {
+  $candidates = @()
+  if ($env:ProgramFiles) {
+    $candidates += (Join-Path $env:ProgramFiles "CMake\bin\cmake.exe")
+  }
+  if (${env:ProgramFiles(x86)}) {
+    $candidates += (Join-Path ${env:ProgramFiles(x86)} "CMake\bin\cmake.exe")
+  }
+  if ($env:LOCALAPPDATA) {
+    $candidates += (Join-Path $env:LOCALAPPDATA "Programs\CMake\bin\cmake.exe")
+    $candidates += (Join-Path $env:LOCALAPPDATA "Microsoft\WinGet\Packages\Kitware.CMake_Microsoft.Winget.Source_8wekyb3d8bbwe\CMake\bin\cmake.exe")
+  }
+  return $candidates
+}
+
+function Get-ToolOrThrow($Name, [string[]]$CandidatePaths = @()) {
+  $tool = Resolve-Tool -Name $Name -CandidatePaths $CandidatePaths
+  if ($tool) {
+    Write-Step "$Name resolved to: $tool"
+    return $tool
+  }
+  throw "$Name was installed or requested, but this PowerShell process cannot find it. Close and reopen PowerShell, or add the tool's bin directory to PATH."
+}
+
 function Test-VsBuildTools {
   $VsWhere = Join-Path ${env:ProgramFiles(x86)} "Microsoft Visual Studio\Installer\vswhere.exe"
   if (-not (Test-Path $VsWhere)) {
@@ -45,6 +109,10 @@ function Ensure-Dependencies {
   Install-WingetPackage -Id "Kitware.CMake" -Name "cmake"
   Install-WingetPackage -Id "Gyan.FFmpeg" -Name "ffmpeg"
 
+  $script:GitExe = Get-ToolOrThrow -Name "git"
+  $script:CMakeExe = Get-ToolOrThrow -Name "cmake" -CandidatePaths (Get-CMakeCandidates)
+  $script:FfmpegExe = Get-ToolOrThrow -Name "ffmpeg"
+
   if (-not ((Test-Command "cl") -or (Test-VsBuildTools))) {
     Install-WingetPackage `
       -Id "Microsoft.VisualStudio.2022.BuildTools" `
@@ -71,7 +139,7 @@ function Ensure-WhisperCpp {
       throw "$EngineRoot exists but is not a whisper.cpp git checkout. Set VIBEVOICE_ENGINE_DIR to an empty directory or existing checkout."
     }
     Write-Step "+ git clone https://github.com/ggml-org/whisper.cpp.git `"$EngineRoot`""
-    & git clone https://github.com/ggml-org/whisper.cpp.git $EngineRoot
+    & $script:GitExe clone https://github.com/ggml-org/whisper.cpp.git $EngineRoot
   } else {
     Write-Step "Reusing whisper.cpp checkout: $EngineRoot"
   }
@@ -86,9 +154,9 @@ function Ensure-WhisperCpp {
 
   if (-not ((Test-Path $WhisperCli) -or (Test-Path $AltWhisperCli))) {
     Write-Step "+ cmake -S `"$EngineRoot`" -B `"$EngineRoot\build`" -A x64"
-    & cmake -S $EngineRoot -B (Join-Path $EngineRoot "build") -A x64
+    & $script:CMakeExe -S $EngineRoot -B (Join-Path $EngineRoot "build") -A x64
     Write-Step "+ cmake --build `"$EngineRoot\build`" --config Release --parallel"
-    & cmake --build (Join-Path $EngineRoot "build") --config Release --parallel
+    & $script:CMakeExe --build (Join-Path $EngineRoot "build") --config Release --parallel
   } else {
     Write-Step "whisper-cli already built."
   }

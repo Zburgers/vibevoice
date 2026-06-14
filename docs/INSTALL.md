@@ -25,7 +25,7 @@ npm install
 npm run tauri dev
 ```
 
-Inside the app, press `Setup`, or run the installer directly:
+Inside the app, press `Setup`, or run the installer directly from the repository root:
 
 ```powershell
 powershell -NoProfile -ExecutionPolicy Bypass -File .\scripts\install-windows.ps1
@@ -38,6 +38,8 @@ The Windows installer:
 - Downloads `ggml-base.en.bin`
 - Builds `whisper-cli.exe`
 - Creates `%TEMP%\vibevoice`
+
+If `winget` reports that CMake is installed but the same PowerShell window says `cmake is not recognized`, pull the latest repo changes and rerun the installer. The script refreshes the current process PATH and falls back to common CMake install locations such as `C:\Program Files\CMake\bin\cmake.exe`.
 
 Run a Windows readiness check:
 
