@@ -12,12 +12,24 @@
   "app": {
     "windows": [
       {
+        "label": "main",
         "title": "VibeVoice",
         "width": 980,
         "height": 680,
         "minWidth": 760,
         "minHeight": 520,
         "alwaysOnTop": false
+      },
+      {
+        "label": "pill",
+        "title": "VibeVoice Pill",
+        "width": 352,
+        "height": 76,
+        "resizable": false,
+        "decorations": false,
+        "transparent": true,
+        "alwaysOnTop": true,
+        "skipTaskbar": true
       }
     ],
     "security": {
@@ -26,7 +38,14 @@
   },
   "bundle": {
     "active": true,
-    "targets": ["deb", "rpm"],
+    "targets": ["deb", "rpm", "msi", "nsis"],
+    "resources": [
+      "../../scripts/install-engine.sh",
+      "../../scripts/install-fedora.sh",
+      "../../scripts/install-windows.ps1",
+      "../../scripts/check-system.sh",
+      "../../scripts/check-windows.ps1"
+    ],
     "icon": []
   }
 }

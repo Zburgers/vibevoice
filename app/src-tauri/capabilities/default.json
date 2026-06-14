@@ -2,6 +2,13 @@
   "$schema": "../gen/schemas/desktop-schema.json",
   "identifier": "default",
   "description": "Default VibeVoice app capabilities",
-  "windows": ["main"],
-  "permissions": ["core:default"]
+  "windows": ["main", "pill"],
+  "permissions": [
+    "core:default",
+    "core:window:allow-set-always-on-top",
+    "core:window:allow-set-size",
+    "core:window:allow-start-dragging",
+    "core:window:allow-show",
+    "core:window:allow-set-focus"
+  ]
 }

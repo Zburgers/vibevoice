@@ -1,5 +1,7 @@
 import { useEffect, useMemo, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
+import { LogicalSize } from "@tauri-apps/api/dpi";
+import { getCurrentWindow, Window as TauriWindow } from "@tauri-apps/api/window";
 import "./App.css";
 
 type TabKey = "main" | "settings" | "history" | "dictionary" | "diagnostics";
@@ -23,6 +25,10 @@ type Diagnostics = {
   mic_available: boolean;
   clipboard_tool: string | null;
   paste_tool: string | null;
+  whisper_path: string | null;
+  model_path: string | null;
+  recorder: string | null;
+  platform: string;
   last_error: string | null;
 };
 
@@ -51,14 +57,15 @@ type AppState = {
   dictionary: DictionaryRule[];
   last_transcript: string | null;
   last_error: string | null;
+  mic_level: number;
   recording_started_at: string | null;
 };
 
 const fallbackState: AppState = {
   voice_state: "Ready",
   settings: {
-    whisper_binary_path: "~/tools/whisper.cpp/build/bin/whisper-cli",
-    model_path: "~/tools/whisper.cpp/models/ggml-base.en.bin",
+    whisper_binary_path: "auto",
+    model_path: "auto",
     hotkey: "Ctrl+Alt+Space",
     recording_mode: "toggle",
     auto_paste: true,
@@ -72,12 +79,17 @@ const fallbackState: AppState = {
     mic_available: false,
     clipboard_tool: null,
     paste_tool: null,
+    whisper_path: null,
+    model_path: null,
+    recorder: null,
+    platform: "unknown",
     last_error: null,
   },
   history: [],
   dictionary: [],
   last_transcript: null,
   last_error: null,
+  mic_level: 0,
   recording_started_at: null,
 };
 
@@ -115,12 +127,15 @@ function errorMessage(error: unknown) {
 function App() {
   const [activeTab, setActiveTab] = useState<TabKey>("main");
   const [state, setState] = useState<AppState>(fallbackState);
+  const [expanded, setExpanded] = useState(false);
   const [commandStatus, setCommandStatus] = useState("Idle");
   const [setupMessage, setSetupMessage] = useState("Local install path not yet verified.");
   const [selectedHistoryId, setSelectedHistoryId] = useState("");
   const [newRuleSpoken, setNewRuleSpoken] = useState("");
   const [newRuleReplacement, setNewRuleReplacement] = useState("");
 
+  const currentWindow = useMemo(() => getCurrentWindow(), []);
+  const isPillWindow = currentWindow.label === "pill";
   const phase = stateToPhase[state.voice_state];
   const selectedHistory = useMemo(
     () => state.history.find((entry) => entry.id === selectedHistoryId) ?? state.history[0],
@@ -145,6 +160,26 @@ function App() {
     return () => window.clearInterval(timer);
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
+
+  useEffect(() => {
+    if (!isPillWindow) return;
+    currentWindow.setAlwaysOnTop(true).catch(() => undefined);
+    currentWindow
+      .setSize(expanded ? new LogicalSize(390, 580) : new LogicalSize(352, 76))
+      .catch(() => undefined);
+  }, [currentWindow, expanded, isPillWindow]);
+
+  function handleWindowDrag(event: React.MouseEvent<HTMLElement>) {
+    const target = event.target as HTMLElement;
+    if (target.closest("button, input, select, textarea")) return;
+    if (isPillWindow) currentWindow.startDragging().catch(() => undefined);
+  }
+
+  async function showMainWindow() {
+    const mainWindow = await TauriWindow.getByLabel("main");
+    await mainWindow?.show();
+    await mainWindow?.setFocus();
+  }
 
   async function handlePrimaryAction() {
     try {
@@ -241,6 +276,198 @@ function App() {
     { label: "Last error", value: state.last_error || "None", tone: state.last_error ? "bad" : "neutral" },
   ] as const;
 
+  if (isPillWindow) {
+    return (
+    <main className={`floating-shell ${expanded ? "is-expanded" : ""}`} onMouseDown={handleWindowDrag}>
+      <button
+        type="button"
+        className={`voice-pill tone-${phaseTone[phase]}`}
+        onClick={() => setExpanded((value) => !value)}
+        aria-expanded={expanded}
+      >
+        <span className="pill-dot" />
+        <span className="pill-copy">
+          <span className="pill-title">{phaseCopy[phase]}</span>
+          <span className="pill-subtitle">
+            {state.voice_state === "Recording" ? `${recordingSeconds}s` : state.settings.hotkey}
+          </span>
+        </span>
+        <MicVisualizer level={state.mic_level} active={state.voice_state === "Recording"} />
+      </button>
+
+      {expanded && (
+        <section className="command-panel" aria-live="polite">
+          <div className="command-bar">
+            <button
+              type="button"
+              className={`primary-action tone-${phaseTone[phase]}`}
+              disabled={state.voice_state === "Processing"}
+              onClick={handlePrimaryAction}
+            >
+              {actionLabel}
+            </button>
+            <button type="button" className="secondary-action" onClick={() => handleReinsert(state.last_transcript || selectedHistory?.final_transcript)}>
+              Paste previous
+            </button>
+            <button type="button" className="secondary-action icon-action" onClick={() => setExpanded(false)}>
+              Close
+            </button>
+            <button type="button" className="secondary-action icon-action" onClick={showMainWindow}>
+              App
+            </button>
+          </div>
+
+          <nav className="tabs" aria-label="Views">
+            {(["main", "history", "settings", "dictionary", "diagnostics"] as TabKey[]).map((tab) => (
+              <button
+                key={tab}
+                type="button"
+                className={`tab ${activeTab === tab ? "is-active" : ""}`}
+                onClick={() => setActiveTab(tab)}
+              >
+                {tab}
+              </button>
+            ))}
+          </nav>
+
+          {activeTab === "main" && (
+            <section className="panel main-panel">
+              <div className="status-strip">
+                <Status label="Engine" value={state.diagnostics.whisper_found ? "Ready" : "Missing"} />
+                <Status label="Model" value={state.diagnostics.model_found ? "Ready" : "Missing"} />
+                <Status label="Mic" value={state.diagnostics.mic_available ? "Ready" : "Missing"} />
+                <Status label="Output" value={state.settings.auto_paste ? "Paste" : "Clipboard"} />
+              </div>
+              <article className="detail-panel transcript-panel">
+                <div className="eyebrow">Last transcript</div>
+                <div className="detail-text">{state.last_error || state.last_transcript || "No transcript yet."}</div>
+              </article>
+              <div className="command-status">{commandStatus}</div>
+            </section>
+          )}
+
+          {activeTab === "history" && (
+            <section className="panel">
+              <div className="history-list compact-list">
+                {state.history.length === 0 ? (
+                  <div className="empty-state">No local history stored.</div>
+                ) : (
+                  state.history.map((entry) => (
+                    <button
+                      key={entry.id}
+                      type="button"
+                      className={`history-row ${selectedHistory?.id === entry.id ? "is-selected" : ""}`}
+                      onClick={() => setSelectedHistoryId(entry.id)}
+                    >
+                      <div className="history-topline">
+                        <span>{new Date(entry.created_at).toLocaleString()}</span>
+                        <span className={`tone-${entry.error ? "bad" : "good"}`}>{entry.insert_status}</span>
+                      </div>
+                      <div className="history-text">{entry.final_transcript}</div>
+                    </button>
+                  ))
+                )}
+              </div>
+              <div className="action-row">
+                <button type="button" className="secondary-action" onClick={() => handleCopyTranscript(selectedHistory?.final_transcript)}>
+                  Copy
+                </button>
+                <button type="button" className="secondary-action" onClick={() => handleReinsert()}>
+                  Paste
+                </button>
+                {selectedHistory && (
+                  <button type="button" className="secondary-action" onClick={() => handleDeleteHistory(selectedHistory.id)}>
+                    Delete
+                  </button>
+                )}
+              </div>
+            </section>
+          )}
+
+          {activeTab === "settings" && (
+            <section className="panel">
+              <div className="form-grid">
+                <Field label="Whisper binary path" value={state.settings.whisper_binary_path} onChange={(value) => updateSettings({ whisper_binary_path: value })} />
+                <Field label="Model path" value={state.settings.model_path} onChange={(value) => updateSettings({ model_path: value })} />
+                <Field label="Hotkey" value={state.settings.hotkey} onChange={(value) => updateSettings({ hotkey: value })} />
+              </div>
+              <div className="toggle-grid">
+                <Toggle label="Clipboard fallback" value={state.settings.clipboard_fallback} onClick={() => updateSettings({ clipboard_fallback: !state.settings.clipboard_fallback })} />
+                <Toggle label="Auto paste" value={state.settings.auto_paste} onClick={() => updateSettings({ auto_paste: !state.settings.auto_paste })} />
+                <Toggle label="Dictionary cleanup" value={state.settings.dictionary_cleanup} onClick={() => updateSettings({ dictionary_cleanup: !state.settings.dictionary_cleanup })} />
+              </div>
+              <button type="button" className="secondary-action full-width" onClick={handleSetup}>
+                Run setup
+              </button>
+            </section>
+          )}
+
+          {activeTab === "dictionary" && (
+            <section className="panel">
+              <div className="dictionary-form">
+                <Field label="Spoken phrase" value={newRuleSpoken} onChange={setNewRuleSpoken} />
+                <Field label="Replacement" value={newRuleReplacement} onChange={setNewRuleReplacement} />
+                <button type="button" className="primary-action small" onClick={handleAddRule}>
+                  Add
+                </button>
+              </div>
+              <div className="rule-list compact-list">
+                {state.dictionary.map((rule) => (
+                  <article key={rule.id} className={`rule-row ${rule.enabled ? "is-on" : ""}`}>
+                    <button type="button" className="rule-toggle" onClick={() => toggleRule(rule.id, !rule.enabled)}>
+                      {rule.enabled ? "On" : "Off"}
+                    </button>
+                    <div className="rule-text">
+                      <div className="rule-find">{rule.spoken}</div>
+                      <div className="rule-replace">{rule.replacement}</div>
+                    </div>
+                    <button type="button" className="secondary-action" onClick={() => removeRule(rule.id)}>
+                      Delete
+                    </button>
+                  </article>
+                ))}
+              </div>
+            </section>
+          )}
+
+          {activeTab === "diagnostics" && (
+            <section className="panel">
+              <div className="diag-list">
+                {diagnosticRows.map((row) => (
+                  <div className="diag-row" key={row.label}>
+                    <span className="diag-label">{row.label}</span>
+                    <span className={`diag-value tone-${row.tone}`}>{row.value}</span>
+                  </div>
+                ))}
+                <div className="diag-row">
+                  <span className="diag-label">Resolved binary</span>
+                  <span className="diag-value mono">{state.diagnostics.whisper_path || "Not resolved"}</span>
+                </div>
+                <div className="diag-row">
+                  <span className="diag-label">Resolved model</span>
+                  <span className="diag-value mono">{state.diagnostics.model_path || "Not resolved"}</span>
+                </div>
+              </div>
+              <article className="detail-panel">
+                <div className="eyebrow">Setup log</div>
+                <div className="detail-text mono">{setupMessage}</div>
+              </article>
+              <div className="action-row">
+                <button type="button" className="secondary-action" onClick={refresh}>
+                  Refresh
+                </button>
+                <button type="button" className="secondary-action" onClick={handleSetup}>
+                  Run setup
+                </button>
+              </div>
+            </section>
+          )}
+        </section>
+      )}
+    </main>
+  );
+  }
+
   return (
     <div className="app-shell">
       <aside className="sidebar">
@@ -292,13 +519,16 @@ function App() {
               <div className="stack">
                 <Metric label="VibeVoice status" value={phaseCopy[phase]} />
                 <Metric label="Whisper engine" value={state.diagnostics.whisper_found ? "Found" : "Missing"} />
-                <Metric label="Model path" value={state.settings.model_path} mono />
+                <Metric label="Resolved model" value={state.diagnostics.model_path || state.settings.model_path} mono />
               </div>
 
               <div className="stack">
                 <Metric label="Hotkey" value={state.settings.hotkey} />
-                <Metric label="Recording mode" value="Toggle" />
-                <Metric label="Last transcript" value={state.last_transcript || "No transcript yet."} />
+                <Metric label="Recorder" value={state.diagnostics.recorder || "Unavailable"} />
+                <article className="metric">
+                  <div className="metric-label">Mic input</div>
+                  <MicVisualizer level={state.mic_level} active={state.voice_state === "Recording"} />
+                </article>
               </div>
             </div>
 
@@ -325,6 +555,11 @@ function App() {
               <Status label="Auto paste" value={state.settings.auto_paste ? "On" : "Off"} />
               <Status label="Command" value={commandStatus} />
             </div>
+
+            <article className="detail-panel transcript-panel">
+              <div className="eyebrow">Last transcript</div>
+              <div className="detail-text">{state.last_error || state.last_transcript || "No transcript yet."}</div>
+            </article>
           </section>
         )}
 
@@ -427,14 +662,8 @@ function App() {
             </div>
 
             <div className="dictionary-form">
-              <label className="field">
-                <span>Spoken phrase</span>
-                <input value={newRuleSpoken} onChange={(event) => setNewRuleSpoken(event.target.value)} />
-              </label>
-              <label className="field">
-                <span>Replacement</span>
-                <input value={newRuleReplacement} onChange={(event) => setNewRuleReplacement(event.target.value)} />
-              </label>
+              <Field label="Spoken phrase" value={newRuleSpoken} onChange={setNewRuleSpoken} />
+              <Field label="Replacement" value={newRuleReplacement} onChange={setNewRuleReplacement} />
               <button type="button" className="primary-action small" onClick={handleAddRule}>
                 Add rule
               </button>
@@ -485,6 +714,14 @@ function App() {
                     <span className={`diag-value tone-${row.tone}`}>{row.value}</span>
                   </div>
                 ))}
+                <div className="diag-row">
+                  <span className="diag-label">Resolved binary</span>
+                  <span className="diag-value mono">{state.diagnostics.whisper_path || "Not resolved"}</span>
+                </div>
+                <div className="diag-row">
+                  <span className="diag-label">Resolved model</span>
+                  <span className="diag-value mono">{state.diagnostics.model_path || "Not resolved"}</span>
+                </div>
               </div>
               <article className="detail-panel">
                 <div className="eyebrow">Setup log</div>
@@ -494,33 +731,6 @@ function App() {
           </section>
         )}
       </main>
-
-      <aside className="widget" aria-live="polite">
-        <div className="widget-top">
-          <div>
-            <div className="widget-label">Floating widget</div>
-            <div className={`status-chip tone-${phaseTone[phase]}`}>{phaseCopy[phase]}</div>
-          </div>
-          <button type="button" className="widget-close" onClick={refresh}>
-            Sync
-          </button>
-        </div>
-        <div className="widget-body">
-          <div className="widget-line">
-            <span>{state.settings.hotkey}</span>
-            <span>{state.voice_state === "Recording" ? `${recordingSeconds}s` : state.settings.auto_paste ? "auto-paste" : "clipboard"}</span>
-          </div>
-          <div className="widget-text">{state.last_error || state.last_transcript || "Ready for local dictation."}</div>
-          <div className="widget-actions">
-            <button type="button" className="widget-action" onClick={handlePrimaryAction}>
-              {state.voice_state === "Recording" ? "Stop" : "Record"}
-            </button>
-            <button type="button" className="widget-action" onClick={() => handleCopyTranscript()}>
-              Copy
-            </button>
-          </div>
-        </div>
-      </aside>
     </div>
   );
 }
@@ -531,6 +741,19 @@ function Metric({ label, value, mono = false }: { label: string; value: string; 
       <div className="metric-label">{label}</div>
       <div className={`metric-value ${mono ? "mono" : ""}`}>{value}</div>
     </article>
+  );
+}
+
+function MicVisualizer({ level, active }: { level: number; active: boolean }) {
+  const normalized = Math.max(0.04, Math.min(1, level || 0));
+  return (
+    <span className={`mic-visualizer ${active ? "is-active" : ""}`} aria-hidden="true">
+      {Array.from({ length: 12 }).map((_, index) => {
+        const wave = active ? Math.abs(Math.sin(index * 0.72 + normalized * 2.8)) : 0.16;
+        const height = Math.round(18 + (active ? Math.max(normalized, wave * normalized) : wave) * 34);
+        return <span key={index} style={{ height: `${height}px` }} />;
+      })}
+    </span>
   );
 }
 
