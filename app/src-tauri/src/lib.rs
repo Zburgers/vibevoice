@@ -121,6 +121,10 @@ struct RecordingSession {
     mic_level: Arc<AtomicU32>,
 }
 
+unsafe impl Send for RecordingSession {}
+unsafe impl Sync for RecordingSession {}
+
+
 enum AudioWriterMessage {
     Samples(Vec<i16>),
     Stop,
