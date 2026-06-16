@@ -121,6 +121,14 @@ const phaseTone: Record<Phase, "good" | "warn" | "bad" | "neutral" | "accent"> =
   error: "bad",
 };
 
+const tabLabels: Record<TabKey, string> = {
+  main: "Main",
+  settings: "Settings",
+  history: "History",
+  dictionary: "Dictionary",
+  diagnostics: "Diagnostics",
+};
+
 function errorMessage(error: unknown) {
   return error instanceof Error ? error.message : String(error);
 }
@@ -139,7 +147,7 @@ function App() {
   const isPillWindow = currentWindow.label === "pill";
   const phase = stateToPhase[state.voice_state];
   const selectedHistory = useMemo(
-    () => state.history.find((entry) => entry.id === selectedHistoryId) ?? state.history[0],
+    () => state.history.find((entry) => entry.id === selectedHistoryId) ?? (selectedHistoryId ? undefined : state.history[0]),
     [state.history, selectedHistoryId],
   );
   const recordingSeconds = useMemo(() => {
@@ -150,7 +158,12 @@ function App() {
   async function refresh() {
     const next = await invoke<AppState>("get_app_state");
     setState(next);
-    if (!selectedHistoryId && next.history[0]) setSelectedHistoryId(next.history[0].id);
+    setSelectedHistoryId((currentId) => {
+      if (currentId && next.history.some((entry) => entry.id === currentId)) {
+        return currentId;
+      }
+      return next.history[0]?.id ?? "";
+    });
   }
 
   useEffect(() => {
@@ -329,7 +342,7 @@ function App() {
                 className={`tab ${activeTab === tab ? "is-active" : ""}`}
                 onClick={() => setActiveTab(tab)}
               >
-                {tab}
+                {tabLabels[tab]}
               </button>
             ))}
           </nav>
@@ -479,7 +492,7 @@ function App() {
           <img className="brand-mark" src={vibevoiceIcon} alt="" aria-hidden="true" />
           <div className="brand-copy">
             <div className="brand-name">VibeVoice</div>
-            <div className="brand-subtitle">Local whisper utility</div>
+            <div className="brand-subtitle">Local Whisper Utility</div>
           </div>
         </div>
 
@@ -491,13 +504,13 @@ function App() {
               className={`tab ${activeTab === tab ? "is-active" : ""}`}
               onClick={() => setActiveTab(tab)}
             >
-              {tab}
+              {tabLabels[tab]}
             </button>
           ))}
         </nav>
 
         <div className="sidebar-panel">
-          <div className="sidebar-label">Current state</div>
+          <div className="sidebar-label">Current State</div>
           <div className={`status-chip tone-${phaseTone[phase]}`}>{phaseCopy[phase]}</div>
           <div className="sidebar-copy">{state.diagnostics.whisper_found ? "Whisper found" : "Whisper missing"}</div>
           <div className="sidebar-copy">{state.diagnostics.model_found ? "Model found" : "Model missing"}</div>

@@ -87,7 +87,7 @@ button {
 .app-shell {
   min-height: 100vh;
   display: grid;
-  grid-template-columns: 280px minmax(0, 1fr);
+  grid-template-columns: clamp(220px, 22vw, 280px) minmax(0, 1fr);
   gap: 24px;
   padding: 24px;
   background: 
@@ -947,19 +947,55 @@ select:focus {
 /* Responsive Overrides */
 @media (max-width: 1100px) {
   .app-shell {
-    grid-template-columns: 1fr;
+    grid-template-columns: clamp(200px, 28vw, 260px) minmax(0, 1fr);
+    gap: 16px;
     padding: 16px;
   }
 
   .sidebar {
-    position: relative;
-    top: 0;
-    min-height: auto;
-    width: 100%;
+    top: 16px;
+    min-height: calc(100vh - 32px);
   }
 }
 
 @media (max-width: 768px) {
+  .app-shell {
+    grid-template-columns: minmax(168px, 34vw) minmax(0, 1fr);
+    padding: 10px;
+    gap: 10px;
+  }
+
+  .sidebar {
+    top: 10px;
+    min-height: calc(100vh - 20px);
+    padding: 10px;
+  }
+
+  .brand-block {
+    gap: 10px;
+  }
+
+  .brand-mark {
+    width: 34px;
+    height: 34px;
+  }
+
+  .brand-name {
+    font-size: 0.94rem;
+  }
+
+  .brand-subtitle,
+  .sidebar-copy,
+  .sidebar-label,
+  .tab,
+  .ghost-button {
+    font-size: 0.78rem;
+  }
+
+  .panel {
+    padding: 14px;
+  }
+
   .main-grid,
   .history-layout,
   .diag-grid,

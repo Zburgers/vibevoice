@@ -124,7 +124,6 @@ struct RecordingSession {
 unsafe impl Send for RecordingSession {}
 unsafe impl Sync for RecordingSession {}
 
-
 enum AudioWriterMessage {
     Samples(Vec<i16>),
     Stop,
@@ -187,6 +186,17 @@ fn save_settings(app: AppHandle, settings: Settings) -> Result<(), String> {
 
 #[tauri::command]
 fn start_recording(app: AppHandle, data: tauri::State<AppData>) -> Result<(), String> {
+    {
+        let runtime = data.runtime.lock().map_err(|error| error.to_string())?;
+        match runtime.voice_state {
+            VoiceState::Recording => return Err("Recording is already active.".to_string()),
+            VoiceState::Processing => {
+                return Err("Recording is still processing. Please wait.".to_string())
+            }
+            _ => {}
+        }
+    }
+
     let settings = load_settings(&app)?;
     ensure_engine_ready(&settings)?;
     let tmp = temp_workspace();
@@ -197,8 +207,12 @@ fn start_recording(app: AppHandle, data: tauri::State<AppData>) -> Result<(), St
     let mut session = start_audio_capture(audio_path.clone(), output_prefix.clone())?;
 
     let mut runtime = data.runtime.lock().map_err(|error| error.to_string())?;
-    if let Some(mut existing) = runtime.recording.take() {
-        let _ = stop_audio_capture(&mut existing);
+    if matches!(
+        runtime.voice_state,
+        VoiceState::Recording | VoiceState::Processing
+    ) {
+        let _ = stop_audio_capture(&mut session);
+        return Err("Recording cannot start until the current action finishes.".to_string());
     }
     session
         .stream
@@ -215,17 +229,24 @@ fn start_recording(app: AppHandle, data: tauri::State<AppData>) -> Result<(), St
 fn stop_recording(app: AppHandle, data: tauri::State<AppData>) -> Result<HistoryItem, String> {
     let mut session = {
         let mut runtime = data.runtime.lock().map_err(|error| error.to_string())?;
-        runtime.voice_state = VoiceState::Processing;
-        runtime
-            .recording
-            .take()
-            .ok_or_else(|| "No active recording to stop.".to_string())?
+        match runtime.recording.take() {
+            Some(session) => {
+                runtime.voice_state = VoiceState::Processing;
+                session
+            }
+            None => {
+                runtime.voice_state = VoiceState::Ready;
+                runtime.last_error = Some("No active recording to stop.".to_string());
+                return Err("No active recording to stop.".to_string());
+            }
+        }
     };
 
-    stop_audio_capture(&mut session)?;
-    let settings = load_settings(&app)?;
-    let dictionary = load_dictionary(&app)?;
-    let raw_transcript = transcribe(&settings, &session.audio_path, &session.output_prefix)?;
+    stop_audio_capture(&mut session).map_err(|error| finish_stop_error(&data, error))?;
+    let settings = load_settings(&app).map_err(|error| finish_stop_error(&data, error))?;
+    let dictionary = load_dictionary(&app).map_err(|error| finish_stop_error(&data, error))?;
+    let raw_transcript = transcribe(&settings, &session.audio_path, &session.output_prefix)
+        .map_err(|error| finish_stop_error(&data, error))?;
     let mut final_transcript = cleanup_transcript(&raw_transcript);
     if settings.dictionary_cleanup {
         final_transcript = apply_dictionary(&final_transcript, &dictionary);
@@ -271,21 +292,16 @@ fn stop_recording(app: AppHandle, data: tauri::State<AppData>) -> Result<History
         insert_status: insert_status.clone(),
         error: error.clone(),
     };
-    append_history(&app, item.clone())?;
+    append_history(&app, item.clone()).map_err(|error| finish_stop_error(&data, error))?;
 
     let mut runtime = data
         .runtime
         .lock()
         .map_err(|lock_error| lock_error.to_string())?;
-    runtime.voice_state = if insert_status.starts_with("inserted") {
-        VoiceState::Inserted
-    } else if insert_status == "copied" || insert_status.starts_with("copied") {
-        VoiceState::Copied
-    } else {
-        VoiceState::Error
-    };
+    runtime.voice_state = VoiceState::Ready;
     runtime.last_transcript = Some(final_transcript);
     runtime.last_error = error;
+    runtime.mic_level = 0.0;
     Ok(item)
 }
 
@@ -1125,7 +1141,13 @@ fn set_runtime_error(data: &tauri::State<AppData>, message: &str) -> Result<(), 
     let mut runtime = data.runtime.lock().map_err(|error| error.to_string())?;
     runtime.voice_state = VoiceState::Error;
     runtime.last_error = Some(message.to_string());
+    runtime.mic_level = 0.0;
     Ok(())
+}
+
+fn finish_stop_error(data: &tauri::State<AppData>, message: String) -> String {
+    let _ = set_runtime_error(data, &message);
+    message
 }
 
 fn parse_hotkey(hotkey: &str) -> Result<Shortcut, String> {
