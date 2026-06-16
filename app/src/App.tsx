@@ -129,6 +129,14 @@ const tabLabels: Record<TabKey, string> = {
   diagnostics: "Diagnostics",
 };
 
+const tabRailLabels: Record<TabKey, string> = {
+  main: "M",
+  settings: "S",
+  history: "H",
+  dictionary: "Di",
+  diagnostics: "Dx",
+};
+
 function errorMessage(error: unknown) {
   return error instanceof Error ? error.message : String(error);
 }
@@ -140,11 +148,13 @@ function App() {
   const [commandStatus, setCommandStatus] = useState("Idle");
   const [setupMessage, setSetupMessage] = useState("Local install path not yet verified.");
   const [selectedHistoryId, setSelectedHistoryId] = useState("");
+  const [sidebarCollapsed, setSidebarCollapsed] = useState(false);
   const [newRuleSpoken, setNewRuleSpoken] = useState("");
   const [newRuleReplacement, setNewRuleReplacement] = useState("");
 
   const currentWindow = useMemo(() => getCurrentWindow(), []);
   const isPillWindow = currentWindow.label === "pill";
+  const sidebarClass = sidebarCollapsed ? "is-sidebar-collapsed" : "is-sidebar-expanded";
   const phase = stateToPhase[state.voice_state];
   const selectedHistory = useMemo(
     () => state.history.find((entry) => entry.id === selectedHistoryId) ?? (selectedHistoryId ? undefined : state.history[0]),
@@ -182,6 +192,16 @@ function App() {
       .setSize(expanded ? new LogicalSize(390, 580) : new LogicalSize(352, 76))
       .catch(() => undefined);
   }, [currentWindow, expanded, isPillWindow]);
+
+  useEffect(() => {
+    if (isPillWindow) return;
+    const collapseWhenNarrow = () => {
+      if (window.innerWidth <= 1100) setSidebarCollapsed(true);
+    };
+    collapseWhenNarrow();
+    window.addEventListener("resize", collapseWhenNarrow);
+    return () => window.removeEventListener("resize", collapseWhenNarrow);
+  }, [isPillWindow]);
 
   function handleWindowDrag(event: React.MouseEvent<HTMLElement>) {
     const target = event.target as HTMLElement;
@@ -486,7 +506,7 @@ function App() {
   }
 
   return (
-    <div className="app-shell">
+    <div className={`app-shell ${sidebarClass}`}>
       <aside className="sidebar">
         <div className="brand-block">
           <img className="brand-mark" src={vibevoiceIcon} alt="" aria-hidden="true" />
@@ -494,6 +514,15 @@ function App() {
             <div className="brand-name">VibeVoice</div>
             <div className="brand-subtitle">Local Whisper Utility</div>
           </div>
+          <button
+            type="button"
+            className="sidebar-toggle"
+            onClick={() => setSidebarCollapsed((value) => !value)}
+            aria-label={sidebarCollapsed ? "Expand sidebar" : "Collapse sidebar"}
+            title={sidebarCollapsed ? "Expand sidebar" : "Collapse sidebar"}
+          >
+            <span aria-hidden="true">{sidebarCollapsed ? ">" : "<"}</span>
+          </button>
         </div>
 
         <nav className="tabs" aria-label="Views">
@@ -503,8 +532,13 @@ function App() {
               type="button"
               className={`tab ${activeTab === tab ? "is-active" : ""}`}
               onClick={() => setActiveTab(tab)}
+              title={tabLabels[tab]}
+              aria-label={tabLabels[tab]}
             >
-              {tabLabels[tab]}
+              <span className="tab-initial" aria-hidden="true">
+                {tabRailLabels[tab]}
+              </span>
+              <span className="tab-label">{tabLabels[tab]}</span>
             </button>
           ))}
         </nav>

@@ -111,6 +111,59 @@ button {
   box-shadow: var(--shadow);
 }
 
+.app-shell.is-sidebar-collapsed {
+  grid-template-columns: 76px minmax(0, 1fr);
+}
+
+.app-shell.is-sidebar-collapsed .sidebar {
+  gap: 14px;
+  padding: 14px 10px;
+}
+
+.app-shell.is-sidebar-collapsed .brand-block {
+  justify-content: center;
+  padding-bottom: 4px;
+}
+
+.app-shell.is-sidebar-collapsed .brand-copy,
+.app-shell.is-sidebar-collapsed .tab-label,
+.app-shell.is-sidebar-collapsed .sidebar-copy,
+.app-shell.is-sidebar-collapsed .sidebar-label,
+.app-shell.is-sidebar-collapsed .ghost-button {
+  display: none;
+}
+
+.app-shell.is-sidebar-collapsed .tab,
+.app-shell.is-sidebar-collapsed .sidebar-toggle {
+  justify-content: center;
+}
+
+.app-shell.is-sidebar-collapsed .tab {
+  padding: 0;
+}
+
+.app-shell.is-sidebar-collapsed .tab-initial {
+  display: inline-flex;
+}
+
+.app-shell.is-sidebar-collapsed .sidebar-panel {
+  align-items: center;
+  padding: 10px;
+}
+
+.app-shell.is-sidebar-collapsed .sidebar .status-chip {
+  width: 18px;
+  height: 18px;
+  padding: 0;
+  justify-content: center;
+  overflow: hidden;
+  font-size: 0;
+}
+
+.app-shell.is-sidebar-collapsed .sidebar .status-chip::before {
+  flex: 0 0 auto;
+}
+
 .brand-block {
   display: flex;
   align-items: center;
@@ -144,6 +197,25 @@ button {
   margin-top: 1px;
 }
 
+.sidebar-toggle {
+  margin-left: auto;
+  width: 32px;
+  height: 32px;
+  flex: 0 0 32px;
+  border-radius: 8px;
+  border: 1px solid var(--color-rule);
+  color: var(--color-muted);
+  background: var(--color-paper);
+  font-weight: 700;
+  transition: all 150ms ease;
+}
+
+.sidebar-toggle:hover {
+  color: var(--color-ink);
+  border-color: var(--color-accent);
+  background: var(--color-paper-3);
+}
+
 .tabs {
   display: grid;
   gap: 6px;
@@ -160,6 +232,14 @@ button {
   color: var(--color-muted);
   border: 1px solid transparent;
   transition: all 150ms ease;
+}
+
+.tab-initial {
+  display: none;
+  align-items: center;
+  justify-content: center;
+  width: 100%;
+  font-weight: 700;
 }
 
 .tab:hover {
@@ -947,27 +1027,93 @@ select:focus {
 /* Responsive Overrides */
 @media (max-width: 1100px) {
   .app-shell {
-    grid-template-columns: clamp(200px, 28vw, 260px) minmax(0, 1fr);
     gap: 16px;
     padding: 16px;
+  }
+
+  .app-shell.is-sidebar-expanded {
+    grid-template-columns: clamp(220px, 28vw, 260px) minmax(0, 1fr);
+  }
+
+  .app-shell:not(.is-sidebar-expanded) {
+    grid-template-columns: 76px minmax(0, 1fr);
   }
 
   .sidebar {
     top: 16px;
     min-height: calc(100vh - 32px);
   }
+
+  .app-shell:not(.is-sidebar-expanded) .sidebar {
+    gap: 14px;
+    padding: 14px 10px;
+  }
+
+  .app-shell:not(.is-sidebar-expanded) .brand-block {
+    justify-content: center;
+    padding-bottom: 4px;
+  }
+
+  .app-shell:not(.is-sidebar-expanded) .brand-copy,
+  .app-shell:not(.is-sidebar-expanded) .tab-label,
+  .app-shell:not(.is-sidebar-expanded) .sidebar-copy,
+  .app-shell:not(.is-sidebar-expanded) .sidebar-label,
+  .app-shell:not(.is-sidebar-expanded) .ghost-button {
+    display: none;
+  }
+
+  .app-shell:not(.is-sidebar-expanded) .tab,
+  .app-shell:not(.is-sidebar-expanded) .sidebar-toggle {
+    justify-content: center;
+  }
+
+  .app-shell:not(.is-sidebar-expanded) .tab {
+    padding: 0;
+  }
+
+  .app-shell:not(.is-sidebar-expanded) .tab-initial {
+    display: inline-flex;
+  }
+
+  .app-shell:not(.is-sidebar-expanded) .sidebar-panel {
+    align-items: center;
+    padding: 10px;
+  }
+
+  .app-shell:not(.is-sidebar-expanded) .sidebar .status-chip {
+    width: 18px;
+    height: 18px;
+    padding: 0;
+    justify-content: center;
+    overflow: hidden;
+    font-size: 0;
+  }
+
+  .app-shell:not(.is-sidebar-expanded) .sidebar .status-chip::before {
+    flex: 0 0 auto;
+  }
 }
 
 @media (max-width: 768px) {
   .app-shell {
-    grid-template-columns: minmax(168px, 34vw) minmax(0, 1fr);
     padding: 10px;
     gap: 10px;
+  }
+
+  .app-shell.is-sidebar-expanded {
+    grid-template-columns: minmax(188px, 34vw, 240px) minmax(0, 1fr);
+  }
+
+  .app-shell:not(.is-sidebar-expanded) {
+    grid-template-columns: 68px minmax(0, 1fr);
   }
 
   .sidebar {
     top: 10px;
     min-height: calc(100vh - 20px);
+  }
+
+  .app-shell:not(.is-sidebar-expanded) .sidebar {
     padding: 10px;
   }
 
