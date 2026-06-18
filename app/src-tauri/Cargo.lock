@@ -4001,6 +4001,7 @@ dependencies = [
  "cpal",
  "dirs",
  "hound",
+ "libc",
  "serde",
  "serde_json",
  "tauri",

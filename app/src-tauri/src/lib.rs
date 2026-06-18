@@ -1,8 +1,4 @@
 use chrono::{DateTime, Utc};
-use cpal::{
-    traits::{DeviceTrait, HostTrait, StreamTrait},
-    SampleFormat, Stream,
-};
 use serde::{Deserialize, Serialize};
 use std::{
     fs, io,
@@ -11,15 +7,23 @@ use std::{
     str::FromStr,
     sync::{
         atomic::{AtomicU32, Ordering},
-        mpsc::{self, Sender},
         Arc, Mutex,
     },
-    thread::{self, JoinHandle},
+    thread::{self},
     time::Instant,
 };
 use tauri::{AppHandle, Manager};
 use tauri_plugin_global_shortcut::{Code, GlobalShortcutExt, Modifiers, Shortcut, ShortcutState};
 use uuid::Uuid;
+
+#[cfg(any(target_os = "windows", target_os = "macos"))]
+use cpal::{
+    traits::{DeviceTrait, HostTrait, StreamTrait},
+    SampleFormat, Stream,
+};
+
+#[cfg(any(target_os = "windows", target_os = "macos"))]
+use std::sync::mpsc::{self, Sender};
 
 const AUTO_PATH: &str = "auto";
 const MODEL_FILE_NAME: &str = "ggml-base.en.bin";
@@ -110,20 +114,38 @@ struct AppStateSnapshot {
     recording_started_at: Option<DateTime<Utc>>,
 }
 
+#[cfg(any(target_os = "windows", target_os = "macos"))]
 struct RecordingSession {
     audio_path: PathBuf,
     output_prefix: PathBuf,
     started: Instant,
     started_at: DateTime<Utc>,
     stream: Stream,
-    writer_tx: Sender<AudioWriterMessage>,
-    writer_thread: Option<JoinHandle<Result<(), String>>>,
+    writer_tx: std::sync::mpsc::Sender<AudioWriterMessage>,
+    writer_thread: Option<std::thread::JoinHandle<Result<(), String>>>,
     mic_level: Arc<AtomicU32>,
 }
 
-unsafe impl Send for RecordingSession {}
-unsafe impl Sync for RecordingSession {}
+#[cfg(target_os = "linux")]
+use std::process::Child;
 
+#[cfg(target_os = "linux")]
+struct RecordingSession {
+    audio_path: PathBuf,
+    output_prefix: PathBuf,
+    started: Instant,
+    started_at: DateTime<Utc>,
+    recorder_process: Child,
+    mic_level: Arc<AtomicU32>,
+}
+
+#[cfg(any(target_os = "windows", target_os = "macos"))]
+unsafe impl Send for RecordingSession {}
+
+#[cfg(target_os = "linux")]
+unsafe impl Send for RecordingSession {}
+
+#[cfg(any(target_os = "windows", target_os = "macos"))]
 enum AudioWriterMessage {
     Samples(Vec<i16>),
     Stop,
@@ -205,6 +227,8 @@ fn start_recording(app: AppHandle, data: tauri::State<AppData>) -> Result<(), St
     let audio_path = tmp.join(format!("{stem}.wav"));
     let output_prefix = tmp.join(stem);
     let mut session = start_audio_capture(audio_path.clone(), output_prefix.clone())?;
+    #[cfg(any(target_os = "windows", target_os = "macos"))]
+    start_recording_stream(&session)?;
 
     let mut runtime = data.runtime.lock().map_err(|error| error.to_string())?;
     if matches!(
@@ -214,10 +238,6 @@ fn start_recording(app: AppHandle, data: tauri::State<AppData>) -> Result<(), St
         let _ = stop_audio_capture(&mut session);
         return Err("Recording cannot start until the current action finishes.".to_string());
     }
-    session
-        .stream
-        .play()
-        .map_err(|error| format!("Recording failed to start: {error}"))?;
     runtime.voice_state = VoiceState::Recording;
     runtime.last_error = None;
     runtime.mic_level = 0.0;
@@ -542,7 +562,7 @@ fn diagnostics(settings: &Settings, last_error: Option<String>) -> Diagnostics {
         model_path: resolved
             .as_ref()
             .map(|paths| paths.model.display().to_string()),
-        recorder: Some("cpal".to_string()),
+        recorder: recorder_name(),
         platform: std::env::consts::OS.to_string(),
         last_error,
     }
@@ -754,11 +774,25 @@ fn temp_workspace() -> PathBuf {
     std::env::temp_dir().join("vibevoice")
 }
 
+#[cfg(any(target_os = "windows", target_os = "macos"))]
 fn default_input_device_available() -> bool {
     cpal::default_host().default_input_device().is_some()
 }
 
+#[cfg(target_os = "linux")]
+fn default_input_device_available() -> bool {
+    recorder_command().is_some()
+}
+
 fn start_audio_capture(
+    audio_path: PathBuf,
+    output_prefix: PathBuf,
+) -> Result<RecordingSession, String> {
+    start_audio_capture_impl(audio_path, output_prefix)
+}
+
+#[cfg(any(target_os = "windows", target_os = "macos"))]
+fn start_audio_capture_impl(
     audio_path: PathBuf,
     output_prefix: PathBuf,
 ) -> Result<RecordingSession, String> {
@@ -811,7 +845,7 @@ fn start_audio_capture(
                 move |data: &[f32], _| {
                     write_mono_samples(data, channels, &stream_tx, &stream_level, f32_to_i16)
                 },
-                audio_stream_error,
+                audio_stream_error_impl,
                 None,
             )
         }
@@ -823,7 +857,7 @@ fn start_audio_capture(
                 move |data: &[i16], _| {
                     write_mono_samples(data, channels, &stream_tx, &stream_level, |sample| sample)
                 },
-                audio_stream_error,
+                audio_stream_error_impl,
                 None,
             )
         }
@@ -835,7 +869,7 @@ fn start_audio_capture(
                 move |data: &[u16], _| {
                     write_mono_samples(data, channels, &stream_tx, &stream_level, u16_to_i16)
                 },
-                audio_stream_error,
+                audio_stream_error_impl,
                 None,
             )
         }
@@ -859,11 +893,53 @@ fn start_audio_capture(
     })
 }
 
-fn audio_stream_error(error: cpal::StreamError) {
+#[cfg(target_os = "linux")]
+fn start_audio_capture_impl(
+    audio_path: PathBuf,
+    output_prefix: PathBuf,
+) -> Result<RecordingSession, String> {
+    let (command, args) = recorder_command().ok_or_else(|| {
+        "No supported Linux audio recorder found. Install pw-record, arecord, or ffmpeg."
+            .to_string()
+    })?;
+    let child = Command::new(command)
+        .args(args)
+        .arg(&audio_path)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .map_err(|error| format!("Audio recorder failed to start: {error}"))?;
+
+    Ok(RecordingSession {
+        audio_path,
+        output_prefix,
+        started: Instant::now(),
+        started_at: Utc::now(),
+        recorder_process: child,
+        mic_level: Arc::new(AtomicU32::new(0)),
+    })
+}
+
+#[cfg(any(target_os = "windows", target_os = "macos"))]
+fn audio_stream_error_impl(error: cpal::StreamError) {
     eprintln!("VibeVoice audio stream error: {error}");
 }
 
+#[cfg(any(target_os = "windows", target_os = "macos"))]
+fn start_recording_stream(session: &RecordingSession) -> Result<(), String> {
+    session
+        .stream
+        .play()
+        .map_err(|error| format!("Recording failed to start: {error}"))
+}
+
 fn stop_audio_capture(session: &mut RecordingSession) -> Result<(), String> {
+    stop_audio_capture_impl(session)
+}
+
+#[cfg(any(target_os = "windows", target_os = "macos"))]
+fn stop_audio_capture_impl(session: &mut RecordingSession) -> Result<(), String> {
     let _ = session.stream.pause();
     let _ = session.writer_tx.send(AudioWriterMessage::Stop);
     if let Some(writer_thread) = session.writer_thread.take() {
@@ -874,6 +950,12 @@ fn stop_audio_capture(session: &mut RecordingSession) -> Result<(), String> {
     Ok(())
 }
 
+#[cfg(target_os = "linux")]
+fn stop_audio_capture_impl(session: &mut RecordingSession) -> Result<(), String> {
+    stop_linux_recorder(&mut session.recorder_process)
+}
+
+#[cfg(any(target_os = "windows", target_os = "macos"))]
 fn write_mono_samples<T, F>(
     data: &[T],
     channels: usize,
@@ -905,12 +987,82 @@ fn write_mono_samples<T, F>(
     let _ = writer_tx.send(AudioWriterMessage::Samples(output));
 }
 
+#[cfg(any(target_os = "windows", target_os = "macos"))]
 fn f32_to_i16(sample: f32) -> i16 {
     (sample.clamp(-1.0, 1.0) * i16::MAX as f32) as i16
 }
 
+#[cfg(any(target_os = "windows", target_os = "macos"))]
 fn u16_to_i16(sample: u16) -> i16 {
     (sample as i32 - 32768).clamp(i16::MIN as i32, i16::MAX as i32) as i16
+}
+
+#[cfg(target_os = "linux")]
+fn recorder_name() -> Option<String> {
+    recorder_command().map(|(name, _)| name.to_string())
+}
+
+#[cfg(any(target_os = "windows", target_os = "macos"))]
+fn recorder_name() -> Option<String> {
+    Some("cpal".to_string())
+}
+
+#[cfg(target_os = "linux")]
+fn recorder_command() -> Option<(&'static str, &'static [&'static str])> {
+    if command_exists("pw-record") {
+        Some((
+            "pw-record",
+            &["--rate", "16000", "--channels", "1", "--format", "s16"],
+        ))
+    } else if command_exists("arecord") {
+        Some((
+            "arecord",
+            &["-q", "-c", "1", "-r", "16000", "-f", "S16_LE", "-t", "wav"],
+        ))
+    } else if command_exists("ffmpeg") {
+        Some((
+            "ffmpeg",
+            &[
+                "-hide_banner",
+                "-loglevel",
+                "error",
+                "-y",
+                "-f",
+                "pulse",
+                "-i",
+                "default",
+                "-ac",
+                "1",
+                "-ar",
+                "16000",
+            ],
+        ))
+    } else {
+        None
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn stop_linux_recorder(child: &mut Child) -> Result<(), String> {
+    let pid = child.id() as i32;
+    unsafe {
+        let _ = libc::kill(pid, libc::SIGINT);
+    }
+    for _ in 0..20 {
+        if child
+            .try_wait()
+            .map_err(|error| error.to_string())?
+            .is_some()
+        {
+            return Ok(());
+        }
+        thread::sleep(std::time::Duration::from_millis(100));
+    }
+    child
+        .kill()
+        .map_err(|error| format!("Failed to stop recorder: {error}"))?;
+    let _ = child.wait();
+    Ok(())
 }
 
 fn cleanup_transcript(text: &str) -> String {
