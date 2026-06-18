@@ -12,7 +12,11 @@ use std::{
     thread::{self},
     time::Instant,
 };
-use tauri::{AppHandle, Manager};
+use tauri::{
+    menu::{Menu, MenuItem},
+    tray::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent},
+    AppHandle, Manager,
+};
 use tauri_plugin_global_shortcut::{Code, GlobalShortcutExt, Modifiers, Shortcut, ShortcutState};
 use uuid::Uuid;
 
@@ -1349,6 +1353,92 @@ fn register_global_hotkey(app: &AppHandle, hotkey: &str) -> Result<(), String> {
     register_hotkey_handler(app, shortcut)
 }
 
+fn show_window(app: &AppHandle, label: &str) {
+    if let Some(window) = app.get_webview_window(label) {
+        let _ = window.show();
+        let _ = window.set_focus();
+    }
+}
+
+fn toggle_window(app: &AppHandle, label: &str) {
+    if let Some(window) = app.get_webview_window(label) {
+        match window.is_visible() {
+            Ok(true) => {
+                let _ = window.hide();
+            }
+            _ => {
+                let _ = window.show();
+                let _ = window.set_focus();
+            }
+        }
+    }
+}
+
+fn toggle_recording(app: &AppHandle) {
+    let state = app.state::<AppData>();
+    let is_recording = state
+        .runtime
+        .lock()
+        .map(|runtime| matches!(runtime.voice_state, VoiceState::Recording))
+        .unwrap_or(false);
+    if is_recording {
+        let _ = stop_recording(app.clone(), state);
+    } else {
+        let _ = start_recording(app.clone(), state);
+    }
+}
+
+fn setup_tray(app: &AppHandle) -> Result<(), String> {
+    let show_item = MenuItem::with_id(app, "show", "Show VibeVoice", true, None::<&str>)
+        .map_err(|error| error.to_string())?;
+    let pill_item = MenuItem::with_id(app, "toggle_pill", "Show or Hide Pill", true, None::<&str>)
+        .map_err(|error| error.to_string())?;
+    let record_item = MenuItem::with_id(
+        app,
+        "toggle_recording",
+        "Start or Stop Recording",
+        true,
+        None::<&str>,
+    )
+    .map_err(|error| error.to_string())?;
+    let quit_item = MenuItem::with_id(app, "quit", "Quit VibeVoice", true, None::<&str>)
+        .map_err(|error| error.to_string())?;
+    let menu = Menu::with_items(app, &[&show_item, &pill_item, &record_item, &quit_item])
+        .map_err(|error| error.to_string())?;
+    let icon = app
+        .default_window_icon()
+        .cloned()
+        .ok_or_else(|| "Default window icon is unavailable.".to_string())?;
+
+    TrayIconBuilder::with_id("vibevoice")
+        .icon(icon)
+        .tooltip("VibeVoice")
+        .menu(&menu)
+        .show_menu_on_left_click(false)
+        .on_menu_event(|app, event| match event.id().as_ref() {
+            "show" => show_window(app, "main"),
+            "toggle_pill" => toggle_window(app, "pill"),
+            "toggle_recording" => toggle_recording(app),
+            "quit" => app.exit(0),
+            _ => {}
+        })
+        .on_tray_icon_event(|tray, event| match event {
+            TrayIconEvent::Click {
+                button: MouseButton::Left,
+                button_state: MouseButtonState::Up,
+                ..
+            }
+            | TrayIconEvent::DoubleClick {
+                button: MouseButton::Left,
+                ..
+            } => show_window(tray.app_handle(), "main"),
+            _ => {}
+        })
+        .build(app)
+        .map(|_| ())
+        .map_err(|error| error.to_string())
+}
+
 pub fn run() {
     tauri::Builder::default()
         .plugin(tauri_plugin_global_shortcut::Builder::new().build())
@@ -1369,6 +1459,7 @@ pub fn run() {
             run_setup_script
         ])
         .setup(|app| {
+            setup_tray(app.handle())?;
             let hotkey = load_settings(app.handle())
                 .map(|settings| settings.hotkey)
                 .unwrap_or_else(|_| Settings::default().hotkey);

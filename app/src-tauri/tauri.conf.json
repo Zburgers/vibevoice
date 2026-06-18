@@ -38,7 +38,7 @@
   },
   "bundle": {
     "active": true,
-    "targets": ["deb", "rpm", "msi", "nsis"],
+    "targets": "all",
     "resources": [
       "../../scripts/install-engine.sh",
       "../../scripts/install-fedora.sh",
