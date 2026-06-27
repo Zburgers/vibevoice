@@ -33,6 +33,7 @@ const AUTO_PATH: &str = "auto";
 const MODEL_FILE_NAME: &str = "ggml-base.en.bin";
 const LEGACY_DEFAULT_WHISPER: &str = "~/tools/whisper.cpp/build/bin/whisper-cli";
 const LEGACY_DEFAULT_MODEL: &str = "~/tools/whisper.cpp/models/ggml-base.en.bin";
+const DEFAULT_UPDATE_REF: &str = "origin/master";
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "PascalCase")]
@@ -116,6 +117,20 @@ struct AppStateSnapshot {
     last_error: Option<String>,
     mic_level: f32,
     recording_started_at: Option<DateTime<Utc>>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct UpdateInfo {
+    current_version: String,
+    latest_version: Option<String>,
+    current_commit: Option<String>,
+    latest_commit: Option<String>,
+    branch: Option<String>,
+    update_ref: Option<String>,
+    source_dir: Option<String>,
+    update_available: bool,
+    can_update: bool,
+    status: String,
 }
 
 #[cfg(any(target_os = "windows", target_os = "macos"))]
@@ -429,6 +444,113 @@ fn run_setup_script(app: AppHandle, data: tauri::State<AppData>) -> Result<Strin
     }
 }
 
+#[tauri::command]
+fn check_for_updates(app: AppHandle) -> Result<UpdateInfo, String> {
+    let source_dir = find_source_dir(&app);
+    let Some(source_dir) = source_dir else {
+        return Ok(UpdateInfo {
+            current_version: env!("CARGO_PKG_VERSION").to_string(),
+            latest_version: None,
+            current_commit: None,
+            latest_commit: None,
+            branch: None,
+            update_ref: None,
+            source_dir: None,
+            update_available: false,
+            can_update: false,
+            status: "Source checkout not found. Install from a git checkout or set VIBEVOICE_SOURCE_DIR.".to_string(),
+        });
+    };
+
+    git(&source_dir, ["fetch", "--prune"])?;
+    let current_commit = git_trimmed(&source_dir, ["rev-parse", "--short", "HEAD"]).ok();
+    let branch = git_trimmed(&source_dir, ["branch", "--show-current"]).ok();
+    let update_ref = git_trimmed(&source_dir, ["rev-parse", "--abbrev-ref", "@{u}"])
+        .ok()
+        .filter(|value| !value.trim().is_empty())
+        .unwrap_or_else(|| DEFAULT_UPDATE_REF.to_string());
+    let latest_commit = git_trimmed(&source_dir, ["rev-parse", "--short", &update_ref]).ok();
+    let latest_version = git_show_package_version(&source_dir, &update_ref).ok();
+    let update_available = match (&current_commit, &latest_commit) {
+        (Some(current), Some(latest)) => current != latest,
+        _ => false,
+    };
+    let dirty = git_trimmed(&source_dir, ["status", "--porcelain"])
+        .map(|value| !value.is_empty())
+        .unwrap_or(false);
+    let can_update = !dirty && latest_commit.is_some();
+    let status = if dirty {
+        "Local source checkout has uncommitted changes. Commit or stash them before updating."
+            .to_string()
+    } else if update_available {
+        "New source update available.".to_string()
+    } else {
+        "VibeVoice is up to date.".to_string()
+    };
+
+    Ok(UpdateInfo {
+        current_version: env!("CARGO_PKG_VERSION").to_string(),
+        latest_version,
+        current_commit,
+        latest_commit,
+        branch,
+        update_ref: Some(update_ref),
+        source_dir: Some(source_dir.display().to_string()),
+        update_available,
+        can_update,
+        status,
+    })
+}
+
+#[tauri::command]
+fn install_update_and_restart(app: AppHandle) -> Result<(), String> {
+    let info = check_for_updates(app.clone())?;
+    if !info.update_available {
+        return Err("No update is available.".to_string());
+    }
+    if !info.can_update {
+        return Err(info.status);
+    }
+
+    let source_dir = info
+        .source_dir
+        .ok_or_else(|| "Source checkout not found.".to_string())?;
+    let script_name = if cfg!(target_os = "windows") {
+        "scripts/update-app.ps1"
+    } else {
+        "scripts/update-app.sh"
+    };
+    let script = find_repo_file(&app, script_name)
+        .ok_or_else(|| format!("Update script not found: {script_name}"))?;
+    let current_exe = std::env::current_exe()
+        .map_err(|error| format!("Could not resolve current executable: {error}"))?;
+
+    let mut command = if cfg!(target_os = "windows") {
+        let mut command = Command::new("powershell");
+        command.args(["-NoProfile", "-ExecutionPolicy", "Bypass", "-File"]);
+        command.arg(script);
+        command
+    } else {
+        let mut command = Command::new("bash");
+        command.arg(script);
+        command
+    };
+    command.arg(source_dir);
+    command.arg(current_exe);
+    command
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .map_err(|error| format!("Update failed to start: {error}"))?;
+
+    thread::spawn(move || {
+        std::thread::sleep(std::time::Duration::from_millis(350));
+        app.exit(0);
+    });
+    Ok(())
+}
+
 fn load_settings(app: &AppHandle) -> Result<Settings, String> {
     read_json_or_default(settings_path(app)?)
 }
@@ -500,6 +622,72 @@ fn find_repo_file(app: &AppHandle, relative: &str) -> Option<PathBuf> {
         }
     }
     None
+}
+
+fn find_source_dir(app: &AppHandle) -> Option<PathBuf> {
+    if let Ok(value) = std::env::var("VIBEVOICE_SOURCE_DIR") {
+        let path = expand_home(&value);
+        if path.join(".git").exists() && path.join("app").join("package.json").is_file() {
+            return Some(path);
+        }
+    }
+
+    let mut candidates = Vec::new();
+    if let Ok(current) = std::env::current_dir() {
+        candidates.push(current);
+    }
+    if let Ok(exe) = std::env::current_exe() {
+        if let Some(parent) = exe.parent() {
+            candidates.push(parent.to_path_buf());
+        }
+    }
+    if let Ok(resource) = app.path().resource_dir() {
+        candidates.push(resource);
+    }
+
+    for base in candidates {
+        let mut cursor = Some(base.as_path());
+        while let Some(path) = cursor {
+            if path.join(".git").exists() && path.join("app").join("package.json").is_file() {
+                return Some(path.to_path_buf());
+            }
+            cursor = path.parent();
+        }
+    }
+    None
+}
+
+fn git<const N: usize>(source_dir: &Path, args: [&str; N]) -> Result<String, String> {
+    let output = Command::new("git")
+        .args(args)
+        .current_dir(source_dir)
+        .output()
+        .map_err(|error| format!("git failed to start: {error}"))?;
+    let combined = format!(
+        "{}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    if output.status.success() {
+        Ok(combined)
+    } else {
+        Err(combined)
+    }
+}
+
+fn git_trimmed<const N: usize>(source_dir: &Path, args: [&str; N]) -> Result<String, String> {
+    git(source_dir, args).map(|value| value.trim().to_string())
+}
+
+fn git_show_package_version(source_dir: &Path, update_ref: &str) -> Result<String, String> {
+    let spec = format!("{update_ref}:app/package.json");
+    let content = git(source_dir, ["show", &spec])?;
+    let json: serde_json::Value =
+        serde_json::from_str(&content).map_err(|error| error.to_string())?;
+    json.get("version")
+        .and_then(|value| value.as_str())
+        .map(|value| value.to_string())
+        .ok_or_else(|| "Remote app/package.json did not contain a version.".to_string())
 }
 
 fn read_json_or_default<T>(path: PathBuf) -> Result<T, String>
@@ -1456,7 +1644,9 @@ pub fn run() {
             add_dictionary_rule,
             delete_dictionary_rule,
             set_dictionary_rule_enabled,
-            run_setup_script
+            run_setup_script,
+            check_for_updates,
+            install_update_and_restart
         ])
         .setup(|app| {
             setup_tray(app.handle())?;

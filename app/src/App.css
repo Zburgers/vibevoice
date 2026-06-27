@@ -366,7 +366,8 @@ button {
 
 .main-grid,
 .history-layout,
-.diag-grid {
+.diag-grid,
+.update-layout {
   display: grid;
   grid-template-columns: minmax(0, 1fr) minmax(0, 1fr);
   gap: 20px;
@@ -456,6 +457,12 @@ button {
 }
 
 .primary-action:disabled {
+  opacity: 0.5;
+  cursor: not-allowed;
+  transform: none;
+}
+
+.secondary-action:disabled {
   opacity: 0.5;
   cursor: not-allowed;
   transform: none;
@@ -1145,6 +1152,7 @@ select:focus {
   .main-grid,
   .history-layout,
   .diag-grid,
+  .update-layout,
   .form-grid,
   .toggle-grid,
   .dictionary-form {

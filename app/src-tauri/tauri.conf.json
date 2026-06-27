@@ -42,6 +42,12 @@
     "resources": [
       "../../scripts/install-engine.sh",
       "../../scripts/install-fedora.sh",
+      "../../scripts/install-app.sh",
+      "../../scripts/install-app.ps1",
+      "../../scripts/uninstall-app.sh",
+      "../../scripts/uninstall-app.ps1",
+      "../../scripts/update-app.sh",
+      "../../scripts/update-app.ps1",
       "../../scripts/install-windows.ps1",
       "../../scripts/check-system.sh",
       "../../scripts/check-windows.ps1"

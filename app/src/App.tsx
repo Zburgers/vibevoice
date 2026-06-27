@@ -5,7 +5,7 @@ import { getCurrentWindow, Window as TauriWindow } from "@tauri-apps/api/window"
 import vibevoiceIcon from "./assets/vibevoice-icon.png";
 import "./App.css";
 
-type TabKey = "main" | "settings" | "history" | "dictionary" | "diagnostics";
+type TabKey = "main" | "settings" | "history" | "dictionary" | "updates" | "diagnostics";
 type VoiceState = "Ready" | "Recording" | "Processing" | "Inserted" | "Copied" | "Error";
 type Phase = "ready" | "recording" | "transcribing" | "inserted" | "copied" | "error";
 
@@ -60,6 +60,19 @@ type AppState = {
   last_error: string | null;
   mic_level: number;
   recording_started_at: string | null;
+};
+
+type UpdateInfo = {
+  current_version: string;
+  latest_version: string | null;
+  current_commit: string | null;
+  latest_commit: string | null;
+  branch: string | null;
+  update_ref: string | null;
+  source_dir: string | null;
+  update_available: boolean;
+  can_update: boolean;
+  status: string;
 };
 
 const fallbackState: AppState = {
@@ -126,6 +139,7 @@ const tabLabels: Record<TabKey, string> = {
   settings: "Settings",
   history: "History",
   dictionary: "Dictionary",
+  updates: "Updates",
   diagnostics: "Diagnostics",
 };
 
@@ -134,6 +148,7 @@ const tabRailLabels: Record<TabKey, string> = {
   settings: "S",
   history: "H",
   dictionary: "Di",
+  updates: "Up",
   diagnostics: "Dx",
 };
 
@@ -147,6 +162,9 @@ function App() {
   const [expanded, setExpanded] = useState(false);
   const [commandStatus, setCommandStatus] = useState("Idle");
   const [setupMessage, setSetupMessage] = useState("Local install path not yet verified.");
+  const [updateInfo, setUpdateInfo] = useState<UpdateInfo | null>(null);
+  const [updateMessage, setUpdateMessage] = useState("Updates have not been checked yet.");
+  const [updateBusy, setUpdateBusy] = useState(false);
   const [selectedHistoryId, setSelectedHistoryId] = useState("");
   const [sidebarCollapsed, setSidebarCollapsed] = useState(false);
   const [newRuleSpoken, setNewRuleSpoken] = useState("");
@@ -184,6 +202,18 @@ function App() {
     return () => window.clearInterval(timer);
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
+
+  useEffect(() => {
+    invoke<UpdateInfo>("check_for_updates")
+      .then((info) => {
+        setUpdateInfo(info);
+        setUpdateMessage(info.status);
+        if (info.update_available && !isPillWindow) {
+          setActiveTab("updates");
+        }
+      })
+      .catch((error) => setUpdateMessage(errorMessage(error)));
+  }, [isPillWindow]);
 
   useEffect(() => {
     if (!isPillWindow) return;
@@ -250,6 +280,31 @@ function App() {
     } catch (error) {
       setSetupMessage(errorMessage(error));
       await refresh().catch(() => undefined);
+    }
+  }
+
+  async function handleCheckUpdates() {
+    try {
+      setUpdateBusy(true);
+      setUpdateMessage("Checking source control...");
+      const info = await invoke<UpdateInfo>("check_for_updates");
+      setUpdateInfo(info);
+      setUpdateMessage(info.status);
+    } catch (error) {
+      setUpdateMessage(errorMessage(error));
+    } finally {
+      setUpdateBusy(false);
+    }
+  }
+
+  async function handleInstallUpdate() {
+    try {
+      setUpdateBusy(true);
+      setUpdateMessage("Starting updater. VibeVoice will close and reopen after installation.");
+      await invoke("install_update_and_restart");
+    } catch (error) {
+      setUpdateBusy(false);
+      setUpdateMessage(errorMessage(error));
     }
   }
 
@@ -355,7 +410,7 @@ function App() {
           </div>
 
           <nav className="tabs" aria-label="Views">
-            {(["main", "history", "settings", "dictionary", "diagnostics"] as TabKey[]).map((tab) => (
+            {(["main", "history", "settings", "dictionary", "updates", "diagnostics"] as TabKey[]).map((tab) => (
               <button
                 key={tab}
                 type="button"
@@ -436,6 +491,34 @@ function App() {
               <button type="button" className="secondary-action full-width" onClick={handleSetup}>
                 Run setup
               </button>
+            </section>
+          )}
+
+          {activeTab === "updates" && (
+            <section className="panel">
+              <div className="diag-list">
+                <UpdateRows info={updateInfo} />
+              </div>
+              <article className="detail-panel">
+                <div className="eyebrow">Update status</div>
+                <div className="detail-text mono">{updateMessage}</div>
+              </article>
+              <div className="action-row">
+                <button type="button" className="secondary-action" disabled={updateBusy} onClick={handleCheckUpdates}>
+                  Check
+                </button>
+                <button
+                  type="button"
+                  className="primary-action"
+                  disabled={updateBusy || !updateInfo?.update_available || !updateInfo?.can_update}
+                  onClick={handleInstallUpdate}
+                >
+                  Update now
+                </button>
+                <button type="button" className="secondary-action" disabled={updateBusy} onClick={() => setActiveTab("main")}>
+                  Later
+                </button>
+              </div>
             </section>
           )}
 
@@ -526,7 +609,7 @@ function App() {
         </div>
 
         <nav className="tabs" aria-label="Views">
-          {(["main", "settings", "history", "dictionary", "diagnostics"] as TabKey[]).map((tab) => (
+          {(["main", "settings", "history", "dictionary", "updates", "diagnostics"] as TabKey[]).map((tab) => (
             <button
               key={tab}
               type="button"
@@ -740,6 +823,47 @@ function App() {
           </section>
         )}
 
+        {activeTab === "updates" && (
+          <section className="panel">
+            <div className="panel-head">
+              <div>
+                <div className="eyebrow">Updates</div>
+                <h1>Install the latest source release.</h1>
+              </div>
+              <div className={`status-chip tone-${updateInfo?.update_available ? "warn" : "good"}`}>
+                {updateInfo?.update_available ? "Available" : "Ready"}
+              </div>
+            </div>
+
+            <div className="update-layout">
+              <div className="diag-list">
+                <UpdateRows info={updateInfo} />
+              </div>
+              <article className="detail-panel">
+                <div className="eyebrow">Update status</div>
+                <div className="detail-text mono">{updateMessage}</div>
+              </article>
+            </div>
+
+            <div className="action-row">
+              <button type="button" className="secondary-action" disabled={updateBusy} onClick={handleCheckUpdates}>
+                Check for updates
+              </button>
+              <button
+                type="button"
+                className="primary-action"
+                disabled={updateBusy || !updateInfo?.update_available || !updateInfo?.can_update}
+                onClick={handleInstallUpdate}
+              >
+                Update now
+              </button>
+              <button type="button" className="secondary-action" disabled={updateBusy} onClick={() => setActiveTab("main")}>
+                Do it later
+              </button>
+            </div>
+          </section>
+        )}
+
         {activeTab === "diagnostics" && (
           <section className="panel">
             <div className="panel-head">
@@ -814,6 +938,29 @@ function Status({ label, value }: { label: string; value: string }) {
       <span className="status-label">{label}</span>
       <span className="status-value">{value}</span>
     </div>
+  );
+}
+
+function UpdateRows({ info }: { info: UpdateInfo | null }) {
+  const rows = [
+    { label: "Current version", value: info?.current_version || "0.1.0" },
+    { label: "Latest version", value: info?.latest_version || "Unknown" },
+    { label: "Current commit", value: info?.current_commit || "Unknown" },
+    { label: "Latest commit", value: info?.latest_commit || "Unknown" },
+    { label: "Branch", value: info?.branch || "Unknown" },
+    { label: "Update ref", value: info?.update_ref || "Unknown" },
+    { label: "Source checkout", value: info?.source_dir || "Not found" },
+  ];
+
+  return (
+    <>
+      {rows.map((row) => (
+        <div className="diag-row" key={row.label}>
+          <span className="diag-label">{row.label}</span>
+          <span className="diag-value mono">{row.value}</span>
+        </div>
+      ))}
+    </>
   );
 }
 
