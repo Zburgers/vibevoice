@@ -614,9 +614,13 @@ fn find_repo_file(app: &AppHandle, relative: &str) -> Option<PathBuf> {
     for base in candidates {
         let mut cursor = Some(base.as_path());
         while let Some(path) = cursor {
-            let candidate = path.join(relative);
-            if candidate.exists() {
-                return Some(candidate);
+            for candidate in [
+                path.join(relative),
+                path.join("_up").join("_up").join(relative),
+            ] {
+                if candidate.exists() {
+                    return Some(candidate);
+                }
             }
             cursor = path.parent();
         }

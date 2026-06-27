@@ -1,5 +1,6 @@
 #!/usr/bin/env bash
 set -euo pipefail
+umask 022
 
 SOURCE_DIR="${1:?source checkout path is required}"
 CURRENT_EXE="${2:-}"

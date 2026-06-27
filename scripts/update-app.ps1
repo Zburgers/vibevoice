@@ -5,6 +5,7 @@ param(
 )
 
 $ErrorActionPreference = "Stop"
+$env:MSYS = "$env:MSYS umask=022"
 $LogDir = Join-Path $env:LOCALAPPDATA "VibeVoice\logs"
 $LogFile = Join-Path $LogDir "update.log"
 New-Item -ItemType Directory -Force -Path $LogDir | Out-Null

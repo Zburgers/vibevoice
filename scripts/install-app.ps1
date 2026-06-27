@@ -1,4 +1,5 @@
 $ErrorActionPreference = "Stop"
+$env:MSYS = "$env:MSYS umask=022"
 $SourceDir = Resolve-Path (Join-Path $PSScriptRoot "..")
 
 Set-Location (Join-Path $SourceDir "app")
