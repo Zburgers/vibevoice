@@ -695,6 +695,22 @@ select:focus {
   padding-top: 12px;
 }
 
+.update-panel {
+  gap: 0;
+}
+
+.update-row {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  gap: 16px;
+  align-items: start;
+}
+
+.update-status {
+  margin-top: 8px;
+  font-size: 0.95rem;
+}
+
 /* Dictionary replacement */
 .dictionary-form {
   display: grid;
@@ -1167,5 +1183,9 @@ select:focus {
     flex-direction: column;
     align-items: stretch;
     gap: 12px;
+  }
+
+  .update-row {
+    grid-template-columns: minmax(0, 1fr);
   }
 }

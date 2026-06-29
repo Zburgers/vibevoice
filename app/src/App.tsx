@@ -1,7 +1,9 @@
-import { useEffect, useMemo, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { LogicalSize } from "@tauri-apps/api/dpi";
 import { getCurrentWindow, Window as TauriWindow } from "@tauri-apps/api/window";
+import { relaunch } from "@tauri-apps/plugin-process";
+import { check, type DownloadEvent, type Update } from "@tauri-apps/plugin-updater";
 import vibevoiceIcon from "./assets/vibevoice-icon.png";
 import "./App.css";
 
@@ -169,6 +171,10 @@ function App() {
   const [sidebarCollapsed, setSidebarCollapsed] = useState(false);
   const [newRuleSpoken, setNewRuleSpoken] = useState("");
   const [newRuleReplacement, setNewRuleReplacement] = useState("");
+  const [availableUpdate, setAvailableUpdate] = useState<Update | null>(null);
+  const [updateStatus, setUpdateStatus] = useState("Checking for updates on launch.");
+  const [updateProgress, setUpdateProgress] = useState<number | null>(null);
+  const updateStartedRef = useRef(false);
 
   const currentWindow = useMemo(() => getCurrentWindow(), []);
   const isPillWindow = currentWindow.label === "pill";
@@ -194,6 +200,53 @@ function App() {
     });
   }
 
+  function trackUpdateProgress(event: DownloadEvent) {
+    if (event.event === "Started") {
+      setUpdateProgress(0);
+      setUpdateStatus(
+        event.data.contentLength
+          ? `Downloading update (${Math.round(event.data.contentLength / 1024 / 1024)} MB).`
+          : "Downloading update.",
+      );
+      return;
+    }
+    if (event.event === "Progress") {
+      setUpdateProgress((current) => (current ?? 0) + event.data.chunkLength);
+      return;
+    }
+    setUpdateStatus("Installing update.");
+  }
+
+  async function installUpdate(update: Update) {
+    updateStartedRef.current = true;
+    setAvailableUpdate(update);
+    setUpdateProgress(null);
+    setUpdateStatus(`Installing VibeVoice ${update.version}.`);
+    await update.downloadAndInstall(trackUpdateProgress);
+    setUpdateStatus("Update installed. Restarting VibeVoice.");
+    await relaunch();
+  }
+
+  async function checkForUpdates(installAutomatically = false) {
+    try {
+      setUpdateStatus("Checking for updates.");
+      setUpdateProgress(null);
+      const update = await check();
+      if (!update) {
+        setAvailableUpdate(null);
+        setUpdateStatus("VibeVoice is up to date.");
+        return;
+      }
+      setAvailableUpdate(update);
+      setUpdateStatus(`VibeVoice ${update.version} is available.`);
+      if (installAutomatically) {
+        await installUpdate(update);
+      }
+    } catch (error) {
+      setUpdateStatus(`Update check failed: ${errorMessage(error)}`);
+    }
+  }
+
   useEffect(() => {
     refresh().catch((error) => setCommandStatus(errorMessage(error)));
     const timer = window.setInterval(() => {
@@ -204,15 +257,20 @@ function App() {
   }, []);
 
   useEffect(() => {
+    if (isPillWindow) return;
     invoke<UpdateInfo>("check_for_updates")
       .then((info) => {
         setUpdateInfo(info);
         setUpdateMessage(info.status);
-        if (info.update_available && !isPillWindow) {
+        if (info.update_available) {
           setActiveTab("updates");
         }
       })
       .catch((error) => setUpdateMessage(errorMessage(error)));
+    if (!updateStartedRef.current) {
+      checkForUpdates(true);
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [isPillWindow]);
 
   useEffect(() => {
@@ -690,6 +748,30 @@ function App() {
               <Status label="Command" value={commandStatus} />
             </div>
 
+            <article className="detail-panel update-panel">
+              <div className="update-row">
+                <div>
+                  <div className="eyebrow">Updates</div>
+                  <div className="detail-text update-status">{updateStatus}</div>
+                  {updateProgress !== null && (
+                    <div className="detail-meta">
+                      <span>{Math.round(updateProgress / 1024 / 1024)} MB downloaded</span>
+                    </div>
+                  )}
+                </div>
+                <div className="action-row tight">
+                  <button type="button" className="secondary-action" onClick={() => checkForUpdates(false)}>
+                    Check
+                  </button>
+                  {availableUpdate && (
+                    <button type="button" className="primary-action" onClick={() => installUpdate(availableUpdate)}>
+                      Install
+                    </button>
+                  )}
+                </div>
+              </div>
+            </article>
+
             <article className="detail-panel transcript-panel">
               <div className="eyebrow">Last transcript</div>
               <div className="detail-text">{state.last_error || state.last_transcript || "No transcript yet."}</div>
@@ -828,38 +910,54 @@ function App() {
             <div className="panel-head">
               <div>
                 <div className="eyebrow">Updates</div>
-                <h1>Install the latest source release.</h1>
+                <h1>Install the latest signed release.</h1>
               </div>
-              <div className={`status-chip tone-${updateInfo?.update_available ? "warn" : "good"}`}>
-                {updateInfo?.update_available ? "Available" : "Ready"}
+              <div className={`status-chip tone-${availableUpdate || updateInfo?.update_available ? "warn" : "good"}`}>
+                {availableUpdate || updateInfo?.update_available ? "Available" : "Ready"}
               </div>
             </div>
 
             <div className="update-layout">
-              <div className="diag-list">
-                <UpdateRows info={updateInfo} />
-              </div>
               <article className="detail-panel">
-                <div className="eyebrow">Update status</div>
+                <div className="eyebrow">Release update</div>
+                <div className="detail-text mono">{updateStatus}</div>
+                {updateProgress !== null && (
+                  <div className="detail-meta">
+                    <span>{Math.round(updateProgress / 1024 / 1024)} MB downloaded</span>
+                  </div>
+                )}
+              </article>
+              <article className="detail-panel">
+                <div className="eyebrow">Source checkout</div>
                 <div className="detail-text mono">{updateMessage}</div>
               </article>
             </div>
 
             <div className="action-row">
+              <button type="button" className="secondary-action" onClick={() => checkForUpdates(false)}>
+                Check release
+              </button>
+              <button type="button" className="primary-action" disabled={!availableUpdate} onClick={() => availableUpdate && installUpdate(availableUpdate)}>
+                Install release
+              </button>
               <button type="button" className="secondary-action" disabled={updateBusy} onClick={handleCheckUpdates}>
-                Check for updates
+                Check source
               </button>
               <button
                 type="button"
-                className="primary-action"
+                className="secondary-action"
                 disabled={updateBusy || !updateInfo?.update_available || !updateInfo?.can_update}
                 onClick={handleInstallUpdate}
               >
-                Update now
+                Update source
               </button>
               <button type="button" className="secondary-action" disabled={updateBusy} onClick={() => setActiveTab("main")}>
                 Do it later
               </button>
+            </div>
+
+            <div className="diag-list">
+              <UpdateRows info={updateInfo} />
             </div>
           </section>
         )}

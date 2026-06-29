@@ -90,3 +90,28 @@ or:
 ```bash
 sudo apt-get install -y libasound2-dev pkg-config
 ```
+
+## Release Builds and Updates
+
+GitHub Actions builds release installers when a `v*` tag is pushed.
+
+```bash
+git tag v0.1.1
+git push origin master --tags
+```
+
+The release workflow builds:
+
+- Windows: NSIS `.exe` and MSI `.msi`
+- Linux: `.deb`, `.rpm`, and AppImage
+- macOS: `.dmg` and `.app` bundles for Intel and Apple Silicon runners
+
+The packaged app checks GitHub Releases on launch using Tauri's signed updater metadata at:
+
+```text
+https://github.com/Zburgers/vibevoice/releases/latest/download/latest.json
+```
+
+If a newer signed release is available, VibeVoice downloads it, installs it, and restarts. The main window also has a manual update check/install control.
+
+Updater signing uses the repository secret `TAURI_SIGNING_PRIVATE_KEY`. Only the public key is stored in `app/src-tauri/tauri.conf.json`; do not commit the private key.
