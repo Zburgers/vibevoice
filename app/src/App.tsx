@@ -238,7 +238,7 @@ function App() {
     if (!isPillWindow) return;
     currentWindow.setAlwaysOnTop(true).catch(() => undefined);
     currentWindow
-      .setSize(expanded ? new LogicalSize(390, 580) : new LogicalSize(352, 76))
+      .setSize(expanded ? new LogicalSize(286, 238) : new LogicalSize(64, 64))
       .catch(() => undefined);
   }, [currentWindow, expanded, isPillWindow]);
 
@@ -258,10 +258,34 @@ function App() {
     if (isPillWindow) currentWindow.startDragging().catch(() => undefined);
   }
 
+  function dragPillWindow(event: React.MouseEvent<HTMLElement>) {
+    event.preventDefault();
+    event.stopPropagation();
+    currentWindow.startDragging().catch(() => undefined);
+  }
+
+  function handleTitlebarDrag(event: React.MouseEvent<HTMLElement>) {
+    const target = event.target as HTMLElement;
+    if (target.closest("button")) return;
+    currentWindow.startDragging().catch(() => undefined);
+  }
+
   async function showMainWindow() {
     const mainWindow = await TauriWindow.getByLabel("main");
     await mainWindow?.show();
     await mainWindow?.setFocus();
+  }
+
+  function minimizeWindow() {
+    currentWindow.minimize().catch((error) => setCommandStatus(errorMessage(error)));
+  }
+
+  function toggleMaximizeWindow() {
+    currentWindow.toggleMaximize().catch((error) => setCommandStatus(errorMessage(error)));
+  }
+
+  function closeWindow() {
+    currentWindow.close().catch((error) => setCommandStatus(errorMessage(error)));
   }
 
   async function handlePrimaryAction() {
@@ -369,12 +393,12 @@ function App() {
 
   const actionLabel =
     state.voice_state === "Recording"
-      ? "Stop Recording"
+      ? "Stop"
       : state.voice_state === "Processing"
-        ? "Processing..."
+        ? "Processing"
         : state.voice_state === "Error"
           ? "Retry"
-          : "Start Recording";
+          : "Record";
 
   const diagnosticRows = [
     { label: "Whisper binary", value: state.diagnostics.whisper_found ? "Found" : "Missing", tone: state.diagnostics.whisper_found ? "good" : "bad" },
@@ -388,27 +412,57 @@ function App() {
   if (isPillWindow) {
     return (
     <main className={`floating-shell ${expanded ? "is-expanded" : ""}`} onMouseDown={handleWindowDrag}>
+      {!expanded && (
+        <button
+          type="button"
+          className="pill-drag-dot"
+          onMouseDown={dragPillWindow}
+          aria-label="Move pill"
+          title="Move"
+        >
+          <span aria-hidden="true">::</span>
+        </button>
+      )}
       <button
         type="button"
         className={`voice-pill tone-${phaseTone[phase]}`}
         onClick={() => setExpanded((value) => !value)}
         aria-expanded={expanded}
+        aria-label={`${phaseCopy[phase]}. Open controls.`}
       >
         <span className="pill-icon-wrap">
           <img className="pill-icon" src={vibevoiceIcon} alt="" aria-hidden="true" />
           <span className="pill-dot" />
         </span>
-        <span className="pill-copy">
-          <span className="pill-title">{phaseCopy[phase]}</span>
-          <span className="pill-subtitle">
-            {state.voice_state === "Recording" ? `${recordingSeconds}s` : state.settings.hotkey}
-          </span>
-        </span>
-        <MicVisualizer level={state.mic_level} active={state.voice_state === "Recording"} />
+        {expanded && (
+          <>
+            <span className="pill-copy">
+              <span className="pill-title">{phaseCopy[phase]}</span>
+              <span className="pill-subtitle">
+                {state.voice_state === "Recording" ? `${recordingSeconds}s` : state.settings.hotkey}
+              </span>
+            </span>
+            <MicVisualizer level={state.mic_level} active={state.voice_state === "Recording"} compact />
+          </>
+        )}
       </button>
 
       {expanded && (
         <section className="command-panel" aria-live="polite">
+          <div className="pill-panel-top">
+            <button type="button" className="pill-move" onMouseDown={dragPillWindow} aria-label="Move pill" title="Move">
+              <span aria-hidden="true">Move</span>
+            </button>
+            <span className={`pill-state tone-${phaseTone[phase]}`}>{phaseCopy[phase]}</span>
+            <button type="button" className="pill-mini-action" onClick={() => setExpanded(false)} aria-label="Collapse" title="Collapse">
+              -
+            </button>
+          </div>
+
+          <div className="pill-transcript">
+            {state.last_error || state.last_transcript || commandStatus}
+          </div>
+
           <div className="command-bar">
             <button
               type="button"
@@ -419,189 +473,12 @@ function App() {
               {actionLabel}
             </button>
             <button type="button" className="secondary-action" onClick={() => handleReinsert(state.last_transcript || selectedHistory?.final_transcript)}>
-              Paste previous
-            </button>
-            <button type="button" className="secondary-action icon-action" onClick={() => setExpanded(false)}>
-              Close
+              Paste
             </button>
             <button type="button" className="secondary-action icon-action" onClick={showMainWindow}>
               App
             </button>
           </div>
-
-          <nav className="tabs" aria-label="Views">
-            {(["main", "history", "settings", "dictionary", "updates", "diagnostics"] as TabKey[]).map((tab) => (
-              <button
-                key={tab}
-                type="button"
-                className={`tab ${activeTab === tab ? "is-active" : ""}`}
-                onClick={() => setActiveTab(tab)}
-              >
-                {tabLabels[tab]}
-              </button>
-            ))}
-          </nav>
-
-          {activeTab === "main" && (
-            <section className="panel main-panel">
-              <div className="status-strip">
-                <Status label="Engine" value={state.diagnostics.whisper_found ? "Ready" : "Missing"} />
-                <Status label="Model" value={state.diagnostics.model_found ? "Ready" : "Missing"} />
-                <Status label="Mic" value={state.diagnostics.mic_available ? "Ready" : "Missing"} />
-                <Status label="Output" value={state.settings.auto_paste ? "Paste" : "Clipboard"} />
-              </div>
-              <article className="detail-panel transcript-panel">
-                <div className="eyebrow">Last transcript</div>
-                <div className="detail-text">{state.last_error || state.last_transcript || "No transcript yet."}</div>
-              </article>
-              <div className="command-status">{commandStatus}</div>
-            </section>
-          )}
-
-          {activeTab === "history" && (
-            <section className="panel">
-              <div className="history-list compact-list">
-                {state.history.length === 0 ? (
-                  <div className="empty-state">No local history stored.</div>
-                ) : (
-                  state.history.map((entry) => (
-                    <button
-                      key={entry.id}
-                      type="button"
-                      className={`history-row ${selectedHistory?.id === entry.id ? "is-selected" : ""}`}
-                      onClick={() => setSelectedHistoryId(entry.id)}
-                    >
-                      <div className="history-topline">
-                        <span>{new Date(entry.created_at).toLocaleString()}</span>
-                        <span className={`tone-${entry.error ? "bad" : "good"}`}>{entry.insert_status}</span>
-                      </div>
-                      <div className="history-text">{entry.final_transcript}</div>
-                    </button>
-                  ))
-                )}
-              </div>
-              <div className="action-row">
-                <button type="button" className="secondary-action" onClick={() => handleCopyTranscript(selectedHistory?.final_transcript)}>
-                  Copy
-                </button>
-                <button type="button" className="secondary-action" onClick={() => handleReinsert()}>
-                  Paste
-                </button>
-                {selectedHistory && (
-                  <button type="button" className="secondary-action" onClick={() => handleDeleteHistory(selectedHistory.id)}>
-                    Delete
-                  </button>
-                )}
-              </div>
-            </section>
-          )}
-
-          {activeTab === "settings" && (
-            <section className="panel">
-              <div className="form-grid">
-                <Field label="Whisper binary path" value={state.settings.whisper_binary_path} onChange={(value) => updateSettings({ whisper_binary_path: value })} />
-                <Field label="Model path" value={state.settings.model_path} onChange={(value) => updateSettings({ model_path: value })} />
-                <Field label="Hotkey" value={state.settings.hotkey} onChange={(value) => updateSettings({ hotkey: value })} />
-              </div>
-              <div className="toggle-grid">
-                <Toggle label="Clipboard fallback" value={state.settings.clipboard_fallback} onClick={() => updateSettings({ clipboard_fallback: !state.settings.clipboard_fallback })} />
-                <Toggle label="Auto paste" value={state.settings.auto_paste} onClick={() => updateSettings({ auto_paste: !state.settings.auto_paste })} />
-                <Toggle label="Dictionary cleanup" value={state.settings.dictionary_cleanup} onClick={() => updateSettings({ dictionary_cleanup: !state.settings.dictionary_cleanup })} />
-              </div>
-              <button type="button" className="secondary-action full-width" onClick={handleSetup}>
-                Run setup
-              </button>
-            </section>
-          )}
-
-          {activeTab === "updates" && (
-            <section className="panel">
-              <div className="diag-list">
-                <UpdateRows info={updateInfo} />
-              </div>
-              <article className="detail-panel">
-                <div className="eyebrow">Update status</div>
-                <div className="detail-text mono">{updateMessage}</div>
-              </article>
-              <div className="action-row">
-                <button type="button" className="secondary-action" disabled={updateBusy} onClick={handleCheckUpdates}>
-                  Check
-                </button>
-                <button
-                  type="button"
-                  className="primary-action"
-                  disabled={updateBusy || !updateInfo?.update_available || !updateInfo?.can_update}
-                  onClick={handleInstallUpdate}
-                >
-                  Update now
-                </button>
-                <button type="button" className="secondary-action" disabled={updateBusy} onClick={() => setActiveTab("main")}>
-                  Later
-                </button>
-              </div>
-            </section>
-          )}
-
-          {activeTab === "dictionary" && (
-            <section className="panel">
-              <div className="dictionary-form">
-                <Field label="Spoken phrase" value={newRuleSpoken} onChange={setNewRuleSpoken} />
-                <Field label="Replacement" value={newRuleReplacement} onChange={setNewRuleReplacement} />
-                <button type="button" className="primary-action small" onClick={handleAddRule}>
-                  Add
-                </button>
-              </div>
-              <div className="rule-list compact-list">
-                {state.dictionary.map((rule) => (
-                  <article key={rule.id} className={`rule-row ${rule.enabled ? "is-on" : ""}`}>
-                    <button type="button" className="rule-toggle" onClick={() => toggleRule(rule.id, !rule.enabled)}>
-                      {rule.enabled ? "On" : "Off"}
-                    </button>
-                    <div className="rule-text">
-                      <div className="rule-find">{rule.spoken}</div>
-                      <div className="rule-replace">{rule.replacement}</div>
-                    </div>
-                    <button type="button" className="secondary-action" onClick={() => removeRule(rule.id)}>
-                      Delete
-                    </button>
-                  </article>
-                ))}
-              </div>
-            </section>
-          )}
-
-          {activeTab === "diagnostics" && (
-            <section className="panel">
-              <div className="diag-list">
-                {diagnosticRows.map((row) => (
-                  <div className="diag-row" key={row.label}>
-                    <span className="diag-label">{row.label}</span>
-                    <span className={`diag-value tone-${row.tone}`}>{row.value}</span>
-                  </div>
-                ))}
-                <div className="diag-row">
-                  <span className="diag-label">Resolved binary</span>
-                  <span className="diag-value mono">{state.diagnostics.whisper_path || "Not resolved"}</span>
-                </div>
-                <div className="diag-row">
-                  <span className="diag-label">Resolved model</span>
-                  <span className="diag-value mono">{state.diagnostics.model_path || "Not resolved"}</span>
-                </div>
-              </div>
-              <article className="detail-panel">
-                <div className="eyebrow">Setup log</div>
-                <div className="detail-text mono">{setupMessage}</div>
-              </article>
-              <div className="action-row">
-                <button type="button" className="secondary-action" onClick={refresh}>
-                  Refresh
-                </button>
-                <button type="button" className="secondary-action" onClick={handleSetup}>
-                  Run setup
-                </button>
-              </div>
-            </section>
-          )}
         </section>
       )}
     </main>
@@ -609,8 +486,27 @@ function App() {
   }
 
   return (
-    <div className={`app-shell ${sidebarClass}`}>
-      <aside className="sidebar">
+    <div className="desktop-frame">
+      <header className="app-titlebar" onMouseDown={handleTitlebarDrag}>
+        <div className="titlebar-brand">
+          <img className="titlebar-icon" src={vibevoiceIcon} alt="" aria-hidden="true" />
+          <span>VibeVoice</span>
+        </div>
+        <div className="titlebar-controls" aria-label="Window controls">
+          <button type="button" className="titlebar-button" onClick={minimizeWindow} aria-label="Minimize" title="Minimize">
+            <span aria-hidden="true">-</span>
+          </button>
+          <button type="button" className="titlebar-button" onClick={toggleMaximizeWindow} aria-label="Maximize or restore" title="Maximize or restore">
+            <span aria-hidden="true">[]</span>
+          </button>
+          <button type="button" className="titlebar-button is-close" onClick={closeWindow} aria-label="Close" title="Close">
+            <span aria-hidden="true">x</span>
+          </button>
+        </div>
+      </header>
+
+      <div className={`app-shell ${sidebarClass}`}>
+        <aside className="sidebar">
         <div className="brand-block">
           <img className="brand-mark" src={vibevoiceIcon} alt="" aria-hidden="true" />
           <div className="brand-copy">
@@ -925,7 +821,8 @@ function App() {
             </div>
           </section>
         )}
-      </main>
+        </main>
+      </div>
     </div>
   );
 }
@@ -939,13 +836,13 @@ function Metric({ label, value, mono = false }: { label: string; value: string; 
   );
 }
 
-function MicVisualizer({ level, active }: { level: number; active: boolean }) {
+function MicVisualizer({ level, active, compact = false }: { level: number; active: boolean; compact?: boolean }) {
   const normalized = Math.max(0.04, Math.min(1, level || 0));
   return (
-    <span className={`mic-visualizer ${active ? "is-active" : ""}`} aria-hidden="true">
-      {Array.from({ length: 12 }).map((_, index) => {
+    <span className={`mic-visualizer ${active ? "is-active" : ""} ${compact ? "is-compact" : ""}`} aria-hidden="true">
+      {Array.from({ length: compact ? 6 : 12 }).map((_, index) => {
         const wave = active ? Math.abs(Math.sin(index * 0.72 + normalized * 2.8)) : 0.16;
-        const height = Math.round(18 + (active ? Math.max(normalized, wave * normalized) : wave) * 34);
+        const height = Math.round((compact ? 8 : 18) + (active ? Math.max(normalized, wave * normalized) : wave) * (compact ? 16 : 34));
         return <span key={index} style={{ height: `${height}px` }} />;
       })}
     </span>
