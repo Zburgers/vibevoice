@@ -586,7 +586,7 @@ Fedora and Windows install should be first-class.
 Expected dependencies:
 
 ```bash
-sudo dnf install -y git cmake gcc gcc-c++ make ffmpeg alsa-lib-devel pkgconf-pkg-config wl-clipboard xclip
+sudo dnf install -y git cmake gcc gcc-c++ make ffmpeg alsa-utils alsa-lib-devel pkgconf-pkg-config wl-clipboard xclip xsel wtype xdotool
 ```
 
 Expected setup paths:

@@ -10,7 +10,7 @@ use std::{
         Arc, Mutex,
     },
     thread::{self},
-    time::Instant,
+    time::{Duration, Instant},
 };
 use tauri::{
     async_runtime,
@@ -35,13 +35,14 @@ const AUTO_PATH: &str = "auto";
 const MODEL_FILE_NAME: &str = "ggml-base.en.bin";
 const LEGACY_DEFAULT_WHISPER: &str = "~/tools/whisper.cpp/build/bin/whisper-cli";
 const LEGACY_DEFAULT_MODEL: &str = "~/tools/whisper.cpp/models/ggml-base.en.bin";
-const DEFAULT_UPDATE_REF: &str = "origin/master";
 const STATE_CHANGED_EVENT: &str = "vibevoice-state-changed";
+const METER_CHANGED_EVENT: &str = "vibevoice-meter-changed";
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "PascalCase")]
 enum VoiceState {
     Ready,
+    Preparing,
     Recording,
     Processing,
     Inserted,
@@ -50,6 +51,7 @@ enum VoiceState {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
 struct Settings {
     whisper_binary_path: String,
     model_path: String,
@@ -58,6 +60,7 @@ struct Settings {
     auto_paste: bool,
     clipboard_fallback: bool,
     dictionary_cleanup: bool,
+    history_enabled: bool,
     start_on_login: bool,
 }
 
@@ -71,6 +74,7 @@ impl Default for Settings {
             auto_paste: true,
             clipboard_fallback: true,
             dictionary_cleanup: true,
+            history_enabled: false,
             start_on_login: false,
         }
     }
@@ -86,7 +90,10 @@ struct Diagnostics {
     whisper_path: Option<String>,
     model_path: Option<String>,
     recorder: Option<String>,
+    input_device: Option<String>,
     platform: String,
+    setup_script_path: Option<String>,
+    setup_command: Option<String>,
     last_error: Option<String>,
 }
 
@@ -111,6 +118,7 @@ struct DictionaryRule {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct AppStateSnapshot {
+    app_version: String,
     voice_state: VoiceState,
     settings: Settings,
     diagnostics: Diagnostics,
@@ -122,18 +130,9 @@ struct AppStateSnapshot {
     recording_started_at: Option<DateTime<Utc>>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
-struct UpdateInfo {
-    current_version: String,
-    latest_version: Option<String>,
-    current_commit: Option<String>,
-    latest_commit: Option<String>,
-    branch: Option<String>,
-    update_ref: Option<String>,
-    source_dir: Option<String>,
-    update_available: bool,
-    can_update: bool,
-    status: String,
+#[derive(Debug, Clone, Serialize)]
+struct MeterPayload {
+    mic_level: f32,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -216,9 +215,10 @@ fn get_app_state(app: AppHandle, data: tauri::State<AppData>) -> Result<AppState
         .map(|session| session.mic_level.load(Ordering::Relaxed) as f32 / 1000.0)
         .unwrap_or(runtime.mic_level);
     Ok(AppStateSnapshot {
+        app_version: env!("CARGO_PKG_VERSION").to_string(),
         voice_state: runtime.voice_state.clone(),
         settings: settings.clone(),
-        diagnostics: diagnostics(&settings, runtime.last_error.clone()),
+        diagnostics: diagnostics(&app, &settings, runtime.last_error.clone()),
         history,
         dictionary,
         last_transcript: runtime.last_transcript.clone(),
@@ -235,44 +235,75 @@ fn save_settings(app: AppHandle, settings: Settings) -> Result<(), String> {
 }
 
 #[tauri::command]
-fn start_recording(app: AppHandle, data: tauri::State<AppData>) -> Result<(), String> {
+async fn start_recording(app: AppHandle, data: tauri::State<'_, AppData>) -> Result<(), String> {
+    begin_recording(app, data)
+}
+
+fn begin_recording(app: AppHandle, data: tauri::State<'_, AppData>) -> Result<(), String> {
     {
-        let runtime = data.runtime.lock().map_err(|error| error.to_string())?;
+        let mut runtime = data.runtime.lock().map_err(|error| error.to_string())?;
         match runtime.voice_state {
+            VoiceState::Preparing => return Err("Recording is still starting.".to_string()),
             VoiceState::Recording => return Err("Recording is already active.".to_string()),
             VoiceState::Processing => {
                 return Err("Recording is still processing. Please wait.".to_string())
             }
             _ => {}
         }
+        runtime.voice_state = VoiceState::Preparing;
+        runtime.last_error = None;
+        runtime.mic_level = 0.0;
+        runtime.recording = None;
     }
+    emit_state_changed(&app);
 
-    let settings = load_settings(&app)?;
+    let app_handle = app.clone();
+    async_runtime::spawn_blocking(move || match prepare_recording_session(&app_handle) {
+        Ok(mut session) => {
+            let mic_level = Arc::clone(&session.mic_level);
+            let data = app_handle.state::<AppData>();
+            let mut runtime = match data.runtime.lock() {
+                Ok(runtime) => runtime,
+                Err(error) => {
+                    let _ = stop_audio_capture(&mut session);
+                    let _ = set_runtime_error(&data, &error.to_string());
+                    emit_state_changed(&app_handle);
+                    return;
+                }
+            };
+            if !matches!(runtime.voice_state, VoiceState::Preparing) {
+                let _ = stop_audio_capture(&mut session);
+                return;
+            }
+            runtime.voice_state = VoiceState::Recording;
+            runtime.last_error = None;
+            runtime.mic_level = 0.0;
+            runtime.recording = Some(session);
+            drop(runtime);
+            emit_state_changed(&app_handle);
+            spawn_meter_emitter(app_handle.clone(), mic_level);
+        }
+        Err(error) => {
+            let data = app_handle.state::<AppData>();
+            let _ = set_runtime_error(&data, &error);
+            emit_state_changed(&app_handle);
+        }
+    });
+    Ok(())
+}
+
+fn prepare_recording_session(app: &AppHandle) -> Result<RecordingSession, String> {
+    let settings = load_settings(app)?;
     ensure_engine_ready(&settings)?;
     let tmp = temp_workspace();
     fs::create_dir_all(&tmp).map_err(|error| error.to_string())?;
     let stem = format!("recording-{}", Uuid::new_v4());
     let audio_path = tmp.join(format!("{stem}.wav"));
     let output_prefix = tmp.join(stem);
-    let mut session = start_audio_capture(audio_path.clone(), output_prefix.clone())?;
+    let session = start_audio_capture(audio_path, output_prefix)?;
     #[cfg(any(target_os = "windows", target_os = "macos"))]
     start_recording_stream(&session)?;
-
-    let mut runtime = data.runtime.lock().map_err(|error| error.to_string())?;
-    if matches!(
-        runtime.voice_state,
-        VoiceState::Recording | VoiceState::Processing
-    ) {
-        let _ = stop_audio_capture(&mut session);
-        return Err("Recording cannot start until the current action finishes.".to_string());
-    }
-    runtime.voice_state = VoiceState::Recording;
-    runtime.last_error = None;
-    runtime.mic_level = 0.0;
-    runtime.recording = Some(session);
-    drop(runtime);
-    emit_state_changed(&app);
-    Ok(())
+    Ok(session)
 }
 
 #[tauri::command]
@@ -285,9 +316,18 @@ async fn stop_recording(app: AppHandle, data: tauri::State<'_, AppData>) -> Resu
                 session
             }
             None => {
-                runtime.voice_state = VoiceState::Ready;
-                runtime.last_error = Some("No active recording to stop.".to_string());
-                return Err("No active recording to stop.".to_string());
+                let message = if matches!(runtime.voice_state, VoiceState::Preparing) {
+                    "Recording is still starting. Try stopping again in a moment."
+                } else {
+                    "No active recording to stop."
+                };
+                runtime.voice_state = if matches!(runtime.voice_state, VoiceState::Preparing) {
+                    VoiceState::Preparing
+                } else {
+                    VoiceState::Ready
+                };
+                runtime.last_error = Some(message.to_string());
+                return Err(message.to_string());
             }
         }
     };
@@ -343,14 +383,16 @@ fn finish_recording(app: AppHandle, session: &mut RecordingSession) -> Result<Hi
         insert_status: action_status.insert_status.clone(),
         error: action_status.error.clone(),
     };
-    append_history(&app, item.clone())?;
+    if settings.history_enabled {
+        append_history(&app, item.clone())?;
+    }
 
     let data = app.state::<AppData>();
     let mut runtime = data
         .runtime
         .lock()
         .map_err(|lock_error| lock_error.to_string())?;
-    runtime.voice_state = VoiceState::Ready;
+    runtime.voice_state = voice_state_for_insert_status(&action_status);
     runtime.last_transcript = Some(final_transcript);
     runtime.last_error = action_status.error;
     runtime.mic_level = 0.0;
@@ -404,6 +446,11 @@ fn delete_history_item(app: AppHandle, id: String) -> Result<(), String> {
 }
 
 #[tauri::command]
+fn clear_history(app: AppHandle) -> Result<(), String> {
+    write_json(history_path(&app)?, &Vec::<HistoryItem>::new())
+}
+
+#[tauri::command]
 fn add_dictionary_rule(app: AppHandle, spoken: String, replacement: String) -> Result<(), String> {
     let mut dictionary = load_dictionary(&app)?;
     dictionary.push(DictionaryRule {
@@ -435,15 +482,34 @@ fn set_dictionary_rule_enabled(app: AppHandle, id: String, enabled: bool) -> Res
     write_json(dictionary_path(&app)?, &dictionary)
 }
 
-#[tauri::command]
-fn run_setup_script(app: AppHandle, data: tauri::State<AppData>) -> Result<String, String> {
-    let script_name = if cfg!(target_os = "windows") {
+fn setup_script_name() -> &'static str {
+    if cfg!(target_os = "windows") {
         "scripts/install-windows.ps1"
     } else {
         "scripts/install-engine.sh"
-    };
-    let script = find_repo_file(&app, script_name)
-        .ok_or_else(|| format!("Setup script not found: {script_name}"))?;
+    }
+}
+
+fn setup_script_path(app: &AppHandle) -> Option<PathBuf> {
+    find_repo_file(app, setup_script_name()).filter(|script| script.exists())
+}
+
+fn setup_command(script: &Path) -> String {
+    if cfg!(target_os = "windows") {
+        format!(
+            "powershell -NoProfile -ExecutionPolicy Bypass -File \"{}\"",
+            script.display()
+        )
+    } else {
+        format!("bash \"{}\"", script.display())
+    }
+}
+
+#[tauri::command]
+fn run_setup_script(app: AppHandle, data: tauri::State<AppData>) -> Result<String, String> {
+    let script_name = setup_script_name();
+    let script =
+        setup_script_path(&app).ok_or_else(|| format!("Setup script not found: {script_name}"))?;
     if !script.exists() {
         return Err(format!("Setup script not found: {}", script.display()));
     }
@@ -471,113 +537,6 @@ fn run_setup_script(app: AppHandle, data: tauri::State<AppData>) -> Result<Strin
         set_runtime_error(&data, &combined)?;
         Err(combined)
     }
-}
-
-#[tauri::command]
-fn check_for_updates(app: AppHandle) -> Result<UpdateInfo, String> {
-    let source_dir = find_source_dir(&app);
-    let Some(source_dir) = source_dir else {
-        return Ok(UpdateInfo {
-            current_version: env!("CARGO_PKG_VERSION").to_string(),
-            latest_version: None,
-            current_commit: None,
-            latest_commit: None,
-            branch: None,
-            update_ref: None,
-            source_dir: None,
-            update_available: false,
-            can_update: false,
-            status: "Source checkout not found. Install from a git checkout or set VIBEVOICE_SOURCE_DIR.".to_string(),
-        });
-    };
-
-    git(&source_dir, ["fetch", "--prune"])?;
-    let current_commit = git_trimmed(&source_dir, ["rev-parse", "--short", "HEAD"]).ok();
-    let branch = git_trimmed(&source_dir, ["branch", "--show-current"]).ok();
-    let update_ref = git_trimmed(&source_dir, ["rev-parse", "--abbrev-ref", "@{u}"])
-        .ok()
-        .filter(|value| !value.trim().is_empty())
-        .unwrap_or_else(|| DEFAULT_UPDATE_REF.to_string());
-    let latest_commit = git_trimmed(&source_dir, ["rev-parse", "--short", &update_ref]).ok();
-    let latest_version = git_show_package_version(&source_dir, &update_ref).ok();
-    let update_available = match (&current_commit, &latest_commit) {
-        (Some(current), Some(latest)) => current != latest,
-        _ => false,
-    };
-    let dirty = git_trimmed(&source_dir, ["status", "--porcelain"])
-        .map(|value| !value.is_empty())
-        .unwrap_or(false);
-    let can_update = !dirty && latest_commit.is_some();
-    let status = if dirty {
-        "Local source checkout has uncommitted changes. Commit or stash them before updating."
-            .to_string()
-    } else if update_available {
-        "New source update available.".to_string()
-    } else {
-        "VibeVoice is up to date.".to_string()
-    };
-
-    Ok(UpdateInfo {
-        current_version: env!("CARGO_PKG_VERSION").to_string(),
-        latest_version,
-        current_commit,
-        latest_commit,
-        branch,
-        update_ref: Some(update_ref),
-        source_dir: Some(source_dir.display().to_string()),
-        update_available,
-        can_update,
-        status,
-    })
-}
-
-#[tauri::command]
-fn install_update_and_restart(app: AppHandle) -> Result<(), String> {
-    let info = check_for_updates(app.clone())?;
-    if !info.update_available {
-        return Err("No update is available.".to_string());
-    }
-    if !info.can_update {
-        return Err(info.status);
-    }
-
-    let source_dir = info
-        .source_dir
-        .ok_or_else(|| "Source checkout not found.".to_string())?;
-    let script_name = if cfg!(target_os = "windows") {
-        "scripts/update-app.ps1"
-    } else {
-        "scripts/update-app.sh"
-    };
-    let script = find_repo_file(&app, script_name)
-        .ok_or_else(|| format!("Update script not found: {script_name}"))?;
-    let current_exe = std::env::current_exe()
-        .map_err(|error| format!("Could not resolve current executable: {error}"))?;
-
-    let mut command = if cfg!(target_os = "windows") {
-        let mut command = Command::new("powershell");
-        command.args(["-NoProfile", "-ExecutionPolicy", "Bypass", "-File"]);
-        command.arg(script);
-        command
-    } else {
-        let mut command = Command::new("bash");
-        command.arg(script);
-        command
-    };
-    command.arg(source_dir);
-    command.arg(current_exe);
-    command
-        .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .spawn()
-        .map_err(|error| format!("Update failed to start: {error}"))?;
-
-    thread::spawn(move || {
-        std::thread::sleep(std::time::Duration::from_millis(350));
-        app.exit(0);
-    });
-    Ok(())
 }
 
 fn load_settings(app: &AppHandle) -> Result<Settings, String> {
@@ -657,72 +616,6 @@ fn find_repo_file(app: &AppHandle, relative: &str) -> Option<PathBuf> {
     None
 }
 
-fn find_source_dir(app: &AppHandle) -> Option<PathBuf> {
-    if let Ok(value) = std::env::var("VIBEVOICE_SOURCE_DIR") {
-        let path = expand_home(&value);
-        if path.join(".git").exists() && path.join("app").join("package.json").is_file() {
-            return Some(path);
-        }
-    }
-
-    let mut candidates = Vec::new();
-    if let Ok(current) = std::env::current_dir() {
-        candidates.push(current);
-    }
-    if let Ok(exe) = std::env::current_exe() {
-        if let Some(parent) = exe.parent() {
-            candidates.push(parent.to_path_buf());
-        }
-    }
-    if let Ok(resource) = app.path().resource_dir() {
-        candidates.push(resource);
-    }
-
-    for base in candidates {
-        let mut cursor = Some(base.as_path());
-        while let Some(path) = cursor {
-            if path.join(".git").exists() && path.join("app").join("package.json").is_file() {
-                return Some(path.to_path_buf());
-            }
-            cursor = path.parent();
-        }
-    }
-    None
-}
-
-fn git<const N: usize>(source_dir: &Path, args: [&str; N]) -> Result<String, String> {
-    let output = Command::new("git")
-        .args(args)
-        .current_dir(source_dir)
-        .output()
-        .map_err(|error| format!("git failed to start: {error}"))?;
-    let combined = format!(
-        "{}{}",
-        String::from_utf8_lossy(&output.stdout),
-        String::from_utf8_lossy(&output.stderr)
-    );
-    if output.status.success() {
-        Ok(combined)
-    } else {
-        Err(combined)
-    }
-}
-
-fn git_trimmed<const N: usize>(source_dir: &Path, args: [&str; N]) -> Result<String, String> {
-    git(source_dir, args).map(|value| value.trim().to_string())
-}
-
-fn git_show_package_version(source_dir: &Path, update_ref: &str) -> Result<String, String> {
-    let spec = format!("{update_ref}:app/package.json");
-    let content = git(source_dir, ["show", &spec])?;
-    let json: serde_json::Value =
-        serde_json::from_str(&content).map_err(|error| error.to_string())?;
-    json.get("version")
-        .and_then(|value| value.as_str())
-        .map(|value| value.to_string())
-        .ok_or_else(|| "Remote app/package.json did not contain a version.".to_string())
-}
-
 fn read_json_or_default<T>(path: PathBuf) -> Result<T, String>
 where
     T: for<'de> Deserialize<'de> + Default,
@@ -771,8 +664,9 @@ fn expand_home(path: &str) -> PathBuf {
     expanded
 }
 
-fn diagnostics(settings: &Settings, last_error: Option<String>) -> Diagnostics {
+fn diagnostics(app: &AppHandle, settings: &Settings, last_error: Option<String>) -> Diagnostics {
     let resolved = resolve_engine_paths(settings).ok();
+    let setup_script = setup_script_path(app);
     Diagnostics {
         whisper_found: resolved
             .as_ref()
@@ -788,7 +682,12 @@ fn diagnostics(settings: &Settings, last_error: Option<String>) -> Diagnostics {
             .as_ref()
             .map(|paths| paths.model.display().to_string()),
         recorder: recorder_name(),
+        input_device: input_device_name(),
         platform: std::env::consts::OS.to_string(),
+        setup_script_path: setup_script
+            .as_ref()
+            .map(|script| script.display().to_string()),
+        setup_command: setup_script.as_ref().map(|script| setup_command(script)),
         last_error,
     }
 }
@@ -1232,6 +1131,18 @@ fn recorder_name() -> Option<String> {
     Some("cpal".to_string())
 }
 
+#[cfg(any(target_os = "windows", target_os = "macos"))]
+fn input_device_name() -> Option<String> {
+    cpal::default_host()
+        .default_input_device()
+        .and_then(|device| device.name().ok())
+}
+
+#[cfg(target_os = "linux")]
+fn input_device_name() -> Option<String> {
+    recorder_name().map(|recorder| format!("System default via {recorder}"))
+}
+
 #[cfg(target_os = "linux")]
 fn recorder_command() -> Option<(&'static str, &'static [&'static str])> {
     if command_exists("pw-record") {
@@ -1470,6 +1381,18 @@ fn resolve_insert_status(
     }
 }
 
+fn voice_state_for_insert_status(status: &InsertActionStatus) -> VoiceState {
+    if status.insert_status.starts_with("inserted") {
+        VoiceState::Inserted
+    } else if status.insert_status.starts_with("copied") {
+        VoiceState::Copied
+    } else if status.error.is_some() {
+        VoiceState::Error
+    } else {
+        VoiceState::Ready
+    }
+}
+
 fn default_dictionary() -> Vec<DictionaryRule> {
     [
         ("next js", "Next.js"),
@@ -1508,6 +1431,26 @@ fn set_runtime_error(data: &tauri::State<AppData>, message: &str) -> Result<(), 
 
 fn emit_state_changed(app: &AppHandle) {
     let _ = app.emit(STATE_CHANGED_EVENT, ());
+}
+
+fn emit_meter_changed(app: &AppHandle, mic_level: f32) {
+    let _ = app.emit(METER_CHANGED_EVENT, MeterPayload { mic_level });
+}
+
+fn spawn_meter_emitter(app: AppHandle, mic_level: Arc<AtomicU32>) {
+    thread::spawn(move || loop {
+        let is_recording = app
+            .state::<AppData>()
+            .runtime
+            .lock()
+            .map(|runtime| matches!(runtime.voice_state, VoiceState::Recording))
+            .unwrap_or(false);
+        if !is_recording {
+            break;
+        }
+        emit_meter_changed(&app, mic_level.load(Ordering::Relaxed) as f32 / 1000.0);
+        thread::sleep(Duration::from_millis(180));
+    });
 }
 
 fn parse_hotkey(hotkey: &str) -> Result<Shortcut, String> {
@@ -1550,7 +1493,11 @@ fn register_hotkey_handler(app: &AppHandle, shortcut: Shortcut) -> Result<(), St
                     let _ = stop_recording(app_for_stop.clone(), state).await;
                 });
             } else {
-                let _ = start_recording(app_handle.clone(), app_handle.state::<AppData>());
+                let app_for_start = app_handle.clone();
+                async_runtime::spawn(async move {
+                    let state = app_for_start.state::<AppData>();
+                    let _ = start_recording(app_for_start.clone(), state).await;
+                });
             }
         })
         .map_err(|error| format!("Hotkey registration failed: {error}"))
@@ -1596,7 +1543,11 @@ fn toggle_recording(app: &AppHandle) {
             let _ = stop_recording(app_for_stop.clone(), state).await;
         });
     } else {
-        let _ = start_recording(app.clone(), state);
+        let app_for_start = app.clone();
+        async_runtime::spawn(async move {
+            let state = app_for_start.state::<AppData>();
+            let _ = start_recording(app_for_start.clone(), state).await;
+        });
     }
 }
 
@@ -1666,12 +1617,11 @@ pub fn run() {
             copy_text,
             insert_text,
             delete_history_item,
+            clear_history,
             add_dictionary_rule,
             delete_dictionary_rule,
             set_dictionary_rule_enabled,
-            run_setup_script,
-            check_for_updates,
-            install_update_and_restart
+            run_setup_script
         ])
         .setup(|app| {
             setup_tray(app.handle())?;

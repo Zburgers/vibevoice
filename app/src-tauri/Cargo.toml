@@ -1,6 +1,6 @@
 [package]
 name = "vibevoice"
-version = "0.2.0"
+version = "0.2.1"
 description = "Local-first desktop voice input for developers"
 authors = ["VibeVoice"]
 edition = "2021"

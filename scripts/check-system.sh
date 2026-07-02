@@ -74,7 +74,12 @@ status "gcc" "$(command_present gcc)"
 status "gpp" "$(command_present g++)"
 status "ffmpeg" "$(command_present ffmpeg)"
 status "wl_copy" "$(command_present wl-copy)"
+status "wl_paste" "$(command_present wl-paste)"
 status "xclip" "$(command_present xclip)"
+status "xsel" "$(command_present xsel)"
+status "wtype" "$(command_present wtype)"
+status "xdotool" "$(command_present xdotool)"
+status "ydotool" "$(command_present ydotool)"
 
 missing_critical=0
 if [[ ! -x "$WHISPER_CLI" ]]; then

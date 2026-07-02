@@ -53,7 +53,7 @@ powershell -NoProfile -ExecutionPolicy Bypass -File .\scripts\check-windows.ps1
 bash scripts/install-engine.sh
 ```
 
-The Linux installer supports Fedora first and also handles Debian/Ubuntu package names. It installs a compiler toolchain, CMake, FFmpeg, ALSA development headers for the Rust audio backend, and clipboard helpers.
+The Linux installer supports Fedora first and also handles Debian/Ubuntu package names. It installs a compiler toolchain, CMake, FFmpeg, recorder support, clipboard helpers, and paste helpers such as `wtype` and `xdotool`.
 
 Run a Linux readiness check:
 
@@ -79,7 +79,7 @@ npm install
 npm run tauri build
 ```
 
-Linux developers need ALSA development headers before Rust can compile CPAL:
+Linux recording uses runtime recorder binaries, so the normal no-default-features build does not require CPAL or ALSA development headers. If you intentionally enable a CPAL-based Linux experiment later, install ALSA development headers first:
 
 ```bash
 sudo dnf install -y alsa-lib-devel pkgconf-pkg-config
