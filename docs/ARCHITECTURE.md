@@ -14,10 +14,12 @@ Only the `pill` window should be always-on-top.
 ## Pipeline
 
 ```text
-hotkey or pill -> CPAL mic capture -> local WAV -> whisper-cli -> cleanup -> clipboard/paste -> history
+hotkey or pill -> platform mic capture -> local WAV -> background whisper-cli -> cleanup -> clipboard/paste -> history event
 ```
 
-Recording uses Rust CPAL and writes WAV files with `hound`, so capture is not tied to Linux `arecord`.
+Recording uses Rust CPAL and `hound` on Windows/macOS. Linux uses runtime recorder binaries (`pw-record`, `arecord`, or `ffmpeg`) so the app can build without ALSA development headers. Stopping a recording moves the app into `Processing` and schedules transcription plus output insertion on a background worker; UI windows refresh from the `vibevoice-state-changed` event instead of polling continuously.
+
+Clipboard writes go through Tauri's clipboard manager plugin. Paste simulation remains platform-specific because desktop environments expose it through different native tools, but paste execution runs off the UI command path so a slow paste helper cannot block the frontend.
 
 ## Engine Resolution
 

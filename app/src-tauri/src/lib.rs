@@ -13,10 +13,12 @@ use std::{
     time::Instant,
 };
 use tauri::{
+    async_runtime,
     menu::{Menu, MenuItem},
     tray::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent},
-    AppHandle, Manager,
+    AppHandle, Emitter, Manager,
 };
+use tauri_plugin_clipboard_manager::ClipboardExt;
 use tauri_plugin_global_shortcut::{Code, GlobalShortcutExt, Modifiers, Shortcut, ShortcutState};
 use uuid::Uuid;
 
@@ -34,6 +36,7 @@ const MODEL_FILE_NAME: &str = "ggml-base.en.bin";
 const LEGACY_DEFAULT_WHISPER: &str = "~/tools/whisper.cpp/build/bin/whisper-cli";
 const LEGACY_DEFAULT_MODEL: &str = "~/tools/whisper.cpp/models/ggml-base.en.bin";
 const DEFAULT_UPDATE_REF: &str = "origin/master";
+const STATE_CHANGED_EVENT: &str = "vibevoice-state-changed";
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "PascalCase")]
@@ -131,6 +134,12 @@ struct UpdateInfo {
     update_available: bool,
     can_update: bool,
     status: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct InsertActionStatus {
+    insert_status: String,
+    error: Option<String>,
 }
 
 #[cfg(any(target_os = "windows", target_os = "macos"))]
@@ -261,11 +270,13 @@ fn start_recording(app: AppHandle, data: tauri::State<AppData>) -> Result<(), St
     runtime.last_error = None;
     runtime.mic_level = 0.0;
     runtime.recording = Some(session);
+    drop(runtime);
+    emit_state_changed(&app);
     Ok(())
 }
 
 #[tauri::command]
-fn stop_recording(app: AppHandle, data: tauri::State<AppData>) -> Result<HistoryItem, String> {
+async fn stop_recording(app: AppHandle, data: tauri::State<'_, AppData>) -> Result<(), String> {
     let mut session = {
         let mut runtime = data.runtime.lock().map_err(|error| error.to_string())?;
         match runtime.recording.take() {
@@ -280,12 +291,24 @@ fn stop_recording(app: AppHandle, data: tauri::State<AppData>) -> Result<History
             }
         }
     };
+    emit_state_changed(&app);
 
-    stop_audio_capture(&mut session).map_err(|error| finish_stop_error(&data, error))?;
-    let settings = load_settings(&app).map_err(|error| finish_stop_error(&data, error))?;
-    let dictionary = load_dictionary(&app).map_err(|error| finish_stop_error(&data, error))?;
-    let raw_transcript = transcribe(&settings, &session.audio_path, &session.output_prefix)
-        .map_err(|error| finish_stop_error(&data, error))?;
+    let app_handle = app.clone();
+    async_runtime::spawn_blocking(move || {
+        if let Err(error) = finish_recording(app_handle.clone(), &mut session) {
+            let state = app_handle.state::<AppData>();
+            let _ = set_runtime_error(&state, &error);
+            emit_state_changed(&app_handle);
+        }
+    });
+    Ok(())
+}
+
+fn finish_recording(app: AppHandle, session: &mut RecordingSession) -> Result<HistoryItem, String> {
+    stop_audio_capture(session)?;
+    let settings = load_settings(&app)?;
+    let dictionary = load_dictionary(&app)?;
+    let raw_transcript = transcribe(&settings, &session.audio_path, &session.output_prefix)?;
     let mut final_transcript = cleanup_transcript(&raw_transcript);
     if settings.dictionary_cleanup {
         final_transcript = apply_dictionary(&final_transcript, &dictionary);
@@ -293,34 +316,23 @@ fn stop_recording(app: AppHandle, data: tauri::State<AppData>) -> Result<History
 
     if final_transcript.is_empty() {
         let message = "Whisper returned an empty transcript.".to_string();
-        set_runtime_error(&data, &message)?;
         return Err(message);
     }
 
-    let mut insert_status = "none".to_string();
-    let mut error = None;
-    if settings.clipboard_fallback {
-        match copy_to_clipboard(&final_transcript) {
-            Ok(tool) => insert_status = format!("copied:{tool}"),
-            Err(copy_error) => {
-                error = Some(copy_error.clone());
-                insert_status = "clipboard_failed".to_string();
-            }
-        }
-    }
-    if settings.auto_paste {
-        match paste_from_clipboard() {
-            Ok(tool) => insert_status = format!("inserted:{tool}"),
-            Err(paste_error) => {
-                if error.is_none() {
-                    error = Some(paste_error);
-                }
-                if insert_status.starts_with("copied") {
-                    insert_status = "copied".to_string();
-                }
-            }
-        }
-    }
+    let copy_result = settings
+        .clipboard_fallback
+        .then(|| copy_to_clipboard(&app, &final_transcript));
+    let paste_result = if settings.auto_paste && !matches!(copy_result, Some(Err(_))) {
+        Some(paste_from_clipboard())
+    } else {
+        None
+    };
+    let action_status = resolve_insert_status(
+        settings.clipboard_fallback,
+        settings.auto_paste,
+        copy_result,
+        paste_result,
+    );
 
     let item = HistoryItem {
         id: Uuid::new_v4().to_string(),
@@ -328,40 +340,57 @@ fn stop_recording(app: AppHandle, data: tauri::State<AppData>) -> Result<History
         raw_transcript,
         final_transcript: final_transcript.clone(),
         duration_ms: Some(session.started.elapsed().as_millis()),
-        insert_status: insert_status.clone(),
-        error: error.clone(),
+        insert_status: action_status.insert_status.clone(),
+        error: action_status.error.clone(),
     };
-    append_history(&app, item.clone()).map_err(|error| finish_stop_error(&data, error))?;
+    append_history(&app, item.clone())?;
 
+    let data = app.state::<AppData>();
     let mut runtime = data
         .runtime
         .lock()
         .map_err(|lock_error| lock_error.to_string())?;
     runtime.voice_state = VoiceState::Ready;
     runtime.last_transcript = Some(final_transcript);
-    runtime.last_error = error;
+    runtime.last_error = action_status.error;
     runtime.mic_level = 0.0;
+    drop(runtime);
+    emit_state_changed(&app);
     Ok(item)
 }
 
 #[tauri::command]
-fn copy_text(text: String, data: tauri::State<AppData>) -> Result<(), String> {
-    copy_to_clipboard(&text)?;
+async fn copy_text(
+    app: AppHandle,
+    text: String,
+    data: tauri::State<'_, AppData>,
+) -> Result<(), String> {
+    copy_to_clipboard(&app, &text)?;
     let mut runtime = data.runtime.lock().map_err(|error| error.to_string())?;
     runtime.voice_state = VoiceState::Copied;
     runtime.last_transcript = Some(text);
     runtime.last_error = None;
+    drop(runtime);
+    emit_state_changed(&app);
     Ok(())
 }
 
 #[tauri::command]
-fn insert_text(text: String, data: tauri::State<AppData>) -> Result<(), String> {
-    copy_to_clipboard(&text)?;
-    paste_from_clipboard()?;
+async fn insert_text(
+    app: AppHandle,
+    text: String,
+    data: tauri::State<'_, AppData>,
+) -> Result<(), String> {
+    copy_to_clipboard(&app, &text)?;
+    async_runtime::spawn_blocking(paste_from_clipboard)
+        .await
+        .map_err(|error| format!("Paste task failed: {error}"))??;
     let mut runtime = data.runtime.lock().map_err(|error| error.to_string())?;
     runtime.voice_state = VoiceState::Inserted;
     runtime.last_transcript = Some(text);
     runtime.last_error = None;
+    drop(runtime);
+    emit_state_changed(&app);
     Ok(())
 }
 
@@ -1305,71 +1334,11 @@ fn replace_case_insensitive(input: &str, needle: &str, replacement: &str) -> Str
     output
 }
 
-fn copy_to_clipboard(text: &str) -> Result<String, String> {
-    if cfg!(target_os = "windows") {
-        let mut child = Command::new("powershell")
-            .args([
-                "-NoProfile",
-                "-Command",
-                "Set-Clipboard -Value ([Console]::In.ReadToEnd())",
-            ])
-            .stdin(Stdio::piped())
-            .spawn()
-            .map_err(|error| format!("Set-Clipboard failed: {error}"))?;
-        use std::io::Write;
-        child
-            .stdin
-            .as_mut()
-            .ok_or_else(|| "Set-Clipboard stdin unavailable.".to_string())?
-            .write_all(text.as_bytes())
-            .map_err(|error| error.to_string())?;
-        let status = child.wait().map_err(|error| error.to_string())?;
-        return if status.success() {
-            Ok("powershell:Set-Clipboard".to_string())
-        } else {
-            Err("Set-Clipboard exited with an error.".to_string())
-        };
-    }
-    if command_exists("wl-copy") {
-        let mut child = Command::new("wl-copy")
-            .stdin(Stdio::piped())
-            .spawn()
-            .map_err(|error| format!("wl-copy failed: {error}"))?;
-        use std::io::Write;
-        child
-            .stdin
-            .as_mut()
-            .ok_or_else(|| "wl-copy stdin unavailable.".to_string())?
-            .write_all(text.as_bytes())
-            .map_err(|error| error.to_string())?;
-        let status = child.wait().map_err(|error| error.to_string())?;
-        return if status.success() {
-            Ok("wl-copy".to_string())
-        } else {
-            Err("wl-copy exited with an error.".to_string())
-        };
-    }
-    if command_exists("xclip") {
-        let mut child = Command::new("xclip")
-            .args(["-selection", "clipboard"])
-            .stdin(Stdio::piped())
-            .spawn()
-            .map_err(|error| format!("xclip failed: {error}"))?;
-        use std::io::Write;
-        child
-            .stdin
-            .as_mut()
-            .ok_or_else(|| "xclip stdin unavailable.".to_string())?
-            .write_all(text.as_bytes())
-            .map_err(|error| error.to_string())?;
-        let status = child.wait().map_err(|error| error.to_string())?;
-        return if status.success() {
-            Ok("xclip".to_string())
-        } else {
-            Err("xclip exited with an error.".to_string())
-        };
-    }
-    Err("Clipboard tool missing. Install wl-clipboard or xclip.".to_string())
+fn copy_to_clipboard(app: &AppHandle, text: &str) -> Result<String, String> {
+    app.clipboard()
+        .write_text(text)
+        .map_err(|error| format!("Clipboard write failed: {error}"))?;
+    Ok("tauri-clipboard".to_string())
 }
 
 fn paste_from_clipboard() -> Result<String, String> {
@@ -1444,10 +1413,7 @@ fn first_command(names: &[&str]) -> Option<String> {
 }
 
 fn clipboard_tool_name() -> Option<String> {
-    if cfg!(target_os = "windows") {
-        return command_exists("powershell").then(|| "powershell:Set-Clipboard".to_string());
-    }
-    first_command(&["wl-copy", "xclip"])
+    Some("tauri-clipboard".to_string())
 }
 
 fn paste_tool_name() -> Option<String> {
@@ -1455,6 +1421,53 @@ fn paste_tool_name() -> Option<String> {
         return command_exists("powershell").then(|| "powershell:SendKeys".to_string());
     }
     first_command(&["wtype", "xdotool", "ydotool"])
+}
+
+fn resolve_insert_status(
+    clipboard_fallback: bool,
+    auto_paste: bool,
+    copy_result: Option<Result<String, String>>,
+    paste_result: Option<Result<String, String>>,
+) -> InsertActionStatus {
+    let mut insert_status = "none".to_string();
+    let mut error = None;
+
+    if clipboard_fallback {
+        match copy_result {
+            Some(Ok(tool)) => insert_status = format!("copied:{tool}"),
+            Some(Err(copy_error)) => {
+                error = Some(copy_error);
+                insert_status = "clipboard_failed".to_string();
+            }
+            None => {
+                error = Some("Clipboard copy was not attempted.".to_string());
+                insert_status = "clipboard_failed".to_string();
+            }
+        }
+    }
+
+    if auto_paste {
+        match paste_result {
+            Some(Ok(tool)) => insert_status = format!("inserted:{tool}"),
+            Some(Err(paste_error)) => {
+                if error.is_none() {
+                    error = Some(paste_error);
+                }
+                if insert_status.starts_with("copied") {
+                    insert_status = "copied".to_string();
+                }
+            }
+            None if !clipboard_fallback => {
+                error = Some("Paste requires clipboard copy to run first.".to_string());
+            }
+            None => {}
+        }
+    }
+
+    InsertActionStatus {
+        insert_status,
+        error,
+    }
 }
 
 fn default_dictionary() -> Vec<DictionaryRule> {
@@ -1493,9 +1506,8 @@ fn set_runtime_error(data: &tauri::State<AppData>, message: &str) -> Result<(), 
     Ok(())
 }
 
-fn finish_stop_error(data: &tauri::State<AppData>, message: String) -> String {
-    let _ = set_runtime_error(data, &message);
-    message
+fn emit_state_changed(app: &AppHandle) {
+    let _ = app.emit(STATE_CHANGED_EVENT, ());
 }
 
 fn parse_hotkey(hotkey: &str) -> Result<Shortcut, String> {
@@ -1532,7 +1544,11 @@ fn register_hotkey_handler(app: &AppHandle, shortcut: Shortcut) -> Result<(), St
                 .map(|runtime| matches!(runtime.voice_state, VoiceState::Recording))
                 .unwrap_or(false);
             if is_recording {
-                let _ = stop_recording(app_handle.clone(), app_handle.state::<AppData>());
+                let app_for_stop = app_handle.clone();
+                async_runtime::spawn(async move {
+                    let state = app_for_stop.state::<AppData>();
+                    let _ = stop_recording(app_for_stop.clone(), state).await;
+                });
             } else {
                 let _ = start_recording(app_handle.clone(), app_handle.state::<AppData>());
             }
@@ -1574,7 +1590,11 @@ fn toggle_recording(app: &AppHandle) {
         .map(|runtime| matches!(runtime.voice_state, VoiceState::Recording))
         .unwrap_or(false);
     if is_recording {
-        let _ = stop_recording(app.clone(), state);
+        let app_for_stop = app.clone();
+        async_runtime::spawn(async move {
+            let state = app_for_stop.state::<AppData>();
+            let _ = stop_recording(app_for_stop.clone(), state).await;
+        });
     } else {
         let _ = start_recording(app.clone(), state);
     }
@@ -1634,6 +1654,7 @@ fn setup_tray(app: &AppHandle) -> Result<(), String> {
 pub fn run() {
     tauri::Builder::default()
         .plugin(tauri_plugin_global_shortcut::Builder::new().build())
+        .plugin(tauri_plugin_clipboard_manager::init())
         .manage(AppData {
             runtime: Mutex::new(RuntimeState::default()),
         })
@@ -1722,5 +1743,36 @@ mod tests {
         assert_eq!(resolved.whisper_binary, whisper);
         assert_eq!(resolved.model, model);
         let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn action_status_keeps_copy_success_when_paste_fails() {
+        let status = resolve_insert_status(
+            true,
+            true,
+            Some(Ok("tauri-clipboard".to_string())),
+            Some(Err("Paste failed".to_string())),
+        );
+
+        assert_eq!(status.insert_status, "copied");
+        assert_eq!(status.error.as_deref(), Some("Paste failed"));
+    }
+
+    #[test]
+    fn action_status_reports_clipboard_failure_without_paste_attempt() {
+        let status = resolve_insert_status(
+            true,
+            false,
+            Some(Err("Clipboard unavailable".to_string())),
+            None,
+        );
+
+        assert_eq!(status.insert_status, "clipboard_failed");
+        assert_eq!(status.error.as_deref(), Some("Clipboard unavailable"));
+    }
+
+    #[test]
+    fn native_clipboard_capability_is_reported_without_shell_helper() {
+        assert_eq!(clipboard_tool_name(), Some("tauri-clipboard".to_string()));
     }
 }

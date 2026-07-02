@@ -1,6 +1,7 @@
 import { useEffect, useMemo, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { LogicalSize } from "@tauri-apps/api/dpi";
+import { listen } from "@tauri-apps/api/event";
 import { getCurrentWindow, Window as TauriWindow } from "@tauri-apps/api/window";
 import vibevoiceIcon from "./assets/vibevoice-icon.png";
 import "./App.css";
@@ -169,6 +170,7 @@ function App() {
   const [sidebarCollapsed, setSidebarCollapsed] = useState(false);
   const [newRuleSpoken, setNewRuleSpoken] = useState("");
   const [newRuleReplacement, setNewRuleReplacement] = useState("");
+  const [, setElapsedTick] = useState(0);
 
   const currentWindow = useMemo(() => getCurrentWindow(), []);
   const isPillWindow = currentWindow.label === "pill";
@@ -196,12 +198,29 @@ function App() {
 
   useEffect(() => {
     refresh().catch((error) => setCommandStatus(errorMessage(error)));
+    let unlisten: (() => void) | undefined;
+    listen("vibevoice-state-changed", () => {
+      refresh().catch(() => undefined);
+    })
+      .then((cleanup) => {
+        unlisten = cleanup;
+      })
+      .catch((error) => setCommandStatus(errorMessage(error)));
+    return () => {
+      unlisten?.();
+    };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
+
+  useEffect(() => {
+    if (state.voice_state !== "Recording") return;
     const timer = window.setInterval(() => {
+      setElapsedTick((value) => value + 1);
       refresh().catch(() => undefined);
     }, 1000);
     return () => window.clearInterval(timer);
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, []);
+  }, [state.voice_state]);
 
   useEffect(() => {
     invoke<UpdateInfo>("check_for_updates")
@@ -250,14 +269,15 @@ function App() {
       if (state.voice_state === "Recording") {
         setCommandStatus("Stopping recording");
         await invoke("stop_recording");
+        setCommandStatus("Processing transcript");
       } else if (state.voice_state === "Processing") {
         return;
       } else {
         setCommandStatus("Starting recording");
         await invoke("start_recording");
+        setCommandStatus("Recording");
       }
       await refresh();
-      setCommandStatus("Idle");
     } catch (error) {
       setCommandStatus(errorMessage(error));
       await refresh().catch(() => undefined);
