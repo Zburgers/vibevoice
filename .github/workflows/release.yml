@@ -2,8 +2,14 @@ name: Release
 
 on:
   push:
+    branches:
+      - master
     tags:
       - "v*"
+  pull_request:
+    branches:
+      - master
+  workflow_dispatch:
 
 permissions:
   contents: write
@@ -18,16 +24,13 @@ jobs:
         include:
           - name: Windows
             os: windows-latest
-            bundles: nsis,msi
+            args: ""
           - name: Linux
             os: ubuntu-22.04
-            bundles: deb,rpm,appimage
-          - name: macOS Intel
-            os: macos-13
-            bundles: dmg,app
+            args: ""
           - name: macOS Apple Silicon
-            os: macos-latest
-            bundles: dmg,app
+            os: macos-14
+            args: --target aarch64-apple-darwin
 
     steps:
       - name: Checkout
@@ -55,6 +58,10 @@ jobs:
       - name: Setup Rust
         uses: dtolnay/rust-toolchain@stable
 
+      - name: Install macOS target
+        if: matrix.os == 'macos-14'
+        run: rustup target add aarch64-apple-darwin
+
       - name: Cache Rust
         uses: swatinem/rust-cache@v2
         with:
@@ -64,20 +71,22 @@ jobs:
         run: npm ci
         working-directory: app
 
+      - name: Read app version
+        id: version
+        run: echo "version=$(node -p \"require('./app/package.json').version\")" >> "$GITHUB_OUTPUT"
+
       - name: Build and publish release assets
         uses: tauri-apps/tauri-action@v0
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
         with:
           projectPath: app
-          tagName: ${{ github.ref_name }}
-          releaseName: VibeVoice ${{ github.ref_name }}
-          releaseBody: |
-            VibeVoice desktop installers and updater metadata.
-
-            Installers are attached for Windows, Linux, and macOS. Existing packaged installs check this release's signed updater metadata automatically.
+          args: ${{ matrix.args }}
+          uploadWorkflowArtifacts: true
+          uploadUpdaterJson: false
+          uploadUpdaterSignatures: false
+          tagName: ${{ github.event_name == 'pull_request' && '' || startsWith(github.ref, 'refs/tags/') && github.ref_name || format('v{0}', steps.version.outputs.version) }}
+          releaseName: ${{ github.event_name == 'pull_request' && '' || startsWith(github.ref, 'refs/tags/') && format('VibeVoice {0}', github.ref_name) || format('VibeVoice v{0}', steps.version.outputs.version) }}
+          releaseBody: ${{ github.event_name == 'pull_request' && '' || 'VibeVoice desktop installers for Windows, Linux, and macOS Apple Silicon.' }}
           releaseDraft: false
           prerelease: false
-          updaterJsonPreferNsis: true
-          args: --bundles ${{ matrix.bundles }}
