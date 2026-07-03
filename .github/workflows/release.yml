@@ -40,7 +40,7 @@ jobs:
         if: runner.os == 'Linux'
         run: |
           sudo apt-get update
-          sudo apt-get install -y \
+          sudo apt-get install -y --no-install-recommends \
             libwebkit2gtk-4.1-dev \
             libgtk-3-dev \
             libayatana-appindicator3-dev \
@@ -73,9 +73,9 @@ jobs:
 
       - name: Read app version
         id: version
+        shell: bash
         run: |
-          VERSION=$(node -p "require('./app/package.json').version")
-          echo "version=${VERSION}" >> "$GITHUB_OUTPUT"
+          echo "version=$(node -p "require('./app/package.json').version")" >> "$GITHUB_OUTPUT"
 
       - name: Build and publish release assets
         uses: tauri-apps/tauri-action@v0
@@ -84,11 +84,13 @@ jobs:
         with:
           projectPath: app
           args: ${{ matrix.args }}
+          includeRelease: ${{ startsWith(github.ref, 'refs/tags/') || github.event_name == 'workflow_dispatch' }}
           uploadWorkflowArtifacts: true
           uploadUpdaterJson: false
           uploadUpdaterSignatures: false
-          tagName: ${{ github.event_name == 'pull_request' && '' || startsWith(github.ref, 'refs/tags/') && github.ref_name || format('v{0}', steps.version.outputs.version) }}
-          releaseName: ${{ github.event_name == 'pull_request' && '' || startsWith(github.ref, 'refs/tags/') && format('VibeVoice {0}', github.ref_name) || format('VibeVoice v{0}', steps.version.outputs.version) }}
-          releaseBody: ${{ github.event_name == 'pull_request' && '' || 'VibeVoice desktop installers for Windows, Linux, and macOS Apple Silicon.' }}
+          tagName: ${{ startsWith(github.ref, 'refs/tags/') && github.ref_name || format('v{0}', steps.version.outputs.version) }}
+          releaseName: ${{ startsWith(github.ref, 'refs/tags/') && format('VibeVoice {0}', github.ref_name) || format('VibeVoice v{0}', steps.version.outputs.version) }}
+          releaseBody: 'VibeVoice desktop installers for Windows, Linux, and macOS Apple Silicon.'
+          generateReleaseNotes: true
           releaseDraft: false
           prerelease: false
