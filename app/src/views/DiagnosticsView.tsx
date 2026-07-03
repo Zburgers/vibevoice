@@ -1,18 +1,26 @@
-import { Copy, RefreshCw, Wrench } from "lucide-react";
-import type { AppState, Tone } from "../types";
+import { Copy, Download, ExternalLink, RefreshCw, Wrench } from "lucide-react";
+import type { AppState, Tone, UpdateStatus } from "../types";
 
 export function DiagnosticsView({
   state,
+  updateStatus,
   setupMessage,
   commandStatus,
   onRefresh,
+  onCheckUpdates,
+  onInstallUpdate,
+  onOpenReleasePage,
   onSetup,
   onCopyCommand,
 }: {
   state: AppState;
+  updateStatus: UpdateStatus;
   setupMessage: string;
   commandStatus: string;
   onRefresh: () => void;
+  onCheckUpdates: () => void;
+  onInstallUpdate: () => void;
+  onOpenReleasePage: () => void;
   onSetup: () => void;
   onCopyCommand: () => void;
 }) {
@@ -80,9 +88,32 @@ export function DiagnosticsView({
             <p className="mono">{setupMessage}</p>
           </article>
 
-          <article className="version-strip">
-            <span>Version {state.app_version}</span>
-            <strong>Source updates are handled outside the app.</strong>
+          <article className={`update-card is-${updateStatus.state}`}>
+            <div className="block-head">
+              <span>App updates</span>
+              <span>{updateStatus.latestVersion ? `Latest ${updateStatus.latestVersion}` : "GitHub Releases"}</span>
+            </div>
+            <div className="update-card-main">
+              <div>
+                <span className="version-label">Installed</span>
+                <strong>Version {state.app_version}</strong>
+              </div>
+              <p>{updateStatus.message}</p>
+            </div>
+            <div className="action-row">
+              <button type="button" className="secondary-action" onClick={onCheckUpdates} disabled={updateStatus.state === "checking" || updateStatus.state === "installing"}>
+                <RefreshCw size={16} className={updateStatus.state === "checking" ? "spin" : ""} />
+                <span>{updateStatus.state === "checking" ? "Checking" : "Check updates"}</span>
+              </button>
+              <button type="button" className="primary-action" onClick={onInstallUpdate} disabled={!updateStatus.canInstall || updateStatus.state === "installing"}>
+                <Download size={16} />
+                <span>{updateStatus.state === "installing" ? "Installing" : "Update app"}</span>
+              </button>
+              <button type="button" className="ghost-button" onClick={onOpenReleasePage}>
+                <ExternalLink size={16} />
+                <span>Release page</span>
+              </button>
+            </div>
           </article>
         </div>
       </div>

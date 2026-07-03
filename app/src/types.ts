@@ -80,8 +80,16 @@ export type MeterPayload = {
   mic_level: number;
 };
 
+export type UpdateStatus = {
+  state: "idle" | "checking" | "available" | "current" | "installing" | "installed" | "error";
+  latestVersion: string | null;
+  releaseUrl: string;
+  message: string;
+  canInstall: boolean;
+};
+
 export const fallbackState: AppState = {
-  app_version: "0.2.1",
+  app_version: "0.2.3",
   voice_state: "Ready",
   settings: {
     whisper_binary_path: "auto",

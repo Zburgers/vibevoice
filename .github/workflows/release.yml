@@ -17,6 +17,7 @@ permissions:
 jobs:
   publish-tauri:
     name: Build ${{ matrix.name }}
+    if: github.event_name != 'pull_request'
     runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
@@ -81,13 +82,15 @@ jobs:
         uses: tauri-apps/tauri-action@v0
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
         with:
           projectPath: app
           args: ${{ matrix.args }}
           includeRelease: ${{ startsWith(github.ref, 'refs/tags/') || github.event_name == 'workflow_dispatch' }}
           uploadWorkflowArtifacts: true
-          uploadUpdaterJson: false
-          uploadUpdaterSignatures: false
+          uploadUpdaterJson: true
+          uploadUpdaterSignatures: true
           tagName: ${{ startsWith(github.ref, 'refs/tags/') && github.ref_name || format('v{0}', steps.version.outputs.version) }}
           releaseName: ${{ startsWith(github.ref, 'refs/tags/') && format('VibeVoice {0}', github.ref_name) || format('VibeVoice v{0}', steps.version.outputs.version) }}
           releaseBody: 'VibeVoice desktop installers for Windows, Linux, and macOS Apple Silicon.'

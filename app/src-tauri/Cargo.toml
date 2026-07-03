@@ -1,6 +1,6 @@
 [package]
 name = "vibevoice"
-version = "0.2.2"
+version = "0.2.3"
 description = "Local-first desktop voice input for developers"
 authors = ["VibeVoice"]
 edition = "2021"
@@ -22,6 +22,8 @@ chrono = { version = "0.4", features = ["serde"] }
 uuid = { version = "1", features = ["v4", "serde"] }
 dirs = "6"
 hound = "3"
+tauri-plugin-updater = "^2"
+tauri-plugin-process = "^2"
 
 [target.'cfg(any(target_os = "windows", target_os = "macos"))'.dependencies]
 cpal = "0.15"

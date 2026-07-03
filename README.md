@@ -10,7 +10,7 @@ Local-first desktop voice input for developers. VibeVoice records from your micr
 - Whisper engine paths default to `auto`
 - Saved transcript history is opt-in and local-only
 - Windows and Linux setup scripts install or reuse `whisper.cpp`
-- Source updates are handled outside the app through normal release/install flows
+- Diagnostics checks GitHub Releases and can install signed updater releases in-app when updater metadata is available
 
 ## Quick Start
 

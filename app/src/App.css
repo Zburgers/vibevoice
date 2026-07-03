@@ -31,9 +31,10 @@
 html,
 body,
 #root {
-  min-height: 100%;
+  width: 100%;
+  height: 100%;
   margin: 0;
-  overflow-x: clip;
+  overflow: hidden;
   background: transparent;
   color: var(--text);
   font-family: var(--font-body);
@@ -99,7 +100,8 @@ select:focus-visible {
 }
 
 .desktop-frame {
-  min-height: 100dvh;
+  height: 100dvh;
+  overflow: hidden;
   display: flex;
   flex-direction: column;
   background:
@@ -109,6 +111,8 @@ select:focus-visible {
 }
 
 .app-titlebar {
+  position: relative;
+  z-index: 3;
   height: var(--titlebar);
   flex: 0 0 var(--titlebar);
   display: flex;
@@ -179,6 +183,7 @@ select:focus-visible {
 .app-shell {
   flex: 1;
   min-height: 0;
+  overflow: hidden;
   display: grid;
   grid-template-columns: minmax(210px, 248px) minmax(0, 1fr);
   gap: 20px;
@@ -191,7 +196,9 @@ select:focus-visible {
 
 .sidebar {
   min-width: 0;
-  min-height: calc(100dvh - var(--titlebar) - 36px);
+  height: calc(100dvh - var(--titlebar) - 36px);
+  min-height: 0;
+  overflow: hidden;
   display: flex;
   flex-direction: column;
   gap: 18px;
@@ -305,7 +312,16 @@ select:focus-visible {
 }
 
 .app-shell.is-rail .brand-block {
+  width: 100%;
+  min-height: 0;
+  flex-direction: column;
   justify-content: center;
+  gap: 8px;
+}
+
+.app-shell.is-rail .brand-mark {
+  width: 34px;
+  height: 34px;
 }
 
 .app-shell.is-rail .brand-copy,
@@ -336,6 +352,10 @@ select:focus-visible {
 
 .content {
   min-width: 0;
+  height: calc(100dvh - var(--titlebar) - 36px);
+  overflow: auto;
+  overscroll-behavior: contain;
+  padding-right: 4px;
   container: content / inline-size;
 }
 
@@ -513,7 +533,7 @@ select:focus-visible {
 .detail-block,
 .transcript-block,
 .diag-list,
-.version-strip,
+.update-card,
 .history-row,
 .rule-row,
 .dictionary-form,
@@ -983,25 +1003,54 @@ select:focus {
   gap: 14px;
 }
 
-.version-strip {
-  min-height: 58px;
-  display: flex;
-  align-items: center;
-  justify-content: space-between;
-  gap: 16px;
-  padding: 0 16px;
+.update-card {
+  min-width: 0;
+  display: grid;
+  gap: 14px;
+  padding: 16px;
 }
 
-.version-strip span {
+.update-card-main {
+  min-width: 0;
+  display: grid;
+  gap: 8px;
+}
+
+.version-label {
+  display: block;
+  margin-bottom: 3px;
   color: var(--accent);
   font-family: var(--font-mono);
   font-size: 0.82rem;
   font-weight: 720;
 }
 
-.version-strip strong {
+.update-card strong {
+  display: block;
   color: var(--text);
-  text-align: right;
+  overflow-wrap: anywhere;
+}
+
+.update-card p {
+  margin: 0;
+  color: var(--muted);
+  line-height: 1.45;
+  overflow-wrap: anywhere;
+}
+
+.update-card.is-available {
+  border-color: color-mix(in srgb, var(--accent) 48%, var(--line));
+  background:
+    linear-gradient(135deg, rgb(217 199 106 / 0.08), transparent 58%),
+    var(--surface);
+}
+
+.update-card.is-current {
+  border-color: color-mix(in srgb, var(--good) 34%, var(--line));
+}
+
+.update-card.is-error {
+  border-color: color-mix(in srgb, var(--bad) 42%, var(--line));
 }
 
 .empty-state {
@@ -1283,6 +1332,7 @@ select:focus {
   }
 
   .sidebar {
+    height: auto;
     min-height: auto;
     position: static;
     padding: 12px;

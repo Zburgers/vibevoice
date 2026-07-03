@@ -37,6 +37,7 @@ const LEGACY_DEFAULT_WHISPER: &str = "~/tools/whisper.cpp/build/bin/whisper-cli"
 const LEGACY_DEFAULT_MODEL: &str = "~/tools/whisper.cpp/models/ggml-base.en.bin";
 const STATE_CHANGED_EVENT: &str = "vibevoice-state-changed";
 const METER_CHANGED_EVENT: &str = "vibevoice-meter-changed";
+const RELEASES_URL: &str = "https://github.com/Zburgers/vibevoice/releases";
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "PascalCase")]
@@ -537,6 +538,33 @@ fn run_setup_script(app: AppHandle, data: tauri::State<AppData>) -> Result<Strin
         set_runtime_error(&data, &combined)?;
         Err(combined)
     }
+}
+
+#[tauri::command]
+fn open_release_page(url: Option<String>) -> Result<(), String> {
+    let url = url.unwrap_or_else(|| RELEASES_URL.to_string());
+    if !url.starts_with(RELEASES_URL) {
+        return Err("Release URL is outside the VibeVoice repository.".to_string());
+    }
+
+    let mut command = if cfg!(target_os = "windows") {
+        let mut command = Command::new("cmd");
+        command.args(["/C", "start", "", &url]);
+        command
+    } else if cfg!(target_os = "macos") {
+        let mut command = Command::new("open");
+        command.arg(&url);
+        command
+    } else {
+        let mut command = Command::new("xdg-open");
+        command.arg(&url);
+        command
+    };
+
+    command
+        .spawn()
+        .map(|_| ())
+        .map_err(|error| format!("Could not open release page: {error}"))
 }
 
 fn load_settings(app: &AppHandle) -> Result<Settings, String> {
@@ -1606,6 +1634,8 @@ pub fn run() {
     tauri::Builder::default()
         .plugin(tauri_plugin_global_shortcut::Builder::new().build())
         .plugin(tauri_plugin_clipboard_manager::init())
+        .plugin(tauri_plugin_process::init())
+        .plugin(tauri_plugin_updater::Builder::new().build())
         .manage(AppData {
             runtime: Mutex::new(RuntimeState::default()),
         })
@@ -1621,7 +1651,8 @@ pub fn run() {
             add_dictionary_rule,
             delete_dictionary_rule,
             set_dictionary_rule_enabled,
-            run_setup_script
+            run_setup_script,
+            open_release_page
         ])
         .setup(|app| {
             setup_tray(app.handle())?;

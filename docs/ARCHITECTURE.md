@@ -57,4 +57,4 @@ Transcript history is local JSON data and is disabled by default for privacy. Th
 
 ## Updates
 
-VibeVoice does not ship a self-update mechanism. Developers should use normal source control or release installers to move between versions.
+Diagnostics checks the latest public GitHub Release and reports whether a newer installer exists. The app also wires Tauri's signed updater plugin against `latest.json` on GitHub Releases, so releases that include updater metadata can be downloaded and installed from the Diagnostics view. If updater metadata is unavailable or the install fails, the same card opens the GitHub release page for manual install.

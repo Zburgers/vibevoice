@@ -4,6 +4,9 @@ import { invoke } from "@tauri-apps/api/core";
 import { LogicalSize } from "@tauri-apps/api/dpi";
 import { listen } from "@tauri-apps/api/event";
 import { getCurrentWindow, Window as TauriWindow } from "@tauri-apps/api/window";
+import { relaunch } from "@tauri-apps/plugin-process";
+import { check } from "@tauri-apps/plugin-updater";
+import type { Update } from "@tauri-apps/plugin-updater";
 import { Maximize2, Minimize2, PanelLeftClose, PanelLeftOpen, X } from "lucide-react";
 import vibevoiceIcon from "./assets/vibevoice-icon.png";
 import { PillWindow } from "./PillWindow";
@@ -14,7 +17,7 @@ import {
   navItems,
   stateToPhase,
 } from "./types";
-import type { AppState, LibraryMode, MeterPayload, Settings, TabKey } from "./types";
+import type { AppState, LibraryMode, MeterPayload, Settings, TabKey, UpdateStatus } from "./types";
 import { StatusChip } from "./ui";
 import { ControlView } from "./views/ControlView";
 import { DiagnosticsView } from "./views/DiagnosticsView";
@@ -47,6 +50,32 @@ function errorMessage(error: unknown) {
   return error instanceof Error ? error.message : String(error);
 }
 
+const RELEASES_URL = "https://github.com/Zburgers/vibevoice/releases";
+const LATEST_RELEASE_API = "https://api.github.com/repos/Zburgers/vibevoice/releases/latest";
+
+const initialUpdateStatus: UpdateStatus = {
+  state: "idle",
+  latestVersion: null,
+  releaseUrl: RELEASES_URL,
+  message: "Check GitHub Releases for newer installers.",
+  canInstall: false,
+};
+
+function normalizeVersion(version: string) {
+  return version.trim().replace(/^v/i, "");
+}
+
+function compareVersions(left: string, right: string) {
+  const leftParts = normalizeVersion(left).split(/[.-]/).map((part) => Number.parseInt(part, 10) || 0);
+  const rightParts = normalizeVersion(right).split(/[.-]/).map((part) => Number.parseInt(part, 10) || 0);
+  const count = Math.max(leftParts.length, rightParts.length, 3);
+  for (let index = 0; index < count; index += 1) {
+    const diff = (leftParts[index] ?? 0) - (rightParts[index] ?? 0);
+    if (diff !== 0) return diff;
+  }
+  return 0;
+}
+
 function App() {
   const [activeTab, setActiveTab] = useState<TabKey>(initialTab);
   const [libraryMode, setLibraryMode] = useState<LibraryMode>(initialLibraryMode);
@@ -58,6 +87,8 @@ function App() {
   const [sidebarCollapsed, setSidebarCollapsed] = useState(false);
   const [newRuleSpoken, setNewRuleSpoken] = useState("");
   const [newRuleReplacement, setNewRuleReplacement] = useState("");
+  const [updateStatus, setUpdateStatus] = useState<UpdateStatus>(initialUpdateStatus);
+  const [pendingUpdate, setPendingUpdate] = useState<Update | null>(null);
   const [, setTimerTick] = useState(0);
 
   const inTauri = isTauriRuntime();
@@ -87,6 +118,78 @@ function App() {
       if (currentId && next.history.some((entry) => entry.id === currentId)) return currentId;
       return next.history[0]?.id ?? "";
     });
+  }
+
+  async function refreshUpdateStatus() {
+    setUpdateStatus((current) => ({
+      ...current,
+      state: "checking",
+      message: "Checking for a newer release.",
+      canInstall: false,
+    }));
+    setPendingUpdate(null);
+
+    let updaterError = "";
+    if (inTauri) {
+      try {
+        const update = await check({ timeout: 12000 });
+        if (update) {
+          setPendingUpdate(update);
+          setUpdateStatus({
+            state: "available",
+            latestVersion: update.version,
+            releaseUrl: `${RELEASES_URL}/tag/v${normalizeVersion(update.version)}`,
+            message: `Version ${update.version} is ready to install.`,
+            canInstall: true,
+          });
+          return;
+        }
+      } catch (error) {
+        updaterError = errorMessage(error);
+      }
+    }
+
+    try {
+      const response = await fetch(LATEST_RELEASE_API, {
+        headers: { Accept: "application/vnd.github+json" },
+      });
+      if (!response.ok) {
+        throw new Error(`GitHub returned ${response.status}`);
+      }
+      const release = (await response.json()) as {
+        tag_name?: string;
+        html_url?: string;
+        name?: string;
+      };
+      const latestVersion = normalizeVersion(release.tag_name || release.name || "");
+      if (!latestVersion) {
+        throw new Error("Latest release did not include a version.");
+      }
+      const releaseUrl = release.html_url || `${RELEASES_URL}/tag/v${latestVersion}`;
+      const versionDelta = compareVersions(latestVersion, state.app_version);
+      const isNewer = versionDelta > 0;
+      setUpdateStatus({
+        state: isNewer ? "available" : "current",
+        latestVersion,
+        releaseUrl,
+        message: isNewer
+          ? updaterError
+            ? `Version ${latestVersion} is available. Open the release page to install it.`
+            : `Version ${latestVersion} is available.`
+          : versionDelta < 0
+            ? "This build is newer than the latest public release."
+            : "You are on the latest public release.",
+        canInstall: false,
+      });
+    } catch (error) {
+      setUpdateStatus({
+        state: "error",
+        latestVersion: null,
+        releaseUrl: RELEASES_URL,
+        message: updaterError || errorMessage(error),
+        canInstall: false,
+      });
+    }
   }
 
   useEffect(() => {
@@ -130,6 +233,20 @@ function App() {
     currentWindow?.setAlwaysOnTop(true).catch(() => undefined);
     currentWindow?.setSize(expanded ? new LogicalSize(318, 262) : new LogicalSize(68, 68)).catch(() => undefined);
   }, [currentWindow, expanded, isPillWindow]);
+
+  useEffect(() => {
+    if (isPillWindow || activeTab !== "diagnostics" || updateStatus.state !== "idle") return;
+    refreshUpdateStatus().catch((error) =>
+      setUpdateStatus({
+        state: "error",
+        latestVersion: null,
+        releaseUrl: RELEASES_URL,
+        message: errorMessage(error),
+        canInstall: false,
+      }),
+    );
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [activeTab, isPillWindow, updateStatus.state]);
 
   useEffect(() => {
     if (isPillWindow) return;
@@ -235,6 +352,74 @@ function App() {
       await refresh();
     } catch (error) {
       setCommandStatus(errorMessage(error));
+    }
+  }
+
+  async function handleInstallUpdate() {
+    if (!pendingUpdate) {
+      await handleOpenReleasePage();
+      return;
+    }
+    try {
+      setUpdateStatus((current) => ({
+        ...current,
+        state: "installing",
+        message: "Downloading update.",
+        canInstall: false,
+      }));
+      let downloaded = 0;
+      await pendingUpdate.downloadAndInstall((event) => {
+        if (event.event === "Started") {
+          setUpdateStatus((current) => ({
+            ...current,
+            message: event.data.contentLength ? `Downloading ${(event.data.contentLength / 1024 / 1024).toFixed(1)} MB update.` : "Downloading update.",
+          }));
+        }
+        if (event.event === "Progress") {
+          downloaded += event.data.chunkLength;
+          setUpdateStatus((current) => ({
+            ...current,
+            message: `Downloaded ${(downloaded / 1024 / 1024).toFixed(1)} MB.`,
+          }));
+        }
+        if (event.event === "Finished") {
+          setUpdateStatus((current) => ({
+            ...current,
+            message: "Installing update.",
+          }));
+        }
+      });
+      setUpdateStatus((current) => ({
+        ...current,
+        state: "installed",
+        message: "Update installed. Restarting VibeVoice.",
+      }));
+      await relaunch();
+    } catch (error) {
+      setPendingUpdate(null);
+      setUpdateStatus((current) => ({
+        ...current,
+        state: "error",
+        message: `${errorMessage(error)} Open the release page to install manually.`,
+        canInstall: false,
+      }));
+    }
+  }
+
+  async function handleOpenReleasePage() {
+    const url = updateStatus.releaseUrl || RELEASES_URL;
+    if (!inTauri) {
+      window.open(url, "_blank", "noopener,noreferrer");
+      return;
+    }
+    try {
+      await invoke("open_release_page", { url });
+    } catch (error) {
+      setUpdateStatus((current) => ({
+        ...current,
+        state: "error",
+        message: errorMessage(error),
+      }));
     }
   }
 
@@ -426,9 +611,13 @@ function App() {
           {activeTab === "diagnostics" && (
             <DiagnosticsView
               state={state}
+              updateStatus={updateStatus}
               setupMessage={setupMessage}
               commandStatus={commandStatus}
               onRefresh={refresh}
+              onCheckUpdates={refreshUpdateStatus}
+              onInstallUpdate={handleInstallUpdate}
+              onOpenReleasePage={handleOpenReleasePage}
               onSetup={handleSetup}
               onCopyCommand={() => handleCopyText(state.diagnostics.setup_command)}
             />
