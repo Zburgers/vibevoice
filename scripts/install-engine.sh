@@ -30,7 +30,7 @@ install_linux_packages() {
     fedora)
       local packages=()
       local pkg
-      for pkg in git cmake gcc gcc-c++ make ffmpeg alsa-utils alsa-lib-devel pkgconf-pkg-config wl-clipboard xclip; do
+      for pkg in git cmake gcc gcc-c++ make ffmpeg alsa-utils alsa-lib-devel pkgconf-pkg-config wl-clipboard xclip xsel wtype xdotool; do
         case "$pkg" in
           git) need_cmd git || packages+=("$pkg") ;;
           cmake) need_cmd cmake || packages+=("$pkg") ;;
@@ -43,6 +43,9 @@ install_linux_packages() {
           pkgconf-pkg-config) need_cmd pkg-config || packages+=("$pkg") ;;
           wl-clipboard) need_cmd wl-copy || packages+=("$pkg") ;;
           xclip) need_cmd xclip || packages+=("$pkg") ;;
+          xsel) need_cmd xsel || packages+=("$pkg") ;;
+          wtype) need_cmd wtype || packages+=("$pkg") ;;
+          xdotool) need_cmd xdotool || packages+=("$pkg") ;;
         esac
       done
       if ((${#packages[@]} > 0)); then
@@ -61,6 +64,9 @@ install_linux_packages() {
       pkg-config --exists alsa 2>/dev/null || packages+=(libasound2-dev pkg-config)
       need_cmd wl-copy || packages+=(wl-clipboard)
       need_cmd xclip || packages+=(xclip)
+      need_cmd xsel || packages+=(xsel)
+      need_cmd wtype || packages+=(wtype)
+      need_cmd xdotool || packages+=(xdotool)
       if ((${#packages[@]} > 0)); then
         say "Installing missing Debian/Ubuntu packages: ${packages[*]}"
         run sudo apt-get update
@@ -71,7 +77,7 @@ install_linux_packages() {
       ;;
     *)
       say "Unsupported Linux distro for automatic package install: ${ID:-unknown}"
-      say "Install git, cmake, a C/C++ toolchain, ffmpeg, ALSA development headers, and clipboard tools, then rerun."
+      say "Install git, cmake, a C/C++ toolchain, ffmpeg, ALSA tools, clipboard helpers, and paste helpers, then rerun."
       ;;
   esac
 }

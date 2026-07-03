@@ -53,7 +53,7 @@ powershell -NoProfile -ExecutionPolicy Bypass -File .\scripts\check-windows.ps1
 bash scripts/install-engine.sh
 ```
 
-The Linux installer supports Fedora first and also handles Debian/Ubuntu package names. It installs a compiler toolchain, CMake, FFmpeg, ALSA development headers for the Rust audio backend, and clipboard helpers.
+The Linux installer supports Fedora first and also handles Debian/Ubuntu package names. It installs a compiler toolchain, CMake, FFmpeg, recorder support, clipboard helpers, and paste helpers such as `wtype` and `xdotool`.
 
 Run a Linux readiness check:
 
@@ -79,7 +79,7 @@ npm install
 npm run tauri build
 ```
 
-Linux developers need ALSA development headers before Rust can compile CPAL:
+Linux recording uses runtime recorder binaries, so the normal no-default-features build does not require CPAL or ALSA development headers. If you intentionally enable a CPAL-based Linux experiment later, install ALSA development headers first:
 
 ```bash
 sudo dnf install -y alsa-lib-devel pkgconf-pkg-config
@@ -90,28 +90,3 @@ or:
 ```bash
 sudo apt-get install -y libasound2-dev pkg-config
 ```
-
-## Release Builds and Updates
-
-GitHub Actions builds release installers when a `v*` tag is pushed.
-
-```bash
-git tag v0.1.1
-git push origin master --tags
-```
-
-The release workflow builds:
-
-- Windows: NSIS `.exe` and MSI `.msi`
-- Linux: `.deb`, `.rpm`, and AppImage
-- macOS: `.dmg` and `.app` bundles for Intel and Apple Silicon runners
-
-The packaged app checks GitHub Releases on launch using Tauri's signed updater metadata at:
-
-```text
-https://github.com/Zburgers/vibevoice/releases/latest/download/latest.json
-```
-
-If a newer signed release is available, VibeVoice downloads it, installs it, and restarts. The main window also has a manual update check/install control.
-
-Updater signing uses the repository secret `TAURI_SIGNING_PRIVATE_KEY`. Only the public key is stored in `app/src-tauri/tauri.conf.json`; do not commit the private key.

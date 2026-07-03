@@ -4,11 +4,13 @@ Local-first desktop voice input for developers. VibeVoice records from your micr
 
 ## Current App Shape
 
-- Normal desktop app window for settings, diagnostics, dictionary rules, and history
+- Normal desktop app window with Control, Settings, Library, and Diagnostics views
 - Separate always-on-top floating pill window for quick recording
-- Pill shows recording state and live mic activity
+- Pill shows startup, recording, transcription, copied/inserted, and error states
 - Whisper engine paths default to `auto`
+- Saved transcript history is opt-in and local-only
 - Windows and Linux setup scripts install or reuse `whisper.cpp`
+- Source updates are handled outside the app through normal release/install flows
 
 ## Quick Start
 
