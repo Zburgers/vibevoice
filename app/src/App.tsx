@@ -3,7 +3,7 @@ import type { MouseEvent } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { LogicalSize } from "@tauri-apps/api/dpi";
 import { listen } from "@tauri-apps/api/event";
-import { getCurrentWindow, Window as TauriWindow } from "@tauri-apps/api/window";
+import { getCurrentWindow, monitorFromPoint, Window as TauriWindow } from "@tauri-apps/api/window";
 import { relaunch } from "@tauri-apps/plugin-process";
 import { check } from "@tauri-apps/plugin-updater";
 import type { Update } from "@tauri-apps/plugin-updater";
@@ -90,6 +90,8 @@ function App() {
   const [updateStatus, setUpdateStatus] = useState<UpdateStatus>(initialUpdateStatus);
   const [pendingUpdate, setPendingUpdate] = useState<Update | null>(null);
   const [, setTimerTick] = useState(0);
+  const [pillFlipX, setPillFlipX] = useState(false);
+  const [pillFlipY, setPillFlipY] = useState(false);
 
   const inTauri = isTauriRuntime();
   const currentWindow = useMemo(() => (inTauri ? getCurrentWindow() : null), [inTauri]);
@@ -232,6 +234,24 @@ function App() {
     if (!isPillWindow) return;
     currentWindow?.setAlwaysOnTop(true).catch(() => undefined);
     currentWindow?.setSize(expanded ? new LogicalSize(318, 262) : new LogicalSize(68, 68)).catch(() => undefined);
+
+    // When expanding, detect position relative to screen to decide flip direction
+    if (expanded && currentWindow) {
+      currentWindow.outerPosition().then(async (pos) => {
+        const monitor = await monitorFromPoint(pos.x, pos.y);
+        if (!monitor) return;
+        const monitorSize = monitor.size;
+        const scaleFactor = monitor.scaleFactor;
+        const screenW = monitorSize.width / scaleFactor;
+        const screenH = monitorSize.height / scaleFactor;
+        const pillLogicalX = pos.x / scaleFactor;
+        const pillLogicalY = pos.y / scaleFactor;
+        // Flip horizontal if pill is in the right 50% of the screen
+        setPillFlipX(pillLogicalX > screenW * 0.45);
+        // Flip vertical (open upward) if pill is in the bottom 50% of the screen
+        setPillFlipY(pillLogicalY > screenH * 0.5);
+      }).catch(() => undefined);
+    }
   }, [currentWindow, expanded, isPillWindow]);
 
   useEffect(() => {
@@ -270,9 +290,14 @@ function App() {
 
   async function showMainWindow() {
     if (!inTauri) return;
-    const mainWindow = await TauriWindow.getByLabel("main");
-    await mainWindow?.show();
-    await mainWindow?.setFocus();
+    try {
+      await invoke("show_main_window");
+    } catch {
+      // Fallback: try direct window API
+      const mainWindow = await TauriWindow.getByLabel("main");
+      await mainWindow?.show();
+      await mainWindow?.setFocus();
+    }
   }
 
   function minimizeWindow() {
@@ -488,6 +513,8 @@ function App() {
         recordingSeconds={recordingSeconds}
         primaryDisabled={primaryDisabled}
         ActionIcon={ActionIcon}
+        flipX={pillFlipX}
+        flipY={pillFlipY}
         onToggleExpanded={() => setExpanded((value) => !value)}
         onCollapse={() => setExpanded(false)}
         onDrag={dragPillWindow}

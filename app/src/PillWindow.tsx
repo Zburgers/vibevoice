@@ -14,6 +14,8 @@ export function PillWindow({
   recordingSeconds,
   primaryDisabled,
   ActionIcon,
+  flipX,
+  flipY,
   onToggleExpanded,
   onCollapse,
   onDrag,
@@ -28,6 +30,10 @@ export function PillWindow({
   recordingSeconds: number;
   primaryDisabled: boolean;
   ActionIcon: LucideIcon;
+  /** When true, the expanded panel opens to the LEFT (pill is in the right portion of screen) */
+  flipX?: boolean;
+  /** When true, the expanded panel opens UPWARD (pill is in the bottom portion of screen) */
+  flipY?: boolean;
   onToggleExpanded: () => void;
   onCollapse: () => void;
   onDrag: (event: MouseEvent<HTMLElement>) => void;
@@ -37,9 +43,17 @@ export function PillWindow({
 }) {
   const tone = phaseTone[phase];
   return (
-    <main className={`floating-shell ${expanded ? "is-expanded" : ""}`}>
+    <main
+      className={`floating-shell ${expanded ? "is-expanded" : ""} ${flipX ? "flip-x" : ""} ${flipY ? "flip-y" : ""}`}
+    >
       {!expanded && (
-        <button type="button" className="pill-grip-floating" onMouseDown={onDrag} aria-label="Move pill" title="Move">
+        <button
+          type="button"
+          className="pill-grip-floating"
+          onMouseDown={onDrag}
+          aria-label="Move pill"
+          title="Move"
+        >
           <GripVertical size={13} strokeWidth={2.5} />
         </button>
       )}
