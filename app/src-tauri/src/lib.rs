@@ -541,6 +541,31 @@ fn run_setup_script(app: AppHandle, data: tauri::State<AppData>) -> Result<Strin
 }
 
 #[tauri::command]
+async fn show_main_window(app: AppHandle) -> Result<(), String> {
+    if let Some(window) = app.get_webview_window("main") {
+        // Window exists – just show and focus it
+        let _ = window.show();
+        let _ = window.unminimize();
+        let _ = window.set_focus();
+    } else {
+        // Window was fully closed; re-create it from the config
+        tauri::WebviewWindowBuilder::from_config(
+            &app,
+            app.config()
+                .app
+                .windows
+                .iter()
+                .find(|w| w.label == "main")
+                .ok_or_else(|| "Main window config not found".to_string())?,
+        )
+        .map_err(|e| e.to_string())?
+        .build()
+        .map_err(|e| e.to_string())?;
+    }
+    Ok(())
+}
+
+#[tauri::command]
 fn open_release_page(url: Option<String>) -> Result<(), String> {
     let url = url.unwrap_or_else(|| RELEASES_URL.to_string());
     if !url.starts_with(RELEASES_URL) {
@@ -1652,7 +1677,8 @@ pub fn run() {
             delete_dictionary_rule,
             set_dictionary_rule_enabled,
             run_setup_script,
-            open_release_page
+            open_release_page,
+            show_main_window
         ])
         .setup(|app| {
             setup_tray(app.handle())?;

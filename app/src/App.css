@@ -798,6 +798,69 @@ select:focus {
   color: var(--accent);
 }
 
+/* ── Hotkey field ─────────────────────────────────────────── */
+.hotkey-field {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  width: 100%;
+  min-height: 42px;
+  padding: 0 8px 0 12px;
+  border: 1px solid var(--line);
+  border-radius: var(--radius-sm);
+  background: var(--surface);
+  transition: border-color 160ms ease, box-shadow 160ms ease;
+}
+
+.hotkey-field:focus-within {
+  border-color: var(--accent);
+  box-shadow: 0 0 0 4px var(--focus);
+}
+
+.hotkey-display {
+  flex: 1;
+  font-family: var(--font-mono);
+  font-size: 0.84rem;
+  color: var(--text);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.hotkey-record-btn {
+  flex: 0 0 auto;
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  height: 28px;
+  padding: 0 10px;
+  border: 1px solid var(--line);
+  border-radius: var(--radius-sm);
+  color: var(--muted);
+  background: var(--bg-soft);
+  font-size: 0.78rem;
+  font-weight: 720;
+  transition: color 160ms ease, border-color 160ms ease, background 160ms ease;
+}
+
+.hotkey-record-btn:hover {
+  color: var(--text);
+  border-color: var(--line-strong);
+  background: var(--surface-2);
+}
+
+.hotkey-record-btn.is-recording {
+  color: var(--warn);
+  border-color: color-mix(in srgb, var(--warn) 50%, var(--line));
+  background: rgb(255 180 95 / 0.08);
+  animation: hotkey-pulse 1.1s ease-in-out infinite;
+}
+
+@keyframes hotkey-pulse {
+  0%, 100% { opacity: 1; }
+  50% { opacity: 0.65; }
+}
+
 .segmented {
   display: inline-flex;
   gap: 4px;
@@ -1113,10 +1176,38 @@ select:focus {
   justify-content: center;
 }
 
+/* Default (non-flipped): pill at top, panel below, aligned left */
+.floating-shell.is-expanded {
+  align-items: flex-start;
+  justify-content: flex-start;
+}
+
+/* Flip X: pill is in right half — panel opens to the LEFT */
+.floating-shell.is-expanded.flip-x {
+  align-items: flex-end;
+}
+
+/* Flip Y: pill is in bottom half — panel opens UPWARD */
+.floating-shell.is-expanded.flip-y {
+  flex-direction: column-reverse;
+  justify-content: flex-end;
+}
+
+/* Both flipped: panel opens up-and-left */
+.floating-shell.is-expanded.flip-x.flip-y {
+  align-items: flex-end;
+  flex-direction: column-reverse;
+  justify-content: flex-end;
+}
+
+/* Drag handle when collapsed: sits just above-right of the pill circle, not at the window edge */
 .pill-grip-floating {
   position: absolute;
-  top: 0;
-  right: 0;
+  /* Offset so it sits just off the top-right of the 58px pill.
+     The pill is centered in the 68px window, so pill starts at 5px.
+     top-right corner of pill ≈ 5px + 58px - 10px offset = tight to icon */
+  top: 2px;
+  right: 2px;
   z-index: 2;
   width: 22px;
   height: 22px;
@@ -1129,6 +1220,12 @@ select:focus {
   background: rgb(16 18 16 / 0.94);
   box-shadow: var(--shadow-tight);
   cursor: move;
+  opacity: 0.7;
+  transition: opacity 160ms ease;
+}
+
+.pill-grip-floating:hover {
+  opacity: 1;
 }
 
 .voice-pill {
@@ -1237,6 +1334,12 @@ select:focus {
   border-radius: var(--radius-lg);
   background: rgb(24 28 24 / 0.98);
   box-shadow: 0 24px 54px rgb(0 0 0 / 0.52);
+}
+
+/* When flipped vertically, the panel renders above the pill so reverse margin */
+.floating-shell.flip-y .pill-panel {
+  margin-top: 0;
+  margin-bottom: 8px;
 }
 
 .pill-panel-top {
