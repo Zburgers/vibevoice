@@ -349,6 +349,10 @@ function App() {
   }
 
   async function handleSetup() {
+    if (!state.diagnostics.setup_available) {
+      setSetupMessage("In-app setup is disabled in production builds. Use the release installer or documented setup commands.");
+      return;
+    }
     if (!inTauri) {
       setSetupMessage("Desktop runtime unavailable in browser preview.");
       return;
@@ -600,6 +604,7 @@ function App() {
               onCopy={() => handleCopyText()}
               onPaste={() => handleReinsert(state.last_transcript)}
               onSetup={handleSetup}
+              onOpenReleasePage={handleOpenReleasePage}
               onOpenSettings={() => setActiveTab("settings")}
             />
           )}
@@ -609,6 +614,7 @@ function App() {
               state={state}
               onUpdate={updateSettings}
               onSetup={handleSetup}
+              onOpenReleasePage={handleOpenReleasePage}
               onOpenDiagnostics={() => setActiveTab("diagnostics")}
             />
           )}

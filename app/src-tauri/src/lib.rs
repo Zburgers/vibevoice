@@ -93,6 +93,7 @@ struct Diagnostics {
     recorder: Option<String>,
     input_device: Option<String>,
     platform: String,
+    setup_available: bool,
     setup_script_path: Option<String>,
     setup_command: Option<String>,
     last_error: Option<String>,
@@ -336,7 +337,9 @@ async fn stop_recording(app: AppHandle, data: tauri::State<'_, AppData>) -> Resu
 
     let app_handle = app.clone();
     async_runtime::spawn_blocking(move || {
-        if let Err(error) = finish_recording(app_handle.clone(), &mut session) {
+        let result = finish_recording(app_handle.clone(), &mut session);
+        cleanup_recording_artifacts(&session);
+        if let Err(error) = result {
             let state = app_handle.state::<AppData>();
             let _ = set_runtime_error(&state, &error);
             emit_state_changed(&app_handle);
@@ -492,7 +495,11 @@ fn setup_script_name() -> &'static str {
 }
 
 fn setup_script_path(app: &AppHandle) -> Option<PathBuf> {
-    find_repo_file(app, setup_script_name()).filter(|script| script.exists())
+    if !setup_execution_enabled() {
+        return None;
+    }
+    find_repo_file(app, setup_script_name())
+        .and_then(|script| trusted_setup_script_path(app, &script).ok())
 }
 
 fn setup_command(script: &Path) -> String {
@@ -506,14 +513,48 @@ fn setup_command(script: &Path) -> String {
     }
 }
 
-#[tauri::command]
-fn run_setup_script(app: AppHandle, data: tauri::State<AppData>) -> Result<String, String> {
-    let script_name = setup_script_name();
-    let script =
-        setup_script_path(&app).ok_or_else(|| format!("Setup script not found: {script_name}"))?;
+fn setup_execution_enabled() -> bool {
+    cfg!(debug_assertions)
+}
+
+fn trusted_setup_script_path(app: &AppHandle, script: &Path) -> Result<PathBuf, String> {
     if !script.exists() {
         return Err(format!("Setup script not found: {}", script.display()));
     }
+
+    let script = script
+        .canonicalize()
+        .map_err(|error| format!("Setup script path is invalid: {error}"))?;
+    let mut trusted_roots = Vec::new();
+    if let Ok(current) = std::env::current_dir() {
+        trusted_roots.push(current);
+    }
+    if let Ok(resource) = app.path().resource_dir() {
+        trusted_roots.push(resource);
+    }
+
+    for root in trusted_roots {
+        if let Ok(root) = root.canonicalize() {
+            if script.starts_with(root) {
+                return Ok(script);
+            }
+        }
+    }
+
+    Err("Setup script is outside trusted app paths.".to_string())
+}
+
+#[tauri::command]
+fn run_setup_script(app: AppHandle, data: tauri::State<AppData>) -> Result<String, String> {
+    if !setup_execution_enabled() {
+        return Err(
+            "In-app setup is only available in development builds. Use the release installer or documented setup commands."
+                .to_string(),
+        );
+    }
+    let script_name = setup_script_name();
+    let script =
+        setup_script_path(&app).ok_or_else(|| format!("Setup script not found: {script_name}"))?;
     let mut command = if cfg!(target_os = "windows") {
         let mut command = Command::new("powershell");
         command.args(["-NoProfile", "-ExecutionPolicy", "Bypass", "-File"]);
@@ -568,7 +609,7 @@ async fn show_main_window(app: AppHandle) -> Result<(), String> {
 #[tauri::command]
 fn open_release_page(url: Option<String>) -> Result<(), String> {
     let url = url.unwrap_or_else(|| RELEASES_URL.to_string());
-    if !url.starts_with(RELEASES_URL) {
+    if !is_allowed_release_url(&url) {
         return Err("Release URL is outside the VibeVoice repository.".to_string());
     }
 
@@ -590,6 +631,13 @@ fn open_release_page(url: Option<String>) -> Result<(), String> {
         .spawn()
         .map(|_| ())
         .map_err(|error| format!("Could not open release page: {error}"))
+}
+
+fn is_allowed_release_url(url: &str) -> bool {
+    url == RELEASES_URL
+        || url
+            .strip_prefix(RELEASES_URL)
+            .is_some_and(|suffix| suffix.starts_with("/tag/v") || suffix.starts_with("/download/"))
 }
 
 fn load_settings(app: &AppHandle) -> Result<Settings, String> {
@@ -720,6 +768,7 @@ fn expand_home(path: &str) -> PathBuf {
 fn diagnostics(app: &AppHandle, settings: &Settings, last_error: Option<String>) -> Diagnostics {
     let resolved = resolve_engine_paths(settings).ok();
     let setup_script = setup_script_path(app);
+    let setup_available = setup_execution_enabled() && setup_script.is_some();
     Diagnostics {
         whisper_found: resolved
             .as_ref()
@@ -737,6 +786,7 @@ fn diagnostics(app: &AppHandle, settings: &Settings, last_error: Option<String>)
         recorder: recorder_name(),
         input_device: input_device_name(),
         platform: std::env::consts::OS.to_string(),
+        setup_available,
         setup_script_path: setup_script
             .as_ref()
             .map(|script| script.display().to_string()),
@@ -949,6 +999,11 @@ fn executable_name(base: &str) -> String {
 
 fn temp_workspace() -> PathBuf {
     std::env::temp_dir().join("vibevoice")
+}
+
+fn cleanup_recording_artifacts(session: &RecordingSession) {
+    let _ = fs::remove_file(&session.audio_path);
+    let _ = fs::remove_file(session.output_prefix.with_extension("txt"));
 }
 
 #[cfg(any(target_os = "windows", target_os = "macos"))]
@@ -1781,5 +1836,24 @@ mod tests {
     #[test]
     fn native_clipboard_capability_is_reported_without_shell_helper() {
         assert_eq!(clipboard_tool_name(), Some("tauri-clipboard".to_string()));
+    }
+
+    #[test]
+    fn release_url_validation_rejects_prefix_spoofing() {
+        assert!(is_allowed_release_url(RELEASES_URL));
+        assert!(is_allowed_release_url(
+            "https://github.com/Zburgers/vibevoice/releases/tag/v0.2.4"
+        ));
+        assert!(!is_allowed_release_url(
+            "https://github.com/Zburgers/vibevoice/releases.evil.example/tag/v0.2.4"
+        ));
+        assert!(!is_allowed_release_url(
+            "https://github.com/Zburgers/vibevoice/issues"
+        ));
+    }
+
+    #[test]
+    fn setup_execution_flag_matches_build_profile() {
+        assert_eq!(setup_execution_enabled(), cfg!(debug_assertions));
     }
 }

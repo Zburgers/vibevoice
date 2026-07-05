@@ -48,9 +48,9 @@ export function DiagnosticsView({
             <RefreshCw size={16} />
             <span>Refresh</span>
           </button>
-          <button type="button" className="primary-action" onClick={onSetup}>
+          <button type="button" className="primary-action" disabled={!state.diagnostics.setup_available} onClick={onSetup}>
             <Wrench size={16} />
-            <span>Run setup</span>
+            <span>{state.diagnostics.setup_available ? "Run setup" : "Setup disabled"}</span>
           </button>
         </div>
       </div>
@@ -71,7 +71,9 @@ export function DiagnosticsView({
               <span>Setup command</span>
               <span>{state.diagnostics.platform}</span>
             </div>
-            <p className="mono">{state.diagnostics.setup_command || "Setup script not found."}</p>
+            <p className="mono">
+              {state.diagnostics.setup_command || "Production builds use release installers and documented manual setup commands."}
+            </p>
             <div className="action-row">
               <button type="button" className="secondary-action" disabled={!state.diagnostics.setup_command} onClick={onCopyCommand}>
                 <Copy size={16} />

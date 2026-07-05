@@ -45,7 +45,7 @@ The installer writes to the user app-data engine directory by default:
 - `scripts/check-windows.ps1`
 - `scripts/check-system.sh`
 
-Setup scripts are packaged as Tauri resources so app-triggered setup works after bundling.
+Production builds do not execute setup scripts from the app. Diagnostics shows the setup command in development and points production users to release installers or documented manual setup.
 
 ## Dictionary
 

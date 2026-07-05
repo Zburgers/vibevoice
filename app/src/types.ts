@@ -41,6 +41,7 @@ export type Diagnostics = {
   recorder: string | null;
   input_device: string | null;
   platform: string;
+  setup_available: boolean;
   setup_script_path: string | null;
   setup_command: string | null;
   last_error: string | null;
@@ -89,7 +90,7 @@ export type UpdateStatus = {
 };
 
 export const fallbackState: AppState = {
-  app_version: "0.2.3",
+  app_version: "0.2.4",
   voice_state: "Ready",
   settings: {
     whisper_binary_path: "auto",
@@ -113,6 +114,7 @@ export const fallbackState: AppState = {
     recorder: null,
     input_device: null,
     platform: "unknown",
+    setup_available: false,
     setup_script_path: null,
     setup_command: null,
     last_error: null,

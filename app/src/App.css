@@ -67,6 +67,12 @@ button:disabled {
   cursor: not-allowed;
 }
 
+button:disabled,
+button:disabled:hover {
+  opacity: 0.52;
+  transform: none;
+}
+
 button,
 a,
 input,

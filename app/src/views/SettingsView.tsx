@@ -1,5 +1,5 @@
 import { useEffect, useRef, useState } from "react";
-import { Activity, BookOpen, Clipboard, History, Info, Keyboard, Wrench, Zap } from "lucide-react";
+import { Activity, BookOpen, Clipboard, ExternalLink, History, Info, Keyboard, Wrench, Zap } from "lucide-react";
 import type { AppState, Settings } from "../types";
 import { Toggle } from "../ui";
 
@@ -118,11 +118,13 @@ export function SettingsView({
   state,
   onUpdate,
   onSetup,
+  onOpenReleasePage,
   onOpenDiagnostics,
 }: {
   state: AppState;
   onUpdate: (patch: Partial<Settings>) => void;
   onSetup: () => void;
+  onOpenReleasePage: () => void;
   onOpenDiagnostics: () => void;
 }) {
   return (
@@ -132,10 +134,17 @@ export function SettingsView({
           <div className="eyebrow">Settings</div>
           <h1>Paths, hotkey, and output.</h1>
         </div>
-        <button type="button" className="secondary-action" onClick={onSetup}>
-          <Wrench size={16} />
-          <span>Run setup</span>
-        </button>
+        {state.diagnostics.setup_available ? (
+          <button type="button" className="secondary-action" onClick={onSetup}>
+            <Wrench size={16} />
+            <span>Run setup</span>
+          </button>
+        ) : (
+          <button type="button" className="secondary-action" onClick={onOpenReleasePage}>
+            <ExternalLink size={16} />
+            <span>Install guide</span>
+          </button>
+        )}
       </div>
 
       <div className="settings-grid">

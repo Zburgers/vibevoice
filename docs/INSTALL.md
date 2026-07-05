@@ -25,7 +25,7 @@ npm install
 npm run tauri dev
 ```
 
-Inside the app, press `Setup`, or run the installer directly from the repository root:
+Run the installer directly from the repository root:
 
 ```powershell
 powershell -NoProfile -ExecutionPolicy Bypass -File .\scripts\install-windows.ps1

@@ -1,4 +1,4 @@
-import { Activity, Copy, Keyboard, RotateCcw, ShieldCheck, SlidersHorizontal, Wrench, Zap } from "lucide-react";
+import { Activity, Copy, ExternalLink, Keyboard, RotateCcw, ShieldCheck, SlidersHorizontal, Wrench, Zap } from "lucide-react";
 import type { LucideIcon } from "lucide-react";
 import vibevoiceIcon from "../assets/vibevoice-icon.png";
 import { actionLabel, phaseCopy, phaseTone } from "../types";
@@ -16,6 +16,7 @@ export function ControlView({
   onCopy,
   onPaste,
   onSetup,
+  onOpenReleasePage,
   onOpenSettings,
 }: {
   state: AppState;
@@ -28,6 +29,7 @@ export function ControlView({
   onCopy: () => void;
   onPaste: () => void;
   onSetup: () => void;
+  onOpenReleasePage: () => void;
   onOpenSettings: () => void;
 }) {
   const tone = phaseTone[phase];
@@ -73,10 +75,17 @@ export function ControlView({
           <RotateCcw size={16} />
           <span>Paste again</span>
         </button>
-        <button type="button" className="secondary-action" onClick={onSetup}>
-          <Wrench size={16} />
-          <span>Run setup</span>
-        </button>
+        {state.diagnostics.setup_available ? (
+          <button type="button" className="secondary-action" onClick={onSetup}>
+            <Wrench size={16} />
+            <span>Run setup</span>
+          </button>
+        ) : (
+          <button type="button" className="secondary-action" onClick={onOpenReleasePage}>
+            <ExternalLink size={16} />
+            <span>Install guide</span>
+          </button>
+        )}
         <button type="button" className="ghost-button" onClick={onOpenSettings}>
           <SlidersHorizontal size={16} />
           <span>Settings</span>
