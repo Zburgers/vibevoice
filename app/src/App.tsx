@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import type { MouseEvent } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { LogicalSize } from "@tauri-apps/api/dpi";
@@ -92,6 +92,7 @@ function App() {
   const [, setTimerTick] = useState(0);
   const [pillFlipX, setPillFlipX] = useState(false);
   const [pillFlipY, setPillFlipY] = useState(false);
+  const settingsRef = useRef(fallbackState.settings);
 
   const inTauri = isTauriRuntime();
   const currentWindow = useMemo(() => (inTauri ? getCurrentWindow() : null), [inTauri]);
@@ -109,10 +110,17 @@ function App() {
   const primaryDisabled = !canStartOrStop(state.voice_state);
   const ActionIcon = actionIcon(state.voice_state);
 
-  async function refresh() {
+  useEffect(() => {
+    settingsRef.current = state.settings;
+  }, [state.settings]);
+
+  async function refresh(forceDiagnostics = false) {
     if (!inTauri) {
       setState(fallbackState);
       return;
+    }
+    if (forceDiagnostics) {
+      await invoke("refresh_diagnostics");
     }
     const next = await invoke<AppState>("get_app_state");
     setState(next);
@@ -335,13 +343,20 @@ function App() {
   }
 
   async function updateSettings(patch: Partial<Settings>) {
-    const settings = { ...state.settings, ...patch };
+    const settings = { ...settingsRef.current, ...patch };
+    settingsRef.current = settings;
+    const enginePathChanged =
+      patch.whisper_binary_path !== undefined || patch.model_path !== undefined;
+    const retentionChanged =
+      patch.max_history_entries !== undefined || patch.history_retention_days !== undefined;
     setState((current) => ({ ...current, settings }));
     if (!inTauri) return;
     try {
       await invoke("save_settings", { settings });
       setCommandStatus("Settings saved");
-      await refresh();
+      if (enginePathChanged || retentionChanged) {
+        await refresh(enginePathChanged);
+      }
     } catch (error) {
       setCommandStatus(errorMessage(error));
       await refresh().catch(() => undefined);
@@ -481,6 +496,19 @@ function App() {
     await invoke("clear_history");
     setSelectedHistoryId("");
     await refresh();
+  }
+
+  async function handleExportHistory(format: "markdown" | "json") {
+    if (!inTauri) {
+      setCommandStatus("Desktop runtime unavailable in browser preview");
+      return;
+    }
+    try {
+      const path = await invoke<string>("export_history", { format });
+      setCommandStatus(`Exported ${format} history to ${path}`);
+    } catch (error) {
+      setCommandStatus(errorMessage(error));
+    }
   }
 
   async function handleAddRule() {
@@ -632,6 +660,7 @@ function App() {
               onReinsert={handleReinsert}
               onDeleteHistory={handleDeleteHistory}
               onClearHistory={handleClearHistory}
+              onExportHistory={handleExportHistory}
               onUpdateSettings={updateSettings}
               onNewRuleSpoken={setNewRuleSpoken}
               onNewRuleReplacement={setNewRuleReplacement}
@@ -647,7 +676,7 @@ function App() {
               updateStatus={updateStatus}
               setupMessage={setupMessage}
               commandStatus={commandStatus}
-              onRefresh={refresh}
+              onRefresh={() => refresh(true)}
               onCheckUpdates={refreshUpdateStatus}
               onInstallUpdate={handleInstallUpdate}
               onOpenReleasePage={handleOpenReleasePage}
