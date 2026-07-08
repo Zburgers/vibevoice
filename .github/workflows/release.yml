@@ -73,8 +73,9 @@ jobs:
       - name: Read app version
         id: version
         shell: bash
+        working-directory: app
         run: |
-          echo "version=$(node -p "require('./app/package.json').version")" >> "$GITHUB_OUTPUT"
+          echo "version=$(node -p 'require(\"./package.json\").version')" >> "$GITHUB_OUTPUT"
 
       - name: Build and publish release assets
         uses: tauri-apps/tauri-action@v0

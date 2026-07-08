@@ -1,4 +1,4 @@
-import { BookOpen, Copy, Eraser, History, RotateCcw, Trash2 } from "lucide-react";
+import { BookOpen, Copy, Download, Eraser, FileJson, History, RotateCcw, Trash2 } from "lucide-react";
 import type { AppState, HistoryItem, LibraryMode, Settings } from "../types";
 import { EmptyState, Field, RuleToggle, Toggle } from "../ui";
 import { formatDuration } from "../types";
@@ -15,6 +15,7 @@ export function LibraryView({
   onReinsert,
   onDeleteHistory,
   onClearHistory,
+  onExportHistory,
   onUpdateSettings,
   onNewRuleSpoken,
   onNewRuleReplacement,
@@ -33,6 +34,7 @@ export function LibraryView({
   onReinsert: (text?: string | null) => void;
   onDeleteHistory: (id: string) => void;
   onClearHistory: () => void;
+  onExportHistory: (format: "markdown" | "json") => void;
   onUpdateSettings: (patch: Partial<Settings>) => void;
   onNewRuleSpoken: (value: string) => void;
   onNewRuleReplacement: (value: string) => void;
@@ -63,6 +65,14 @@ export function LibraryView({
         <div className="history-layout">
           <div className="history-toolbar">
             <Toggle icon={History} label="Save local history" value={state.settings.history_enabled} onClick={() => onUpdateSettings({ history_enabled: !state.settings.history_enabled })} />
+            <button type="button" className="secondary-action" disabled={state.history.length === 0} onClick={() => onExportHistory("markdown")}>
+              <Download size={16} />
+              <span>Markdown</span>
+            </button>
+            <button type="button" className="secondary-action" disabled={state.history.length === 0} onClick={() => onExportHistory("json")}>
+              <FileJson size={16} />
+              <span>JSON</span>
+            </button>
             <button type="button" className="secondary-action danger" disabled={state.history.length === 0} onClick={onClearHistory}>
               <Eraser size={16} />
               <span>Clear history</span>

@@ -127,6 +127,38 @@ export function SettingsView({
   onOpenReleasePage: () => void;
   onOpenDiagnostics: () => void;
 }) {
+  const [whisperPath, setWhisperPath] = useState(state.settings.whisper_binary_path);
+  const [modelPath, setModelPath] = useState(state.settings.model_path);
+  const updateRef = useRef(onUpdate);
+
+  useEffect(() => {
+    updateRef.current = onUpdate;
+  }, [onUpdate]);
+
+  useEffect(() => {
+    setWhisperPath(state.settings.whisper_binary_path);
+  }, [state.settings.whisper_binary_path]);
+
+  useEffect(() => {
+    setModelPath(state.settings.model_path);
+  }, [state.settings.model_path]);
+
+  useEffect(() => {
+    if (whisperPath === state.settings.whisper_binary_path) return;
+    const timer = window.setTimeout(() => {
+      updateRef.current({ whisper_binary_path: whisperPath });
+    }, 500);
+    return () => window.clearTimeout(timer);
+  }, [state.settings.whisper_binary_path, whisperPath]);
+
+  useEffect(() => {
+    if (modelPath === state.settings.model_path) return;
+    const timer = window.setTimeout(() => {
+      updateRef.current({ model_path: modelPath });
+    }, 500);
+    return () => window.clearTimeout(timer);
+  }, [modelPath, state.settings.model_path]);
+
   return (
     <section className="view settings-view">
       <div className="view-head">
@@ -151,15 +183,15 @@ export function SettingsView({
         <label className="field">
           <span>Whisper binary path</span>
           <input
-            value={state.settings.whisper_binary_path}
-            onChange={(e) => onUpdate({ whisper_binary_path: e.target.value })}
+            value={whisperPath}
+            onChange={(e) => setWhisperPath(e.target.value)}
           />
         </label>
         <label className="field">
           <span>Model path</span>
           <input
-            value={state.settings.model_path}
-            onChange={(e) => onUpdate({ model_path: e.target.value })}
+            value={modelPath}
+            onChange={(e) => setModelPath(e.target.value)}
           />
         </label>
         <HotkeyField
@@ -174,6 +206,26 @@ export function SettingsView({
           >
             <option value="toggle">Toggle recording</option>
           </select>
+        </label>
+        <label className="field">
+          <span>Maximum saved transcripts</span>
+          <input
+            type="number"
+            min={1}
+            max={1000}
+            value={state.settings.max_history_entries}
+            onChange={(e) => onUpdate({ max_history_entries: Number(e.target.value) || 1 })}
+          />
+        </label>
+        <label className="field">
+          <span>Auto-delete after days</span>
+          <input
+            type="number"
+            min={0}
+            max={3650}
+            value={state.settings.history_retention_days}
+            onChange={(e) => onUpdate({ history_retention_days: Number(e.target.value) || 0 })}
+          />
         </label>
       </div>
 

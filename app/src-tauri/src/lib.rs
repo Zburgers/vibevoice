@@ -1,4 +1,4 @@
-use chrono::{DateTime, Utc};
+use chrono::{DateTime, Duration as ChronoDuration, Utc};
 use serde::{Deserialize, Serialize};
 use std::{
     fs, io,
@@ -38,6 +38,9 @@ const LEGACY_DEFAULT_MODEL: &str = "~/tools/whisper.cpp/models/ggml-base.en.bin"
 const STATE_CHANGED_EVENT: &str = "vibevoice-state-changed";
 const METER_CHANGED_EVENT: &str = "vibevoice-meter-changed";
 const RELEASES_URL: &str = "https://github.com/Zburgers/vibevoice/releases";
+const DEFAULT_MAX_HISTORY_ENTRIES: usize = 100;
+const MAX_HISTORY_ENTRIES: usize = 1000;
+const DIAGNOSTICS_CACHE_TTL: Duration = Duration::from_secs(5);
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "PascalCase")]
@@ -62,6 +65,8 @@ struct Settings {
     clipboard_fallback: bool,
     dictionary_cleanup: bool,
     history_enabled: bool,
+    max_history_entries: usize,
+    history_retention_days: u32,
     start_on_login: bool,
 }
 
@@ -76,6 +81,8 @@ impl Default for Settings {
             clipboard_fallback: true,
             dictionary_cleanup: true,
             history_enabled: false,
+            max_history_entries: DEFAULT_MAX_HISTORY_ENTRIES,
+            history_retention_days: 0,
             start_on_login: false,
         }
     }
@@ -200,15 +207,37 @@ impl Default for RuntimeState {
     }
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct DiagnosticsCacheKey {
+    whisper_binary_path: String,
+    model_path: String,
+}
+
+impl DiagnosticsCacheKey {
+    fn from_settings(settings: &Settings) -> Self {
+        Self {
+            whisper_binary_path: settings.whisper_binary_path.clone(),
+            model_path: settings.model_path.clone(),
+        }
+    }
+}
+
+struct DiagnosticsCache {
+    key: DiagnosticsCacheKey,
+    created_at: Instant,
+    diagnostics: Diagnostics,
+}
+
 struct AppData {
     runtime: Mutex<RuntimeState>,
+    diagnostics_cache: Mutex<Option<DiagnosticsCache>>,
 }
 
 #[tauri::command]
 fn get_app_state(app: AppHandle, data: tauri::State<AppData>) -> Result<AppStateSnapshot, String> {
     let settings = load_settings(&app)?;
     let dictionary = load_dictionary(&app)?;
-    let history = load_history(&app)?;
+    let history = load_history_for_settings(&app, &settings)?;
     let runtime = data.runtime.lock().map_err(|error| error.to_string())?;
     let recording_started_at = runtime.recording.as_ref().map(|session| session.started_at);
     let mic_level = runtime
@@ -220,7 +249,7 @@ fn get_app_state(app: AppHandle, data: tauri::State<AppData>) -> Result<AppState
         app_version: env!("CARGO_PKG_VERSION").to_string(),
         voice_state: runtime.voice_state.clone(),
         settings: settings.clone(),
-        diagnostics: diagnostics(&app, &settings, runtime.last_error.clone()),
+        diagnostics: cached_diagnostics(&app, &data, &settings, runtime.last_error.clone(), false)?,
         history,
         dictionary,
         last_transcript: runtime.last_transcript.clone(),
@@ -231,8 +260,27 @@ fn get_app_state(app: AppHandle, data: tauri::State<AppData>) -> Result<AppState
 }
 
 #[tauri::command]
-fn save_settings(app: AppHandle, settings: Settings) -> Result<(), String> {
-    register_global_hotkey(&app, &settings.hotkey)?;
+fn refresh_diagnostics(app: AppHandle, data: tauri::State<AppData>) -> Result<Diagnostics, String> {
+    let settings = load_settings(&app)?;
+    let runtime = data.runtime.lock().map_err(|error| error.to_string())?;
+    cached_diagnostics(&app, &data, &settings, runtime.last_error.clone(), true)
+}
+
+#[tauri::command]
+fn save_settings(
+    app: AppHandle,
+    data: tauri::State<AppData>,
+    settings: Settings,
+) -> Result<(), String> {
+    let previous = load_settings(&app).unwrap_or_default();
+    if settings.hotkey != previous.hotkey {
+        register_global_hotkey(&app, &settings.hotkey)?;
+    }
+    if DiagnosticsCacheKey::from_settings(&settings)
+        != DiagnosticsCacheKey::from_settings(&previous)
+    {
+        invalidate_diagnostics_cache(&data)?;
+    }
     write_json(settings_path(&app)?, &settings)
 }
 
@@ -455,6 +503,36 @@ fn clear_history(app: AppHandle) -> Result<(), String> {
 }
 
 #[tauri::command]
+fn export_history(app: AppHandle, format: String) -> Result<String, String> {
+    let settings = load_settings(&app)?;
+    let history = load_history_for_settings(&app, &settings)?;
+    if history.is_empty() {
+        return Err("No saved history to export.".to_string());
+    }
+
+    let normalized = format.trim().to_lowercase();
+    let (extension, content) = match normalized.as_str() {
+        "json" => (
+            "json",
+            serde_json::to_string_pretty(&history).map_err(|error| error.to_string())?,
+        ),
+        "markdown" | "md" => ("md", history_as_markdown(&history)),
+        _ => return Err("Export format must be markdown or json.".to_string()),
+    };
+    let filename = format!(
+        "vibevoice-history-{}.{}",
+        Utc::now().format("%Y%m%d-%H%M%S"),
+        extension
+    );
+    let path = config_dir(&app)?.join("exports").join(filename);
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent).map_err(|error| error.to_string())?;
+    }
+    fs::write(&path, content).map_err(|error| error.to_string())?;
+    Ok(path.display().to_string())
+}
+
+#[tauri::command]
 fn add_dictionary_rule(app: AppHandle, spoken: String, replacement: String) -> Result<(), String> {
     let mut dictionary = load_dictionary(&app)?;
     dictionary.push(DictionaryRule {
@@ -656,17 +734,75 @@ fn load_dictionary(app: &AppHandle) -> Result<Vec<DictionaryRule>, String> {
 }
 
 fn load_history(app: &AppHandle) -> Result<Vec<HistoryItem>, String> {
-    let mut history: Vec<HistoryItem> = read_json_or_default(history_path(app)?)?;
-    history.sort_by(|left, right| right.created_at.cmp(&left.created_at));
-    history.truncate(100);
+    let settings = load_settings(app)?;
+    load_history_for_settings(app, &settings)
+}
+
+fn load_history_for_settings(
+    app: &AppHandle,
+    settings: &Settings,
+) -> Result<Vec<HistoryItem>, String> {
+    let path = history_path(app)?;
+    let history: Vec<HistoryItem> = read_json_or_default(path.clone())?;
+    let original_len = history.len();
+    let history = apply_history_retention(history, settings, Utc::now());
+    if history.len() != original_len {
+        write_json(path, &history)?;
+    }
     Ok(history)
 }
 
 fn append_history(app: &AppHandle, item: HistoryItem) -> Result<(), String> {
-    let mut history = load_history(app)?;
+    let settings = load_settings(app)?;
+    let mut history = load_history_for_settings(app, &settings)?;
     history.insert(0, item);
-    history.truncate(100);
+    let history = apply_history_retention(history, &settings, Utc::now());
     write_json(history_path(app)?, &history)
+}
+
+fn apply_history_retention(
+    mut history: Vec<HistoryItem>,
+    settings: &Settings,
+    now: DateTime<Utc>,
+) -> Vec<HistoryItem> {
+    history.sort_by(|left, right| right.created_at.cmp(&left.created_at));
+    if settings.history_retention_days > 0 {
+        let cutoff = now - ChronoDuration::days(settings.history_retention_days as i64);
+        history.retain(|item| item.created_at >= cutoff);
+    }
+    history.truncate(history_limit(settings));
+    history
+}
+
+fn history_limit(settings: &Settings) -> usize {
+    settings.max_history_entries.clamp(1, MAX_HISTORY_ENTRIES)
+}
+
+fn history_as_markdown(history: &[HistoryItem]) -> String {
+    let mut output = String::from("# VibeVoice History Export\n\n");
+    for item in history {
+        output.push_str(&format!("## {}\n\n", item.created_at.to_rfc3339()));
+        output.push_str(&format!("- Insert status: `{}`\n", item.insert_status));
+        output.push_str(&format!(
+            "- Duration: {}\n",
+            item.duration_ms
+                .map(|duration| format!("{duration} ms"))
+                .unwrap_or_else(|| "not recorded".to_string())
+        ));
+        output.push_str(&format!(
+            "- Error: {}\n\n",
+            item.error.as_deref().unwrap_or("none")
+        ));
+        output.push_str("### Final transcript\n\n");
+        output.push_str(&item.final_transcript);
+        output.push_str("\n\n");
+        if !item.raw_transcript.trim().is_empty() && item.raw_transcript != item.final_transcript {
+            output.push_str("### Raw transcript\n\n");
+            output.push_str(&item.raw_transcript);
+            output.push_str("\n\n");
+        }
+    }
+    output
 }
 
 fn settings_path(app: &AppHandle) -> Result<PathBuf, String> {
@@ -793,6 +929,50 @@ fn diagnostics(app: &AppHandle, settings: &Settings, last_error: Option<String>)
         setup_command: setup_script.as_ref().map(|script| setup_command(script)),
         last_error,
     }
+}
+
+fn cached_diagnostics(
+    app: &AppHandle,
+    data: &tauri::State<AppData>,
+    settings: &Settings,
+    last_error: Option<String>,
+    force_refresh: bool,
+) -> Result<Diagnostics, String> {
+    let key = DiagnosticsCacheKey::from_settings(settings);
+    let mut cache = data
+        .diagnostics_cache
+        .lock()
+        .map_err(|error| error.to_string())?;
+    if !force_refresh {
+        if let Some(entry) = cache.as_ref() {
+            if entry.key == key && entry.created_at.elapsed() <= DIAGNOSTICS_CACHE_TTL {
+                let mut diagnostics = entry.diagnostics.clone();
+                diagnostics.last_error = last_error;
+                return Ok(diagnostics);
+            }
+        }
+    }
+
+    let diagnostics = diagnostics(app, settings, None);
+    *cache = Some(DiagnosticsCache {
+        key,
+        created_at: Instant::now(),
+        diagnostics: diagnostics.clone(),
+    });
+    drop(cache);
+
+    let mut diagnostics = diagnostics;
+    diagnostics.last_error = last_error;
+    Ok(diagnostics)
+}
+
+fn invalidate_diagnostics_cache(data: &tauri::State<AppData>) -> Result<(), String> {
+    let mut cache = data
+        .diagnostics_cache
+        .lock()
+        .map_err(|error| error.to_string())?;
+    *cache = None;
+    Ok(())
 }
 
 fn ensure_engine_ready(settings: &Settings) -> Result<(), String> {
@@ -1718,9 +1898,11 @@ pub fn run() {
         .plugin(tauri_plugin_updater::Builder::new().build())
         .manage(AppData {
             runtime: Mutex::new(RuntimeState::default()),
+            diagnostics_cache: Mutex::new(None),
         })
         .invoke_handler(tauri::generate_handler![
             get_app_state,
+            refresh_diagnostics,
             save_settings,
             start_recording,
             stop_recording,
@@ -1728,6 +1910,7 @@ pub fn run() {
             insert_text,
             delete_history_item,
             clear_history,
+            export_history,
             add_dictionary_rule,
             delete_dictionary_rule,
             set_dictionary_rule_enabled,
@@ -1855,5 +2038,54 @@ mod tests {
     #[test]
     fn setup_execution_flag_matches_build_profile() {
         assert_eq!(setup_execution_enabled(), cfg!(debug_assertions));
+    }
+
+    #[test]
+    fn history_retention_applies_age_and_count_limits() {
+        let now = Utc::now();
+        let history = vec![
+            history_item("old", now - ChronoDuration::days(10)),
+            history_item("newest", now),
+            history_item("recent", now - ChronoDuration::days(1)),
+        ];
+        let settings = Settings {
+            max_history_entries: 1,
+            history_retention_days: 7,
+            ..Settings::default()
+        };
+
+        let retained = apply_history_retention(history, &settings, now);
+
+        assert_eq!(retained.len(), 1);
+        assert_eq!(retained[0].final_transcript, "newest");
+    }
+
+    #[test]
+    fn history_markdown_includes_export_metadata() {
+        let item = HistoryItem {
+            duration_ms: Some(1250),
+            insert_status: "inserted:wtype".to_string(),
+            error: Some("paste warning".to_string()),
+            ..history_item("final words", Utc::now())
+        };
+
+        let markdown = history_as_markdown(&[item]);
+
+        assert!(markdown.contains("# VibeVoice History Export"));
+        assert!(markdown.contains("Insert status: `inserted:wtype`"));
+        assert!(markdown.contains("final words"));
+        assert!(markdown.contains("paste warning"));
+    }
+
+    fn history_item(final_transcript: &str, created_at: DateTime<Utc>) -> HistoryItem {
+        HistoryItem {
+            id: Uuid::new_v4().to_string(),
+            created_at,
+            raw_transcript: final_transcript.to_string(),
+            final_transcript: final_transcript.to_string(),
+            duration_ms: None,
+            insert_status: "copied".to_string(),
+            error: None,
+        }
     }
 }

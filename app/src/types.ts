@@ -27,6 +27,8 @@ export type Settings = {
   clipboard_fallback: boolean;
   dictionary_cleanup: boolean;
   history_enabled: boolean;
+  max_history_entries: number;
+  history_retention_days: number;
   start_on_login: boolean;
 };
 
@@ -90,7 +92,7 @@ export type UpdateStatus = {
 };
 
 export const fallbackState: AppState = {
-  app_version: "0.2.4",
+  app_version: "1.2.0",
   voice_state: "Ready",
   settings: {
     whisper_binary_path: "auto",
@@ -101,6 +103,8 @@ export const fallbackState: AppState = {
     clipboard_fallback: true,
     dictionary_cleanup: true,
     history_enabled: false,
+    max_history_entries: 100,
+    history_retention_days: 0,
     start_on_login: false,
   },
   diagnostics: {
