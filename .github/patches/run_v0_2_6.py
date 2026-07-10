@@ -1,3 +1,4 @@
+# This runner keeps the patch anchor deterministic before executing repository edits.
 from pathlib import Path
 
 script_path = Path(__file__).with_name("apply_v0_2_6.py")
