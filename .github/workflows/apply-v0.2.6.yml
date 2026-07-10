@@ -1,13 +1,6 @@
 name: Apply and validate VibeVoice 0.2.6
 
 on:
-  push:
-    branches:
-      - fix/history-atomic-v0.2.6
-    paths:
-      - .github/workflows/apply-v0.2.6.yml
-      - .github/patches/apply_v0_2_6.py
-      - .github/patches/run_v0_2_6.py
   pull_request:
     branches:
       - master
@@ -17,12 +10,13 @@ permissions:
 
 jobs:
   apply-and-validate:
-    if: github.actor != 'github-actions[bot]' && (github.event_name == 'push' || github.head_ref == 'fix/history-atomic-v0.2.6')
+    if: github.actor != 'github-actions[bot]' && github.head_ref == 'fix/history-atomic-v0.2.6'
     runs-on: ubuntu-22.04
     steps:
-      - name: Checkout branch
+      - name: Checkout implementation branch
         uses: actions/checkout@v4
         with:
+          ref: ${{ github.event.pull_request.head.sha }}
           fetch-depth: 0
 
       - name: Install Linux build dependencies
@@ -76,7 +70,6 @@ jobs:
 
       - name: Commit validated implementation
         run: |
-          rm -f .github/workflows/apply-v0.2.6.yml
           rm -rf .github/patches
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
