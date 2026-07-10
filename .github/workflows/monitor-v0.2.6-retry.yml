@@ -1,4 +1,4 @@
-name: Monitor VibeVoice 0.2.6 retry
+name: Snapshot VibeVoice 0.2.6 retry
 
 on:
   push:
@@ -12,7 +12,7 @@ permissions:
   contents: write
 
 jobs:
-  monitor-release:
+  snapshot-release:
     runs-on: ubuntu-22.04
     env:
       GH_TOKEN: ${{ github.token }}
@@ -21,20 +21,13 @@ jobs:
       - name: Checkout master
         uses: actions/checkout@v4
 
-      - name: Wait for release and capture result
+      - name: Capture current release state
         shell: bash
         run: |
           set -uo pipefail
-          output="docs/releases/v0.2.6-retry-status.txt"
+          output="docs/releases/v0.2.6-retry-snapshot.txt"
           mkdir -p "$(dirname "$output")"
-          run_json=""
-          for attempt in $(seq 1 75); do
-            run_json="$(gh api "repos/${GITHUB_REPOSITORY}/actions/workflows/release.yml/runs?event=push&branch=master&per_page=50" --jq ".workflow_runs[] | select(.head_sha == env.RELEASE_SHA) | {id, status, conclusion, html_url, created_at, updated_at}" | head -n 1)"
-            if [ -n "$run_json" ] && [ "$(jq -r '.status' <<<"$run_json")" = "completed" ]; then
-              break
-            fi
-            sleep 20
-          done
+          run_json="$(gh api "repos/${GITHUB_REPOSITORY}/actions/workflows/release.yml/runs?event=push&branch=master&per_page=50" --jq ".workflow_runs[] | select(.head_sha == env.RELEASE_SHA) | {id, status, conclusion, html_url, created_at, updated_at}" | head -n 1)"
           {
             echo "Release commit: ${RELEASE_SHA}"
             echo "Captured at: $(date -u +%Y-%m-%dT%H:%M:%SZ)"
@@ -46,18 +39,15 @@ jobs:
               echo
               echo "Jobs:"
               gh api "repos/${GITHUB_REPOSITORY}/actions/runs/${run_id}/jobs?per_page=100" \
-                --jq '.jobs[] | {id, name, status, conclusion, html_url, started_at, completed_at, failed_steps: [.steps[] | select(.conclusion == "failure") | {number, name, conclusion}]}' || true
-              echo
-              echo "Failed logs:"
-              gh run view "$run_id" --repo "$GITHUB_REPOSITORY" --log-failed || true
+                --jq '.jobs[] | {id, name, status, conclusion, html_url, started_at, completed_at, current_or_failed_steps: [.steps[] | select(.status != "completed" or .conclusion == "failure") | {number, name, status, conclusion}]}' || true
             fi
           } > "$output" 2>&1
 
-      - name: Commit release result
+      - name: Commit release snapshot
         shell: bash
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          git add docs/releases/v0.2.6-retry-status.txt
-          git commit -m "ci: capture v0.2.6 retry status"
+          git add docs/releases/v0.2.6-retry-snapshot.txt
+          git commit -m "ci: snapshot v0.2.6 retry progress"
           git push origin HEAD:master
