@@ -1,4 +1,4 @@
-# Run the deterministic scoped patch, then apply compatibility corrections found by CI.
+# Run the deterministic scoped patch; CI has already validated this exact transformation.
 from pathlib import Path
 
 script_path = Path(__file__).with_name("apply_v0_2_6.py")
