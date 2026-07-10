@@ -24,7 +24,7 @@ jobs:
 
       - name: Resolve dependency graph
         working-directory: app/src-tauri
-        run: cargo metadata --format-version 1 --no-deps > /dev/null
+        run: cargo metadata --format-version 1 > /dev/null
 
       - name: Commit lockfile
         run: |
