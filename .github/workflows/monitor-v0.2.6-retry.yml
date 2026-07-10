@@ -1,4 +1,4 @@
-name: Snapshot VibeVoice 0.2.6 retry
+name: Capture VibeVoice 0.2.6 Linux failure
 
 on:
   push:
@@ -12,42 +12,40 @@ permissions:
   contents: write
 
 jobs:
-  snapshot-release:
+  capture-linux-failure:
     runs-on: ubuntu-22.04
     env:
       GH_TOKEN: ${{ github.token }}
-      RELEASE_SHA: 37ff886cb4cdbdf12a3496b73877a6cd248b0d68
+      RUN_ID: 29088192342
+      JOB_ID: 86346864487
     steps:
       - name: Checkout master
         uses: actions/checkout@v4
 
-      - name: Capture current release state
+      - name: Capture failed Linux job output
         shell: bash
         run: |
           set -uo pipefail
-          output="docs/releases/v0.2.6-retry-snapshot.txt"
+          output="docs/releases/v0.2.6-linux-failure.txt"
           mkdir -p "$(dirname "$output")"
-          run_json="$(gh api "repos/${GITHUB_REPOSITORY}/actions/workflows/release.yml/runs?event=push&branch=master&per_page=50" --jq ".workflow_runs[] | select(.head_sha == env.RELEASE_SHA) | {id, status, conclusion, html_url, created_at, updated_at}" | head -n 1)"
           {
-            echo "Release commit: ${RELEASE_SHA}"
+            echo "Run: ${RUN_ID}"
+            echo "Job: ${JOB_ID}"
             echo "Captured at: $(date -u +%Y-%m-%dT%H:%M:%SZ)"
-            if [ -z "$run_json" ]; then
-              echo "No release workflow run was found."
-            else
-              echo "Run: ${run_json}"
-              run_id="$(jq -r '.id' <<<"$run_json")"
-              echo
-              echo "Jobs:"
-              gh api "repos/${GITHUB_REPOSITORY}/actions/runs/${run_id}/jobs?per_page=100" \
-                --jq '.jobs[] | {id, name, status, conclusion, html_url, started_at, completed_at, current_or_failed_steps: [.steps[] | select(.status != "completed" or .conclusion == "failure") | {number, name, status, conclusion}]}' || true
-            fi
+            echo
+            echo "Job metadata:"
+            gh api "repos/${GITHUB_REPOSITORY}/actions/jobs/${JOB_ID}" \
+              --jq '{name, status, conclusion, html_url, steps: [.steps[] | select(.conclusion == "failure") | {number, name, status, conclusion}]}' || true
+            echo
+            echo "Failed log output:"
+            gh run view "${RUN_ID}" --repo "${GITHUB_REPOSITORY}" --job "${JOB_ID}" --log-failed || true
           } > "$output" 2>&1
 
-      - name: Commit release snapshot
+      - name: Commit captured failure
         shell: bash
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          git add docs/releases/v0.2.6-retry-snapshot.txt
-          git commit -m "ci: snapshot v0.2.6 retry progress"
+          git add docs/releases/v0.2.6-linux-failure.txt
+          git commit -m "ci: capture Linux v0.2.6 packaging failure"
           git push origin HEAD:master
