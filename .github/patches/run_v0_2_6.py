@@ -1,7 +1,9 @@
-# Run the deterministic scoped patch; CI has already validated this exact transformation.
+# Run the deterministic scoped patch; CI validated this exact source transformation.
+import subprocess
 from pathlib import Path
 
 script_path = Path(__file__).with_name("apply_v0_2_6.py")
+repo_root = Path(__file__).resolve().parents[2]
 source = script_path.read_text(encoding="utf-8")
 old = (
     "content = replace_once(\n"
@@ -32,7 +34,7 @@ if source.count(old) != 1:
 source = source.replace(old, new, 1)
 exec(compile(source, str(script_path), "exec"), {"__file__": str(script_path), "__name__": "__main__"})
 
-app_path = Path(__file__).resolve().parents[2] / "app/src/App.tsx"
+app_path = repo_root / "app/src/App.tsx"
 app = app_path.read_text(encoding="utf-8")
 app = app.replace('import type { ResizeDirection } from "@tauri-apps/api/window";\n', "")
 resize_type = 'type ResizeDirection = "East" | "North" | "NorthEast" | "NorthWest" | "South" | "SouthEast" | "SouthWest" | "West";\n\n'
@@ -51,3 +53,11 @@ end = app.index(effect_end, start) + len(effect_end)
 effect = app[start:end].replace("currentWindow.", "pillWindow.")
 app = app[:start] + effect + app[end:]
 app_path.write_text(app, encoding="utf-8")
+
+# GitHub Actions tokens cannot modify workflow files. The connector applies this
+# already-validated release workflow change after the source commit succeeds.
+subprocess.run(
+    ["git", "checkout", "--", ".github/workflows/release.yml"],
+    cwd=repo_root,
+    check=True,
+)
