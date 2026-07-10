@@ -1,0 +1,35 @@
+name: Snapshot VibeVoice 0.2.6 release
+
+on:
+  push:
+    branches:
+      - master
+    paths:
+      - .github/workflows/snapshot-v0.2.6-release.yml
+
+permissions:
+  actions: read
+  contents: read
+  issues: write
+  pull-requests: write
+
+jobs:
+  snapshot-release:
+    runs-on: ubuntu-22.04
+    env:
+      GH_TOKEN: ${{ github.token }}
+      RELEASE_SHA: 48b2d5dfb5eaee57d3544a5010d7d91db3413462
+    steps:
+      - name: Report current release status
+        shell: bash
+        run: |
+          run_json="$(gh api "repos/${GITHUB_REPOSITORY}/actions/workflows/release.yml/runs?event=push&branch=master&per_page=30" --jq ".workflow_runs[] | select(.head_sha == env.RELEASE_SHA) | {id, status, conclusion, html_url} " | head -n 1)"
+          if [ -z "$run_json" ]; then
+            gh pr comment 23 --body "Release snapshot: no push run found yet for \`${RELEASE_SHA}\`."
+            exit 1
+          fi
+          run_id="$(jq -r '.id' <<<"$run_json")"
+          status="$(jq -r '.status' <<<"$run_json")"
+          conclusion="$(jq -r '.conclusion // "pending"' <<<"$run_json")"
+          run_url="$(jq -r '.html_url' <<<"$run_json")"
+          gh pr comment 23 --body "Release snapshot: run **${run_id}** is **${status}** (conclusion: **${conclusion}**): ${run_url}"
