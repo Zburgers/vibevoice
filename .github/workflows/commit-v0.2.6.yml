@@ -40,8 +40,8 @@ jobs:
             git add -A
             git commit -m "fix: harden history persistence and desktop controls"
             git push origin HEAD:fix/history-atomic-v0.2.6
-          } 2>&1 | tee commit-push.log
-          echo "${PIPESTATUS[0]}" > commit-push.status
+          } 2>&1 | tee /tmp/commit-push.log
+          echo "${PIPESTATUS[0]}" > /tmp/commit-push.status
           exit 0
 
       - name: Upload commit diagnostics
@@ -49,9 +49,9 @@ jobs:
         with:
           name: v0.2.6-commit-diagnostics
           path: |
-            commit-push.log
-            commit-push.status
+            /tmp/commit-push.log
+            /tmp/commit-push.status
           if-no-files-found: error
 
       - name: Enforce commit result
-        run: test "$(cat commit-push.status)" -eq 0
+        run: test "$(cat /tmp/commit-push.status)" -eq 0
