@@ -1,3 +1,4 @@
+# Temporary PR trigger for the trusted default-branch inspector.
 name: Inspect VibeVoice 0.2.6 release
 
 on:
@@ -14,21 +15,5 @@ permissions:
 jobs:
   inspect:
     runs-on: ubuntu-22.04
-    env:
-      GH_TOKEN: ${{ github.token }}
-      RELEASE_SHA: 48b2d5dfb5eaee57d3544a5010d7d91db3413462
     steps:
-      - name: Print release run and job status
-        shell: bash
-        run: |
-          set -euo pipefail
-          run_json="$(gh api "repos/${GITHUB_REPOSITORY}/actions/workflows/release.yml/runs?event=push&branch=master&per_page=50" --jq ".workflow_runs[] | select(.head_sha == env.RELEASE_SHA) | {id, status, conclusion, html_url, created_at, updated_at}" | head -n 1)"
-          if [ -z "$run_json" ]; then
-            echo "No release workflow run found for ${RELEASE_SHA}."
-            exit 1
-          fi
-          echo "RELEASE_RUN=${run_json}"
-          run_id="$(jq -r '.id' <<<"$run_json")"
-          gh api "repos/${GITHUB_REPOSITORY}/actions/runs/${run_id}/jobs?per_page=100" \
-            --jq '.jobs[] | {id, name, status, conclusion, html_url, started_at, completed_at, failed_steps: [.steps[] | select(.conclusion == "failure") | {number, name, conclusion}]}'
-          test "$(jq -r '.conclusion' <<<"$run_json")" = "success"
+      - run: echo "The authoritative release inspection runs from master."
