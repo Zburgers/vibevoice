@@ -1,7 +1,7 @@
 import { useEffect, useMemo, useRef, useState } from "react";
 import type { MouseEvent } from "react";
 import { invoke } from "@tauri-apps/api/core";
-import { LogicalSize } from "@tauri-apps/api/dpi";
+import { LogicalSize, PhysicalPosition } from "@tauri-apps/api/dpi";
 import { listen } from "@tauri-apps/api/event";
 import { getCurrentWindow, monitorFromPoint, Window as TauriWindow } from "@tauri-apps/api/window";
 import { relaunch } from "@tauri-apps/plugin-process";
@@ -50,8 +50,22 @@ function errorMessage(error: unknown) {
   return error instanceof Error ? error.message : String(error);
 }
 
+type ResizeDirection = "East" | "North" | "NorthEast" | "NorthWest" | "South" | "SouthEast" | "SouthWest" | "West";
+
 const RELEASES_URL = "https://github.com/Zburgers/vibevoice/releases";
 const LATEST_RELEASE_API = "https://api.github.com/repos/Zburgers/vibevoice/releases/latest";
+const COLLAPSED_PILL_SIZE = new LogicalSize(68, 68);
+const EXPANDED_PILL_SIZE = new LogicalSize(318, 262);
+const resizeHandles: Array<{ direction: ResizeDirection; className: string }> = [
+  { direction: "North", className: "is-north" },
+  { direction: "South", className: "is-south" },
+  { direction: "East", className: "is-east" },
+  { direction: "West", className: "is-west" },
+  { direction: "NorthEast", className: "is-north-east" },
+  { direction: "NorthWest", className: "is-north-west" },
+  { direction: "SouthEast", className: "is-south-east" },
+  { direction: "SouthWest", className: "is-south-west" },
+];
 
 const initialUpdateStatus: UpdateStatus = {
   state: "idle",
@@ -93,6 +107,7 @@ function App() {
   const [pillFlipX, setPillFlipX] = useState(false);
   const [pillFlipY, setPillFlipY] = useState(false);
   const settingsRef = useRef(fallbackState.settings);
+  const pillExpansionRef = useRef({ flipX: false, flipY: false });
 
   const inTauri = isTauriRuntime();
   const currentWindow = useMemo(() => (inTauri ? getCurrentWindow() : null), [inTauri]);
@@ -102,10 +117,10 @@ function App() {
     () => state.history.find((entry) => entry.id === selectedHistoryId) ?? (selectedHistoryId ? undefined : state.history[0]),
     [state.history, selectedHistoryId],
   );
-  const recordingSeconds = useMemo(() => {
-    if (!state.recording_started_at || state.voice_state !== "Recording") return 0;
-    return Math.max(0, Math.floor((Date.now() - new Date(state.recording_started_at).getTime()) / 1000));
-  }, [state.recording_started_at, state.voice_state]);
+  const recordingSeconds =
+    state.recording_started_at && state.voice_state === "Recording"
+      ? Math.max(0, Math.floor((Date.now() - new Date(state.recording_started_at).getTime()) / 1000))
+      : 0;
   const lastText = state.last_error || state.last_transcript || "No transcript captured yet.";
   const primaryDisabled = !canStartOrStop(state.voice_state);
   const ActionIcon = actionIcon(state.voice_state);
@@ -239,28 +254,56 @@ function App() {
   }, [state.voice_state]);
 
   useEffect(() => {
-    if (!isPillWindow) return;
-    currentWindow?.setAlwaysOnTop(true).catch(() => undefined);
-    currentWindow?.setSize(expanded ? new LogicalSize(318, 262) : new LogicalSize(68, 68)).catch(() => undefined);
+    if (!isPillWindow || !currentWindow) return;
+    const pillWindow = currentWindow;
+    let cancelled = false;
 
-    // When expanding, detect position relative to screen to decide flip direction
-    if (expanded && currentWindow) {
-      currentWindow.outerPosition().then(async (pos) => {
-        const monitor = await monitorFromPoint(pos.x, pos.y);
-        if (!monitor) return;
-        const monitorSize = monitor.size;
-        const scaleFactor = monitor.scaleFactor;
-        const screenW = monitorSize.width / scaleFactor;
-        const screenH = monitorSize.height / scaleFactor;
-        const pillLogicalX = pos.x / scaleFactor;
-        const pillLogicalY = pos.y / scaleFactor;
-        // Flip horizontal if pill is in the right 50% of the screen
-        setPillFlipX(pillLogicalX > screenW * 0.45);
-        // Flip vertical (open upward) if pill is in the bottom 50% of the screen
-        setPillFlipY(pillLogicalY > screenH * 0.5);
-      }).catch(() => undefined);
+    async function positionPill() {
+      await pillWindow.setAlwaysOnTop(state.settings.pill_always_on_top);
+      const previousPosition = await pillWindow.outerPosition();
+      const previousSize = await pillWindow.outerSize();
+      const centerX = previousPosition.x + previousSize.width / 2;
+      const centerY = previousPosition.y + previousSize.height / 2;
+      const monitor = await monitorFromPoint(centerX, centerY);
+
+      if (!monitor) {
+        await pillWindow.setSize(expanded ? EXPANDED_PILL_SIZE : COLLAPSED_PILL_SIZE);
+        return;
+      }
+
+      const workArea = monitor.workArea;
+      const workRight = workArea.position.x + workArea.size.width;
+      const workBottom = workArea.position.y + workArea.size.height;
+      const flipX = expanded
+        ? centerX > workArea.position.x + workArea.size.width / 2
+        : pillExpansionRef.current.flipX;
+      const flipY = expanded
+        ? centerY > workArea.position.y + workArea.size.height / 2
+        : pillExpansionRef.current.flipY;
+
+      if (expanded) {
+        pillExpansionRef.current = { flipX, flipY };
+        setPillFlipX(flipX);
+        setPillFlipY(flipY);
+      }
+
+      await pillWindow.setSize(expanded ? EXPANDED_PILL_SIZE : COLLAPSED_PILL_SIZE);
+      const nextSize = await pillWindow.outerSize();
+      let x = flipX ? previousPosition.x + previousSize.width - nextSize.width : previousPosition.x;
+      let y = flipY ? previousPosition.y + previousSize.height - nextSize.height : previousPosition.y;
+      x = Math.min(Math.max(x, workArea.position.x), Math.max(workArea.position.x, workRight - nextSize.width));
+      y = Math.min(Math.max(y, workArea.position.y), Math.max(workArea.position.y, workBottom - nextSize.height));
+
+      if (!cancelled) {
+        await pillWindow.setPosition(new PhysicalPosition(Math.round(x), Math.round(y)));
+      }
     }
-  }, [currentWindow, expanded, isPillWindow]);
+
+    positionPill().catch((error) => setCommandStatus(errorMessage(error)));
+    return () => {
+      cancelled = true;
+    };
+  }, [currentWindow, expanded, isPillWindow, state.settings.pill_always_on_top]);
 
   useEffect(() => {
     if (isPillWindow || activeTab !== "diagnostics" || updateStatus.state !== "idle") return;
@@ -318,6 +361,12 @@ function App() {
 
   function closeWindow() {
     currentWindow?.close().catch((error) => setCommandStatus(errorMessage(error)));
+  }
+
+  function startWindowResize(direction: ResizeDirection, event: MouseEvent<HTMLElement>) {
+    event.preventDefault();
+    event.stopPropagation();
+    currentWindow?.startResizeDragging(direction).catch((error) => setCommandStatus(errorMessage(error)));
   }
 
   async function handlePrimaryAction() {
@@ -559,6 +608,14 @@ function App() {
 
   return (
     <div className="desktop-frame">
+      {resizeHandles.map(({ direction, className }) => (
+        <div
+          key={direction}
+          className={`window-resize-handle ${className}`}
+          onMouseDown={(event) => startWindowResize(direction, event)}
+          aria-hidden="true"
+        />
+      ))}
       <header className="app-titlebar" onMouseDown={handleTitlebarDrag}>
         <div className="titlebar-brand">
           <img className="titlebar-icon" src={vibevoiceIcon} alt="" aria-hidden="true" />
