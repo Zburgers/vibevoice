@@ -2,6 +2,8 @@ name: Release
 
 on:
   push:
+    branches:
+      - master
     tags:
       - "v*"
   pull_request:
@@ -15,7 +17,7 @@ permissions:
 jobs:
   publish-tauri:
     name: Build ${{ matrix.name }}
-    if: github.event_name != 'pull_request'
+    if: github.event_name == 'workflow_dispatch' || startsWith(github.ref, 'refs/tags/') || (github.event_name == 'push' && github.ref == 'refs/heads/master' && startsWith(github.event.head_commit.message, 'release: v'))
     runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
@@ -86,11 +88,11 @@ jobs:
         with:
           projectPath: app
           args: ${{ matrix.args }}
-          includeRelease: ${{ startsWith(github.ref, 'refs/tags/') || github.event_name == 'workflow_dispatch' }}
+          includeRelease: true
           includeUpdaterJson: true
           tagName: ${{ startsWith(github.ref, 'refs/tags/') && github.ref_name || format('v{0}', steps.version.outputs.version) }}
           releaseName: ${{ startsWith(github.ref, 'refs/tags/') && format('VibeVoice {0}', github.ref_name) || format('VibeVoice v{0}', steps.version.outputs.version) }}
-          releaseBody: 'VibeVoice desktop installers for Windows, Linux, and macOS Apple Silicon.'
+          releaseBody: 'VibeVoice 0.2.6 hardens local history persistence, fixes timer and pill behavior, restores window resizing, and adds pill always-on-top customization.'
           generateReleaseNotes: true
           releaseDraft: false
           prerelease: false
