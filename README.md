@@ -7,7 +7,7 @@ Local-first desktop voice input for developers. VibeVoice records from your micr
 ## Highlights
 
 - Native Tauri desktop app for Windows, Linux, and macOS
-- Always-on-top floating pill for quick dictation from any app
+- Configurable floating pill for quick dictation from any app
 - Local `whisper.cpp` transcription with automatic engine discovery
 - Developer dictionary cleanup for terms such as TypeScript, GitHub Actions, and PostgreSQL
 - Optional local transcript history, disabled by default for privacy
@@ -63,7 +63,7 @@ Settings default to `auto` for both the Whisper binary and model path. The backe
 
 ## Privacy
 
-VibeVoice is local-first. Audio is recorded to a temporary local WAV, transcribed locally, and removed after processing. Transcript history is opt-in and stored as local JSON when enabled.
+VibeVoice is local-first. Audio is recorded to a temporary local WAV, transcribed locally, and removed after processing. Transcript history is opt-in and stored as atomically replaced local JSON with a recovery backup when enabled.
 
 ## Updates
 
@@ -71,8 +71,8 @@ Diagnostics checks GitHub Releases and keeps the in-app updater available for al
 
 ## Release Notes
 
-- Latest: [VibeVoice 0.2.5](docs/releases/v0.2.5.md)
-- Previous: [VibeVoice 0.2.3](docs/releases/v0.2.3.md)
+- Latest: [VibeVoice 0.2.6](docs/releases/v0.2.6.md)
+- Previous: [VibeVoice 0.2.5](docs/releases/v0.2.5.md)
 
 ## Development Checks
 

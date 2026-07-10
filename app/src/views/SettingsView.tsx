@@ -1,5 +1,5 @@
 import { useEffect, useRef, useState } from "react";
-import { Activity, BookOpen, Clipboard, ExternalLink, History, Info, Keyboard, Wrench, Zap } from "lucide-react";
+import { Activity, BookOpen, Clipboard, ExternalLink, History, Info, Keyboard, Pin, Wrench, Zap } from "lucide-react";
 import type { AppState, Settings } from "../types";
 import { Toggle } from "../ui";
 
@@ -234,6 +234,7 @@ export function SettingsView({
         <Toggle icon={Clipboard} label="Clipboard fallback" value={state.settings.clipboard_fallback} onClick={() => onUpdate({ clipboard_fallback: !state.settings.clipboard_fallback })} />
         <Toggle icon={BookOpen} label="Dictionary cleanup" value={state.settings.dictionary_cleanup} onClick={() => onUpdate({ dictionary_cleanup: !state.settings.dictionary_cleanup })} />
         <Toggle icon={History} label="Save local history" value={state.settings.history_enabled} onClick={() => onUpdate({ history_enabled: !state.settings.history_enabled })} />
+        <Toggle icon={Pin} label="Keep pill above other windows" value={state.settings.pill_always_on_top} onClick={() => onUpdate({ pill_always_on_top: !state.settings.pill_always_on_top })} />
         <Toggle icon={Activity} label="Start on login" value={state.settings.start_on_login} onClick={() => onUpdate({ start_on_login: !state.settings.start_on_login })} />
         <button type="button" className="toggle as-link" onClick={onOpenDiagnostics}>
           <Info size={18} />

@@ -106,6 +106,7 @@ select:focus-visible {
 }
 
 .desktop-frame {
+  position: relative;
   height: 100dvh;
   overflow: hidden;
   display: flex;
@@ -115,6 +116,45 @@ select:focus-visible {
     linear-gradient(315deg, rgb(143 216 201 / 0.04), transparent 34%),
     var(--bg);
 }
+
+
+.window-resize-handle {
+  position: absolute;
+  z-index: 30;
+  user-select: none;
+}
+
+.window-resize-handle.is-north,
+.window-resize-handle.is-south {
+  left: 10px;
+  right: 10px;
+  height: 6px;
+}
+
+.window-resize-handle.is-east,
+.window-resize-handle.is-west {
+  top: 10px;
+  bottom: 10px;
+  width: 6px;
+}
+
+.window-resize-handle.is-north { top: 0; cursor: n-resize; }
+.window-resize-handle.is-south { bottom: 0; cursor: s-resize; }
+.window-resize-handle.is-east { right: 0; cursor: e-resize; }
+.window-resize-handle.is-west { left: 0; cursor: w-resize; }
+
+.window-resize-handle.is-north-east,
+.window-resize-handle.is-north-west,
+.window-resize-handle.is-south-east,
+.window-resize-handle.is-south-west {
+  width: 12px;
+  height: 12px;
+}
+
+.window-resize-handle.is-north-east { top: 0; right: 0; cursor: ne-resize; }
+.window-resize-handle.is-north-west { top: 0; left: 0; cursor: nw-resize; }
+.window-resize-handle.is-south-east { right: 0; bottom: 0; cursor: se-resize; }
+.window-resize-handle.is-south-west { left: 0; bottom: 0; cursor: sw-resize; }
 
 .app-titlebar {
   position: relative;

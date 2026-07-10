@@ -1,7 +1,9 @@
+use atomicwrites::{AllowOverwrite, AtomicFile};
 use chrono::{DateTime, Duration as ChronoDuration, Utc};
 use serde::{Deserialize, Serialize};
 use std::{
-    fs, io,
+    fs,
+    io::{self, Write},
     path::{Path, PathBuf},
     process::{Command, Stdio},
     str::FromStr,
@@ -67,6 +69,7 @@ struct Settings {
     history_enabled: bool,
     max_history_entries: usize,
     history_retention_days: u32,
+    pill_always_on_top: bool,
     start_on_login: bool,
 }
 
@@ -83,6 +86,7 @@ impl Default for Settings {
             history_enabled: false,
             max_history_entries: DEFAULT_MAX_HISTORY_ENTRIES,
             history_retention_days: 0,
+            pill_always_on_top: true,
             start_on_login: false,
         }
     }
@@ -231,13 +235,14 @@ struct DiagnosticsCache {
 struct AppData {
     runtime: Mutex<RuntimeState>,
     diagnostics_cache: Mutex<Option<DiagnosticsCache>>,
+    history: Mutex<()>,
 }
 
 #[tauri::command]
 fn get_app_state(app: AppHandle, data: tauri::State<AppData>) -> Result<AppStateSnapshot, String> {
     let settings = load_settings(&app)?;
     let dictionary = load_dictionary(&app)?;
-    let history = load_history_for_settings(&app, &settings)?;
+    let history = load_history_for_settings(&app, &settings, &data.history)?;
     let runtime = data.runtime.lock().map_err(|error| error.to_string())?;
     let recording_started_at = runtime.recording.as_ref().map(|session| session.started_at);
     let mic_level = runtime
@@ -435,11 +440,11 @@ fn finish_recording(app: AppHandle, session: &mut RecordingSession) -> Result<Hi
         insert_status: action_status.insert_status.clone(),
         error: action_status.error.clone(),
     };
+    let data = app.state::<AppData>();
     if settings.history_enabled {
-        append_history(&app, item.clone())?;
+        append_history(&app, &data.history, item.clone())?;
     }
 
-    let data = app.state::<AppData>();
     let mut runtime = data
         .runtime
         .lock()
@@ -489,23 +494,36 @@ async fn insert_text(
 }
 
 #[tauri::command]
-fn delete_history_item(app: AppHandle, id: String) -> Result<(), String> {
-    let history: Vec<HistoryItem> = load_history(&app)?
-        .into_iter()
-        .filter(|item| item.id != id)
-        .collect();
-    write_json(history_path(&app)?, &history)
+fn delete_history_item(
+    app: AppHandle,
+    data: tauri::State<AppData>,
+    id: String,
+) -> Result<(), String> {
+    with_history_lock(&data.history, || {
+        let path = history_path(&app)?;
+        let history: Vec<HistoryItem> = read_history_with_recovery(&path)?
+            .into_iter()
+            .filter(|item| item.id != id)
+            .collect();
+        write_history(&path, &history)
+    })
 }
 
 #[tauri::command]
-fn clear_history(app: AppHandle) -> Result<(), String> {
-    write_json(history_path(&app)?, &Vec::<HistoryItem>::new())
+fn clear_history(app: AppHandle, data: tauri::State<AppData>) -> Result<(), String> {
+    with_history_lock(&data.history, || {
+        write_history(&history_path(&app)?, &Vec::<HistoryItem>::new())
+    })
 }
 
 #[tauri::command]
-fn export_history(app: AppHandle, format: String) -> Result<String, String> {
+fn export_history(
+    app: AppHandle,
+    data: tauri::State<AppData>,
+    format: String,
+) -> Result<String, String> {
     let settings = load_settings(&app)?;
-    let history = load_history_for_settings(&app, &settings)?;
+    let history = load_history_for_settings(&app, &settings, &data.history)?;
     if history.is_empty() {
         return Err("No saved history to export.".to_string());
     }
@@ -733,31 +751,51 @@ fn load_dictionary(app: &AppHandle) -> Result<Vec<DictionaryRule>, String> {
     }
 }
 
-fn load_history(app: &AppHandle) -> Result<Vec<HistoryItem>, String> {
-    let settings = load_settings(app)?;
-    load_history_for_settings(app, &settings)
+fn with_history_lock<T>(
+    history_lock: &Mutex<()>,
+    operation: impl FnOnce() -> Result<T, String>,
+) -> Result<T, String> {
+    let _guard = history_lock.lock().map_err(|error| error.to_string())?;
+    operation()
 }
 
 fn load_history_for_settings(
     app: &AppHandle,
     settings: &Settings,
+    history_lock: &Mutex<()>,
+) -> Result<Vec<HistoryItem>, String> {
+    with_history_lock(history_lock, || {
+        load_history_for_settings_unlocked(app, settings)
+    })
+}
+
+fn load_history_for_settings_unlocked(
+    app: &AppHandle,
+    settings: &Settings,
 ) -> Result<Vec<HistoryItem>, String> {
     let path = history_path(app)?;
-    let history: Vec<HistoryItem> = read_json_or_default(path.clone())?;
+    let history = read_history_with_recovery(&path)?;
     let original_len = history.len();
     let history = apply_history_retention(history, settings, Utc::now());
     if history.len() != original_len {
-        write_json(path, &history)?;
+        write_history(&path, &history)?;
     }
     Ok(history)
 }
 
-fn append_history(app: &AppHandle, item: HistoryItem) -> Result<(), String> {
+fn append_history(
+    app: &AppHandle,
+    history_lock: &Mutex<()>,
+    item: HistoryItem,
+) -> Result<(), String> {
     let settings = load_settings(app)?;
-    let mut history = load_history_for_settings(app, &settings)?;
-    history.insert(0, item);
-    let history = apply_history_retention(history, &settings, Utc::now());
-    write_json(history_path(app)?, &history)
+    with_history_lock(history_lock, || {
+        let path = history_path(app)?;
+        let mut history = read_history_with_recovery(&path)?;
+        history.insert(0, item);
+        let history = apply_history_retention(history, &settings, Utc::now());
+        write_history(&path, &history)
+    })
 }
 
 fn apply_history_retention(
@@ -864,12 +902,86 @@ where
     }
 }
 
-fn write_json<T: Serialize>(path: PathBuf, value: &T) -> Result<(), String> {
+fn history_backup_path(path: &Path) -> PathBuf {
+    path.with_extension("json.bak")
+}
+
+fn read_history_file(path: &Path) -> Result<Option<Vec<HistoryItem>>, String> {
+    match fs::read_to_string(path) {
+        Ok(content) => serde_json::from_str(&content)
+            .map(Some)
+            .map_err(|error| format!("Could not parse {}: {error}", path.display())),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(None),
+        Err(error) => Err(format!("Could not read {}: {error}", path.display())),
+    }
+}
+
+fn preserve_corrupt_history(path: &Path) -> Result<PathBuf, String> {
+    let parent = path.parent().unwrap_or_else(|| Path::new("."));
+    let preserved = parent.join(format!(
+        "history.corrupt-{}-{}.json",
+        Utc::now().format("%Y%m%d-%H%M%S%.3f"),
+        Uuid::new_v4()
+    ));
+    fs::copy(path, &preserved)
+        .map(|_| preserved)
+        .map_err(|error| format!("Could not preserve corrupt history: {error}"))
+}
+
+fn read_history_with_recovery(path: &Path) -> Result<Vec<HistoryItem>, String> {
+    match read_history_file(path) {
+        Ok(Some(history)) => return Ok(history),
+        Ok(None) => {}
+        Err(error) => match preserve_corrupt_history(path) {
+            Ok(preserved) => eprintln!(
+                "{error}. Preserved the unreadable file at {}.",
+                preserved.display()
+            ),
+            Err(preserve_error) => eprintln!("{error}. {preserve_error}"),
+        },
+    }
+
+    let backup = history_backup_path(path);
+    match read_history_file(&backup) {
+        Ok(Some(history)) => {
+            write_history(path, &history)?;
+            return Ok(history);
+        }
+        Ok(None) => {}
+        Err(error) => eprintln!("{error}. Starting with an empty history."),
+    }
+
+    let history = Vec::new();
+    write_history(path, &history)?;
+    Ok(history)
+}
+
+fn atomic_write(path: &Path, content: &[u8]) -> Result<(), String> {
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent).map_err(|error| error.to_string())?;
     }
-    let content = serde_json::to_string_pretty(value).map_err(|error| error.to_string())?;
-    fs::write(path, content).map_err(|error| error.to_string())
+    AtomicFile::new(path, AllowOverwrite)
+        .write(|file| {
+            file.write_all(content)?;
+            file.sync_all()
+        })
+        .map_err(|error| error.to_string())
+}
+
+fn serialized_json<T: Serialize>(value: &T) -> Result<Vec<u8>, String> {
+    let mut content = serde_json::to_vec_pretty(value).map_err(|error| error.to_string())?;
+    content.push(b'\n');
+    Ok(content)
+}
+
+fn write_json<T: Serialize>(path: PathBuf, value: &T) -> Result<(), String> {
+    atomic_write(&path, &serialized_json(value)?)
+}
+
+fn write_history(path: &Path, history: &[HistoryItem]) -> Result<(), String> {
+    let content = serialized_json(&history)?;
+    atomic_write(path, &content)?;
+    atomic_write(&history_backup_path(path), &content)
 }
 
 #[derive(Debug, Clone)]
@@ -1899,6 +2011,7 @@ pub fn run() {
         .manage(AppData {
             runtime: Mutex::new(RuntimeState::default()),
             diagnostics_cache: Mutex::new(None),
+            history: Mutex::new(()),
         })
         .invoke_handler(tauri::generate_handler![
             get_app_state,
@@ -2075,6 +2188,65 @@ mod tests {
         assert!(markdown.contains("Insert status: `inserted:wtype`"));
         assert!(markdown.contains("final words"));
         assert!(markdown.contains("paste warning"));
+    }
+
+    #[test]
+    fn corrupted_history_recovers_from_valid_backup() {
+        let root = std::env::temp_dir().join(format!("vibevoice-history-test-{}", Uuid::new_v4()));
+        fs::create_dir_all(&root).unwrap();
+        let path = root.join("history.json");
+        let expected = vec![history_item("kept transcript", Utc::now())];
+        write_history(&path, &expected).unwrap();
+        fs::write(&path, b"{truncated").unwrap();
+
+        let recovered = read_history_with_recovery(&path).unwrap();
+
+        assert_eq!(recovered.len(), 1);
+        assert_eq!(recovered[0].final_transcript, "kept transcript");
+        assert!(read_history_file(&path).unwrap().is_some());
+        assert!(fs::read_dir(&root).unwrap().any(|entry| {
+            entry
+                .unwrap()
+                .file_name()
+                .to_string_lossy()
+                .starts_with("history.corrupt-")
+        }));
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn serialized_history_mutations_do_not_lose_entries() {
+        let root = std::env::temp_dir().join(format!("vibevoice-history-test-{}", Uuid::new_v4()));
+        fs::create_dir_all(&root).unwrap();
+        let path = Arc::new(root.join("history.json"));
+        let history_lock = Arc::new(Mutex::new(()));
+        write_history(path.as_ref(), &[]).unwrap();
+
+        let workers: Vec<_> = (0..16)
+            .map(|index| {
+                let path = Arc::clone(&path);
+                let history_lock = Arc::clone(&history_lock);
+                thread::spawn(move || {
+                    with_history_lock(&history_lock, || {
+                        let mut history = read_history_with_recovery(path.as_ref())?;
+                        history.push(history_item(&format!("entry {index}"), Utc::now()));
+                        write_history(path.as_ref(), &history)
+                    })
+                    .unwrap();
+                })
+            })
+            .collect();
+
+        for worker in workers {
+            worker.join().unwrap();
+        }
+
+        let history = read_history_with_recovery(path.as_ref()).unwrap();
+        assert_eq!(history.len(), 16);
+        assert!(read_history_file(&history_backup_path(path.as_ref()))
+            .unwrap()
+            .is_some());
+        let _ = fs::remove_dir_all(root);
     }
 
     fn history_item(final_transcript: &str, created_at: DateTime<Utc>) -> HistoryItem {
