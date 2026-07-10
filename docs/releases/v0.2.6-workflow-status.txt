@@ -1,8 +1,0 @@
-Release commit: 48b2d5dfb5eaee57d3544a5010d7d91db3413462
-Captured at: 2026-07-10T11:00:21Z
-Run: {"conclusion":"failure","created_at":"2026-07-10T08:22:29Z","html_url":"https://github.com/Zburgers/vibevoice/actions/runs/29079569499","id":29079569499,"status":"completed","updated_at":"2026-07-10T08:22:29Z"}
-
-Jobs:
-
-Failed logs:
-failed to get run log: log not found
