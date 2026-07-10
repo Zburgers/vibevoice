@@ -8,13 +8,16 @@ on:
       - .github/workflows/apply-v0.2.6.yml
       - .github/patches/apply_v0_2_6.py
       - .github/patches/run_v0_2_6.py
+  pull_request:
+    branches:
+      - master
 
 permissions:
   contents: write
 
 jobs:
   apply-and-validate:
-    if: github.actor != 'github-actions[bot]'
+    if: github.actor != 'github-actions[bot]' && (github.event_name == 'push' || github.head_ref == 'fix/history-atomic-v0.2.6')
     runs-on: ubuntu-22.04
     steps:
       - name: Checkout branch
