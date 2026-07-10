@@ -77,12 +77,34 @@ jobs:
         run: npm ci
         working-directory: app
 
-      - name: Read app version
+      - name: Read and validate app version
         id: version
         shell: bash
         working-directory: app
         run: |
-          echo "version=$(node -p 'require(\"./package.json\").version')" >> "$GITHUB_OUTPUT"
+          set -euo pipefail
+          version="$(node -p "require('./package.json').version")"
+          if [[ ! "$version" =~ ^[0-9]+\.[0-9]+\.[0-9]+([-.][0-9A-Za-z.-]+)?$ ]]; then
+            echo "Invalid application version: '$version'" >&2
+            exit 1
+          fi
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+          echo "Publishing VibeVoice v$version"
+
+      - name: Remove malformed v release from failed 0.2.6 attempt
+        if: >-
+          matrix.name == 'Linux' &&
+          !startsWith(github.ref, 'refs/tags/') &&
+          steps.version.outputs.version == '0.2.6'
+        shell: bash
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          release_id="$(gh api "repos/${GITHUB_REPOSITORY}/releases/tags/v" --jq '.id' 2>/dev/null || true)"
+          if [ -n "$release_id" ]; then
+            gh api --method DELETE "repos/${GITHUB_REPOSITORY}/releases/${release_id}"
+          fi
+          gh api --method DELETE "repos/${GITHUB_REPOSITORY}/git/refs/tags/v" >/dev/null 2>&1 || true
 
       - name: Build and publish release assets
         uses: tauri-apps/tauri-action@v0
