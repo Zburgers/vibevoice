@@ -1,4 +1,4 @@
-# This runner keeps the patch anchor deterministic before executing repository edits.
+# Default-branch validator is installed; execute the deterministic scoped patch.
 from pathlib import Path
 
 script_path = Path(__file__).with_name("apply_v0_2_6.py")
