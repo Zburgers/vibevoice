@@ -1,4 +1,4 @@
-# Default-branch validator is installed; execute the deterministic scoped patch.
+# Run the deterministic scoped patch and capture exact compiler diagnostics.
 from pathlib import Path
 
 script_path = Path(__file__).with_name("apply_v0_2_6.py")
