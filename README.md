@@ -63,7 +63,7 @@ Settings default to `auto` for both the Whisper binary and model path. The backe
 
 ## Privacy
 
-VibeVoice is local-first. Audio is recorded to a temporary local WAV, transcribed locally, and removed after processing. Transcript history is opt-in and stored as local JSON when enabled.
+VibeVoice is local-first. Audio is recorded to a temporary local WAV, transcribed locally, and removed after processing. Transcript history is opt-in and stored as atomically replaced local JSON with a recovery backup when enabled.
 
 ## Updates
 
