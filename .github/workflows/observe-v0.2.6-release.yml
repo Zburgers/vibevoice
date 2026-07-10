@@ -1,0 +1,41 @@
+name: Observe VibeVoice 0.2.6 release
+
+on:
+  push:
+    branches:
+      - master
+    paths:
+      - .github/workflows/observe-v0.2.6-release.yml
+
+permissions:
+  actions: read
+  contents: read
+  issues: write
+  pull-requests: write
+
+jobs:
+  observe-release:
+    runs-on: ubuntu-22.04
+    env:
+      GH_TOKEN: ${{ github.token }}
+      RELEASE_SHA: 48b2d5dfb5eaee57d3544a5010d7d91db3413462
+    steps:
+      - name: Observe release workflow and report to PR
+        shell: bash
+        run: |
+          for attempt in $(seq 1 90); do
+            run_json="$(gh api "repos/${GITHUB_REPOSITORY}/actions/workflows/release.yml/runs?event=push&branch=master&per_page=30" --jq ".workflow_runs[] | select(.head_sha == env.RELEASE_SHA) | {id, status, conclusion, html_url} " | head -n 1)"
+            if [ -n "$run_json" ]; then
+              status="$(jq -r '.status' <<<"$run_json")"
+              conclusion="$(jq -r '.conclusion // "pending"' <<<"$run_json")"
+              run_url="$(jq -r '.html_url' <<<"$run_json")"
+              if [ "$status" = "completed" ]; then
+                gh pr comment 23 --body "Release workflow completed with **${conclusion}**: ${run_url}"
+                test "$conclusion" = "success"
+                exit
+              fi
+            fi
+            sleep 20
+          done
+          gh pr comment 23 --body "Release workflow observation timed out before completion for commit \`${RELEASE_SHA}\`."
+          exit 1
