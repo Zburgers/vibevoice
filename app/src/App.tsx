@@ -56,6 +56,8 @@ const RELEASES_URL = "https://github.com/Zburgers/vibevoice/releases";
 const LATEST_RELEASE_API = "https://api.github.com/repos/Zburgers/vibevoice/releases/latest";
 const COLLAPSED_PILL_SIZE = new LogicalSize(68, 68);
 const EXPANDED_PILL_SIZE = new LogicalSize(318, 262);
+const COLLAPSED_PILL_DIMENSIONS = { width: 68, height: 68 };
+const EXPANDED_PILL_DIMENSIONS = { width: 318, height: 262 };
 const resizeHandles: Array<{ direction: ResizeDirection; className: string }> = [
   { direction: "North", className: "is-north" },
   { direction: "South", className: "is-south" },
@@ -108,6 +110,7 @@ function App() {
   const [pillFlipY, setPillFlipY] = useState(false);
   const settingsRef = useRef(fallbackState.settings);
   const pillExpansionRef = useRef({ flipX: false, flipY: false });
+  const pillLayoutRequestRef = useRef(0);
 
   const inTauri = isTauriRuntime();
   const currentWindow = useMemo(() => (inTauri ? getCurrentWindow() : null), [inTauri]);
@@ -256,15 +259,20 @@ function App() {
   useEffect(() => {
     if (!isPillWindow || !currentWindow) return;
     const pillWindow = currentWindow;
-    let cancelled = false;
+    const requestId = pillLayoutRequestRef.current + 1;
+    pillLayoutRequestRef.current = requestId;
+    const isCurrentRequest = () => pillLayoutRequestRef.current === requestId;
 
     async function positionPill() {
       await pillWindow.setAlwaysOnTop(state.settings.pill_always_on_top);
       const previousPosition = await pillWindow.outerPosition();
       const previousSize = await pillWindow.outerSize();
+      if (!isCurrentRequest()) return;
+
       const centerX = previousPosition.x + previousSize.width / 2;
       const centerY = previousPosition.y + previousSize.height / 2;
       const monitor = await monitorFromPoint(centerX, centerY);
+      if (!isCurrentRequest()) return;
 
       if (!monitor) {
         await pillWindow.setSize(expanded ? EXPANDED_PILL_SIZE : COLLAPSED_PILL_SIZE);
@@ -287,21 +295,37 @@ function App() {
         setPillFlipY(flipY);
       }
 
-      await pillWindow.setSize(expanded ? EXPANDED_PILL_SIZE : COLLAPSED_PILL_SIZE);
-      const nextSize = await pillWindow.outerSize();
-      let x = flipX ? previousPosition.x + previousSize.width - nextSize.width : previousPosition.x;
-      let y = flipY ? previousPosition.y + previousSize.height - nextSize.height : previousPosition.y;
-      x = Math.min(Math.max(x, workArea.position.x), Math.max(workArea.position.x, workRight - nextSize.width));
-      y = Math.min(Math.max(y, workArea.position.y), Math.max(workArea.position.y, workBottom - nextSize.height));
+      const logicalSize = expanded ? EXPANDED_PILL_DIMENSIONS : COLLAPSED_PILL_DIMENSIONS;
+      const targetWidth = Math.round(logicalSize.width * monitor.scaleFactor);
+      const targetHeight = Math.round(logicalSize.height * monitor.scaleFactor);
+      const anchorX = flipX ? previousPosition.x + previousSize.width : previousPosition.x;
+      const anchorY = flipY ? previousPosition.y + previousSize.height : previousPosition.y;
+      const clampPosition = (anchor: number, targetSize: number, start: number, end: number, flip: boolean) =>
+        Math.min(Math.max(flip ? anchor - targetSize : anchor, start), Math.max(start, end - targetSize));
+      let x = clampPosition(anchorX, targetWidth, workArea.position.x, workRight, flipX);
+      let y = clampPosition(anchorY, targetHeight, workArea.position.y, workBottom, flipY);
 
-      if (!cancelled) {
-        await pillWindow.setPosition(new PhysicalPosition(Math.round(x), Math.round(y)));
-      }
+      // Move first so enlarging the transparent host window cannot expose an
+      // off-screen panel while the native resize is being applied.
+      await pillWindow.setPosition(new PhysicalPosition(Math.round(x), Math.round(y)));
+      if (!isCurrentRequest()) return;
+      await pillWindow.setSize(expanded ? EXPANDED_PILL_SIZE : COLLAPSED_PILL_SIZE);
+      if (!isCurrentRequest()) return;
+
+      // Native window managers can round logical sizes differently. Reconcile
+      // once with the actual outer rectangle after the resize completes.
+      const actualSize = await pillWindow.outerSize();
+      x = Math.min(Math.max(x, workArea.position.x), Math.max(workArea.position.x, workRight - actualSize.width));
+      y = Math.min(Math.max(y, workArea.position.y), Math.max(workArea.position.y, workBottom - actualSize.height));
+      if (!isCurrentRequest()) return;
+      await pillWindow.setPosition(new PhysicalPosition(Math.round(x), Math.round(y)));
     }
 
     positionPill().catch((error) => setCommandStatus(errorMessage(error)));
     return () => {
-      cancelled = true;
+      if (pillLayoutRequestRef.current === requestId) {
+        pillLayoutRequestRef.current += 1;
+      }
     };
   }, [currentWindow, expanded, isPillWindow, state.settings.pill_always_on_top]);
 
