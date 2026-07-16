@@ -1,5 +1,7 @@
 # VibeVoice MVP Build Directive
 
+> **Historical baseline:** This document records the original MVP contract. For current behavior, see [Architecture](ARCHITECTURE.md). For the approved post-MVP direction, see [VibeVoice 0.3: Context Packs](product/v0.3-context-packs.md). Implementation details in this document, including the early SQLite recommendation, are not automatically current requirements.
+
 ## Project Name
 
 **VibeVoice**
