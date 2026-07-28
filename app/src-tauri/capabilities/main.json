@@ -1,12 +1,12 @@
 {
   "$schema": "../gen/schemas/desktop-schema.json",
-  "identifier": "default",
-  "description": "Default VibeVoice app capabilities",
-  "windows": ["main", "pill"],
+  "identifier": "main",
+  "description": "Audited permissions for the primary VibeVoice window",
+  "windows": ["main"],
   "permissions": [
-    "core:default",
-    "core:window:allow-set-always-on-top",
+    "core:window:allow-set-cursor-icon",
     "core:window:allow-set-size",
+    "core:window:allow-start-resize-dragging",
     "core:window:allow-start-dragging",
     "core:window:allow-show",
     "core:window:allow-set-focus",
