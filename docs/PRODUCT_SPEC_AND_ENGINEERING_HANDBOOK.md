@@ -1,6 +1,6 @@
 # VibeVoice — Product Specification and Engineering Handbook
 
-**Document version:** 1.0.0  
+**Document version:** 0.2.6  
 **Last updated:** 2026-08-04  
 **Generated or audited by:** Repository Product Specification & Engineering Handbook Agent  
 **Repository:** `Zburgers/vibevoice`  
@@ -1829,7 +1829,7 @@ Review expectations for future changes:
 
 ## 31. Change history
 
-### 2026-08-04 — Version 1.0.0
+### 2026-08-04 — Version 0.2.6
 
 **Verified branch SHA:** `e833b36cbaabe8e6ba40b9a754320995b00e0473`  
 **Verified deployed SHA:** `UNVERIFIED`  
