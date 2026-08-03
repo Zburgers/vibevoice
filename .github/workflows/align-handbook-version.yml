@@ -1,0 +1,51 @@
+name: Align handbook version
+
+on:
+  push:
+    branches:
+      - docs/product-handbook-sync-2026-08-04
+    paths:
+      - .github/workflows/align-handbook-version.yml
+
+permissions:
+  contents: write
+
+jobs:
+  align-version:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout handbook branch
+        uses: actions/checkout@v4
+        with:
+          ref: docs/product-handbook-sync-2026-08-04
+
+      - name: Align handbook version with product
+        run: |
+          python - <<'PY'
+          from pathlib import Path
+
+          path = Path("docs/PRODUCT_SPEC_AND_ENGINEERING_HANDBOOK.md")
+          text = path.read_text(encoding="utf-8")
+          text = text.replace(
+              "**Document version:** 1.0.0  ",
+              "**Document version:** 0.2.6  ",
+              1,
+          )
+          text = text.replace(
+              "### 2026-08-04 — Version 1.0.0",
+              "### 2026-08-04 — Version 0.2.6",
+              1,
+          )
+          if "1.0.0" in text:
+              raise SystemExit("Unexpected remaining 1.0.0 reference")
+          path.write_text(text, encoding="utf-8")
+          PY
+          rm .github/workflows/align-handbook-version.yml
+
+      - name: Commit aligned version
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add docs/PRODUCT_SPEC_AND_ENGINEERING_HANDBOOK.md .github/workflows/align-handbook-version.yml
+          git commit -m "docs: align handbook version with VibeVoice 0.2.6"
+          git push origin HEAD:docs/product-handbook-sync-2026-08-04
