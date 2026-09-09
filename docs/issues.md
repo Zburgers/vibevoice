@@ -40,6 +40,12 @@ This file records the repository-side status for the 0.2.7 stabilization work. T
 - Change: expansion moves the native window into the active monitor work area before resizing, clamps both axes using physical dimensions, reconciles the actual outer size, and rejects stale layout requests.
 - Source: `origin/agent/fix-pill-edge-positioning-0.2.7` (`4479a69`).
 
+### Transactional insertion timeout cleanup
+
+- Status: completed on `release/vibevoice-0.2.7`; release-gate verification pending.
+- Change: paste helpers time out after two seconds and are killed/reaped, concurrent clipboard operations serialize, failed insertion restores the prior text when possible, and structured insertion results flow through history and the retry UI. Legacy history entries receive safe defaults.
+- Evidence: Rust unit suite `18 passed`; frontend suite `5 passed`; frontend production build passed.
+
 ## Safe follow-up candidates
 
 - #11 model selection and engine health UI: bounded settings/diagnostics work, independent of the stabilization changes.
