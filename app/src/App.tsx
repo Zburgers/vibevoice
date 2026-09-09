@@ -17,7 +17,7 @@ import {
   navItems,
   stateToPhase,
 } from "./types";
-import type { AppState, LibraryMode, MeterPayload, Settings, TabKey, UpdateStatus } from "./types";
+import type { AppState, InsertionReport, LibraryMode, MeterPayload, Settings, TabKey, UpdateStatus } from "./types";
 import { StatusChip } from "./ui";
 import { ControlView } from "./views/ControlView";
 import { DiagnosticsView } from "./views/DiagnosticsView";
@@ -546,8 +546,14 @@ function App() {
       return;
     }
     try {
-      await invoke("insert_text", { text: value });
-      setCommandStatus("Inserted");
+      const report = await invoke<InsertionReport>("insert_text", { text: value });
+      setCommandStatus(
+        report.outcome === "inserted"
+          ? "Paste helper completed; previous clipboard restored."
+          : report.outcome === "copied_only"
+            ? "Transcript copied."
+            : report.error || "Paste did not complete. Use Copy or retry insertion.",
+      );
       await refresh();
     } catch (error) {
       setCommandStatus(errorMessage(error));
