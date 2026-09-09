@@ -1,12 +1,12 @@
 # VibeVoice issue tracker
 
-This file records the repository-side status for the 0.2.7 stabilization work. GitHub issues remain open until the pull request is merged and the release gates are complete.
+This file records the repository-side status for the 0.2.7 stabilization work. The items below are integrated on `release/vibevoice-0.2.7`; release-gate verification remains pending.
 
 ## 0.2.7 stabilization
 
 ### #15 — UI text and icons disappear after transcription
 
-- Status: addressed on `fix/vibevoice-0.2.7-stabilization`; release-gate verification pending.
+- Status: addressed on `release/vibevoice-0.2.7`; release-gate verification pending.
 - Change: stale state refreshes can no longer overwrite a newer render, event-listener cleanup handles async registration races, and jsdom coverage exercises repeated pill transitions.
 - Evidence: `npm --prefix app run build`, `npm --prefix app test`, and packaged Tauri debug build pass. A real 10-cycle Linux recording smoke test still requires a display, microphone, whisper binary, and model.
 
@@ -33,6 +33,12 @@ This file records the repository-side status for the 0.2.7 stabilization work. G
 - Status: addressed on this branch; no separate open GitHub issue existed. Related historical resize issue #19 is already closed.
 - Change: native Tauri cursor icons are set on enter/leave for all eight edge/corner handles, with matching CSS fallback and existing resize dragging retained.
 - Evidence: mapping is covered by the implementation; manual eight-handle verification remains a release-gate task in a graphical desktop session.
+
+### Pill HUD edge and corner overflow
+
+- Status: addressed on `release/vibevoice-0.2.7`; release-gate verification pending.
+- Change: expansion moves the native window into the active monitor work area before resizing, clamps both axes using physical dimensions, reconciles the actual outer size, and rejects stale layout requests.
+- Source: `origin/agent/fix-pill-edge-positioning-0.2.7` (`4479a69`).
 
 ## Safe follow-up candidates
 
