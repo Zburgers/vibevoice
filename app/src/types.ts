@@ -50,6 +50,16 @@ export type Diagnostics = {
   last_error: string | null;
 };
 
+export type InsertionOutcome = "inserted" | "copied_only" | "failed" | "cancelled";
+
+export type InsertionReport = {
+  outcome: InsertionOutcome;
+  copy_status: string;
+  paste_status: string;
+  clipboard_restored: boolean;
+  error: string | null;
+};
+
 export type HistoryItem = {
   id: string;
   created_at: string;
@@ -58,6 +68,7 @@ export type HistoryItem = {
   duration_ms: number | null;
   insert_status: string;
   error: string | null;
+  insertion_report: InsertionReport;
 };
 
 export type DictionaryRule = {

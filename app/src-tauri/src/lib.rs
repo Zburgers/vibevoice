@@ -43,6 +43,8 @@ const RELEASES_URL: &str = "https://github.com/Zburgers/vibevoice/releases";
 const DEFAULT_MAX_HISTORY_ENTRIES: usize = 100;
 const MAX_HISTORY_ENTRIES: usize = 1000;
 const DIAGNOSTICS_CACHE_TTL: Duration = Duration::from_secs(5);
+const PASTE_HELPER_TIMEOUT: Duration = Duration::from_secs(2);
+const PASTE_HELPER_POLL_INTERVAL: Duration = Duration::from_millis(20);
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "PascalCase")]
@@ -127,6 +129,43 @@ struct DiagnosticsReport {
     report: String,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+enum InsertionOutcome {
+    Inserted,
+    CopiedOnly,
+    Failed,
+    Cancelled,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+enum ClipboardSnapshot {
+    Text(String),
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(default)]
+struct InsertionReport {
+    outcome: InsertionOutcome,
+    copy_status: String,
+    paste_status: String,
+    clipboard_restored: bool,
+    error: Option<String>,
+}
+
+impl Default for InsertionReport {
+    fn default() -> Self {
+        Self {
+            outcome: InsertionOutcome::Cancelled,
+            copy_status: "not_attempted".to_string(),
+            paste_status: "not_attempted".to_string(),
+            clipboard_restored: false,
+            error: None,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct HistoryItem {
     id: String,
@@ -136,6 +175,8 @@ struct HistoryItem {
     duration_ms: Option<u128>,
     insert_status: String,
     error: Option<String>,
+    #[serde(default)]
+    insertion_report: InsertionReport,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -253,6 +294,7 @@ struct AppData {
     runtime: Mutex<RuntimeState>,
     diagnostics_cache: Mutex<Option<DiagnosticsCache>>,
     history: Mutex<()>,
+    insertion: Mutex<()>,
 }
 
 fn authorize_window(window: &WebviewWindow, allowed: &[&str]) -> Result<(), String> {
@@ -339,7 +381,9 @@ fn copy_diagnostics_report(
     let diagnostics =
         cached_diagnostics(&app, &data, &settings, runtime.last_error.clone(), false)?;
     let report = format_diagnostics_report(&diagnostics, &updater_status);
-    copy_to_clipboard(&app, &report).map(|_| ())
+    with_insertion_lock(&data.insertion, || {
+        copy_to_clipboard(&app, &report).map(|_| ())
+    })
 }
 
 #[tauri::command]
@@ -510,42 +554,43 @@ fn finish_recording(app: AppHandle, session: &mut RecordingSession) -> Result<Hi
         return Err(message);
     }
 
-    let copy_result = settings
-        .clipboard_fallback
-        .then(|| copy_to_clipboard(&app, &final_transcript));
-    let paste_result = if settings.auto_paste && !matches!(copy_result, Some(Err(_))) {
-        Some(paste_from_clipboard())
-    } else {
-        None
-    };
-    let action_status = resolve_insert_status(
+    let data = app.state::<AppData>();
+    let insertion_report = coordinate_insertion(
+        &app,
+        &data,
+        &final_transcript,
         settings.clipboard_fallback,
         settings.auto_paste,
-        copy_result,
-        paste_result,
     );
-
-    let item = HistoryItem {
+    let action_status = insert_action_status(&insertion_report);
+    let mut item = HistoryItem {
         id: Uuid::new_v4().to_string(),
         created_at: Utc::now(),
         raw_transcript,
         final_transcript: final_transcript.clone(),
         duration_ms: Some(session.started.elapsed().as_millis()),
-        insert_status: action_status.insert_status.clone(),
-        error: action_status.error.clone(),
+        insert_status: action_status.insert_status,
+        error: action_status.error,
+        insertion_report: insertion_report.clone(),
     };
-    let data = app.state::<AppData>();
+    let mut history_error = None;
     if settings.history_enabled {
-        append_history(&app, &data.history, item.clone())?;
+        if let Err(error) = append_history(&app, &data.history, item.clone()) {
+            history_error = Some(format!("History save failed: {error}"));
+            item.error = Some(match item.error.take() {
+                Some(insertion_error) => format!("{insertion_error} History save failed: {error}"),
+                None => history_error.clone().unwrap_or_default(),
+            });
+        }
     }
 
     let mut runtime = data
         .runtime
         .lock()
         .map_err(|lock_error| lock_error.to_string())?;
-    runtime.voice_state = voice_state_for_insert_status(&action_status);
+    runtime.voice_state = voice_state_for_insertion_report(&insertion_report);
     runtime.last_transcript = Some(final_transcript);
-    runtime.last_error = action_status.error;
+    runtime.last_error = insertion_report.error.clone().or(history_error);
     runtime.mic_level = 0.0;
     drop(runtime);
     emit_state_changed(&app);
@@ -560,12 +605,14 @@ async fn copy_text(
     window: WebviewWindow,
 ) -> Result<(), String> {
     authorize_window(&window, &["main"])?;
-    copy_to_clipboard(&app, &text)?;
-    let mut runtime = data.runtime.lock().map_err(|error| error.to_string())?;
-    runtime.voice_state = VoiceState::Copied;
-    runtime.last_transcript = Some(text);
-    runtime.last_error = None;
-    drop(runtime);
+    with_insertion_lock(&data.insertion, || {
+        copy_to_clipboard(&app, &text)?;
+        let mut runtime = data.runtime.lock().map_err(|error| error.to_string())?;
+        runtime.voice_state = VoiceState::Copied;
+        runtime.last_transcript = Some(text.clone());
+        runtime.last_error = None;
+        Ok(())
+    })?;
     emit_state_changed(&app);
     Ok(())
 }
@@ -576,19 +623,18 @@ async fn insert_text(
     text: String,
     data: tauri::State<'_, AppData>,
     window: WebviewWindow,
-) -> Result<(), String> {
+) -> Result<InsertionReport, String> {
     authorize_window(&window, &["main", "pill"])?;
-    copy_to_clipboard(&app, &text)?;
-    async_runtime::spawn_blocking(paste_from_clipboard)
-        .await
-        .map_err(|error| format!("Paste task failed: {error}"))??;
-    let mut runtime = data.runtime.lock().map_err(|error| error.to_string())?;
-    runtime.voice_state = VoiceState::Inserted;
-    runtime.last_transcript = Some(text);
-    runtime.last_error = None;
-    drop(runtime);
-    emit_state_changed(&app);
-    Ok(())
+    let app_handle = app.clone();
+    let insertion_text = text.clone();
+    let report = async_runtime::spawn_blocking(move || {
+        let data = app_handle.state::<AppData>();
+        coordinate_insertion(&app_handle, &data, &insertion_text, true, true)
+    })
+    .await
+    .map_err(|error| format!("Insertion task failed: {error}"))?;
+    update_runtime_after_insertion(&app, &data, &text, &report)?;
+    Ok(report)
 }
 
 #[tauri::command]
@@ -1827,25 +1873,168 @@ fn copy_to_clipboard(app: &AppHandle, text: &str) -> Result<String, String> {
     Ok("tauri-clipboard".to_string())
 }
 
+fn snapshot_text_clipboard(app: &AppHandle) -> Result<ClipboardSnapshot, String> {
+    app.clipboard()
+        .read_text()
+        .map(ClipboardSnapshot::Text)
+        .map_err(|error| format!("Clipboard read failed: {error}"))
+}
+
+fn restore_text_clipboard(app: &AppHandle, snapshot: &ClipboardSnapshot) -> Result<(), String> {
+    match snapshot {
+        ClipboardSnapshot::Text(text) => copy_to_clipboard(app, text).map(|_| ()),
+    }
+}
+
+fn coordinate_insertion(
+    app: &AppHandle,
+    data: &AppData,
+    text: &str,
+    should_copy: bool,
+    should_paste: bool,
+) -> InsertionReport {
+    with_insertion_lock(&data.insertion, || {
+        Ok(execute_insertion_transaction(
+            text,
+            should_copy,
+            should_paste,
+            || snapshot_text_clipboard(app),
+            || copy_to_clipboard(app, text),
+            paste_from_clipboard,
+            |snapshot| restore_text_clipboard(app, snapshot),
+        ))
+    })
+    .unwrap_or_else(|error| InsertionReport {
+        outcome: InsertionOutcome::Failed,
+        error: Some(format!("Insertion lock failed: {error}")),
+        ..InsertionReport::default()
+    })
+}
+
+fn with_insertion_lock<T>(
+    insertion_lock: &Mutex<()>,
+    operation: impl FnOnce() -> Result<T, String>,
+) -> Result<T, String> {
+    let _guard = insertion_lock.lock().map_err(|error| error.to_string())?;
+    operation()
+}
+
+fn execute_insertion_transaction<Read, Copy, Paste, Restore>(
+    _text: &str,
+    should_copy: bool,
+    should_paste: bool,
+    read_clipboard: Read,
+    copy: Copy,
+    paste: Paste,
+    restore: Restore,
+) -> InsertionReport
+where
+    Read: FnOnce() -> Result<ClipboardSnapshot, String>,
+    Copy: FnOnce() -> Result<String, String>,
+    Paste: FnOnce() -> Result<String, String>,
+    Restore: FnOnce(&ClipboardSnapshot) -> Result<(), String>,
+{
+    if !should_copy {
+        return InsertionReport {
+            outcome: if should_paste {
+                InsertionOutcome::Failed
+            } else {
+                InsertionOutcome::Cancelled
+            },
+            paste_status: if should_paste {
+                "not_attempted".to_string()
+            } else {
+                "not_requested".to_string()
+            },
+            error: should_paste.then(|| "Paste requires a clipboard copy.".to_string()),
+            ..InsertionReport::default()
+        };
+    }
+
+    if !should_paste {
+        let mut report = insertion_report_from_results(false, copy(), None, Ok(()));
+        report.clipboard_restored = false;
+        return report;
+    }
+
+    let snapshot = match read_clipboard() {
+        Ok(snapshot) => snapshot,
+        Err(error) => {
+            return InsertionReport {
+                outcome: InsertionOutcome::Failed,
+                copy_status: "not_attempted".to_string(),
+                paste_status: "not_attempted".to_string(),
+                error: Some(error),
+                ..InsertionReport::default()
+            }
+        }
+    };
+
+    let copy_result = copy();
+    let paste_result = if should_paste && copy_result.is_ok() {
+        Some(paste())
+    } else {
+        None
+    };
+    let restore_result = restore(&snapshot);
+    insertion_report_from_results(should_paste, copy_result, paste_result, restore_result)
+}
+
+fn insertion_report_from_results(
+    should_paste: bool,
+    copy_result: Result<String, String>,
+    paste_result: Option<Result<String, String>>,
+    restore_result: Result<(), String>,
+) -> InsertionReport {
+    let mut report = InsertionReport {
+        copy_status: match &copy_result {
+            Ok(tool) => format!("copied:{tool}"),
+            Err(_) => "failed".to_string(),
+        },
+        paste_status: if !should_paste {
+            "not_requested".to_string()
+        } else {
+            match &paste_result {
+                Some(Ok(tool)) => format!("pasted:{tool}"),
+                Some(Err(_)) => "failed".to_string(),
+                None => "not_attempted".to_string(),
+            }
+        },
+        clipboard_restored: restore_result.is_ok(),
+        ..InsertionReport::default()
+    };
+
+    let mut errors = Vec::new();
+    if let Err(error) = copy_result {
+        errors.push(error);
+    }
+    if let Some(Err(error)) = paste_result {
+        errors.push(error);
+    }
+    if let Err(error) = restore_result {
+        errors.push(format!("Clipboard restore failed: {error}"));
+    }
+    report.error = (!errors.is_empty()).then(|| errors.join(" "));
+    report.outcome = if report.error.is_some() {
+        InsertionOutcome::Failed
+    } else if should_paste {
+        InsertionOutcome::Inserted
+    } else {
+        InsertionOutcome::CopiedOnly
+    };
+    report
+}
+
 fn paste_from_clipboard() -> Result<String, String> {
     if cfg!(target_os = "windows") {
-        let status = Command::new("powershell")
-            .args([
-                "-STA",
-                "-NoProfile",
-                "-Command",
-                "Add-Type -AssemblyName System.Windows.Forms; [System.Windows.Forms.SendKeys]::SendWait('^v')",
-            ])
-            .status()
-            .map_err(|error| format!("Windows paste failed: {error}"))?;
-        return if status.success() {
-            Ok("powershell:SendKeys".to_string())
-        } else {
-            Err(
-                "Windows paste command exited with an error. Transcript remains in clipboard."
-                    .to_string(),
-            )
-        };
+        let mut command = Command::new("powershell");
+        command.args([
+            "-STA",
+            "-NoProfile",
+            "-Command",
+            "Add-Type -AssemblyName System.Windows.Forms; [System.Windows.Forms.SendKeys]::SendWait('^v')",
+        ]);
+        return run_paste_helper(&mut command, "powershell:SendKeys", PASTE_HELPER_TIMEOUT);
     }
     let candidates: [(&str, &[&str]); 3] = [
         ("wtype", &["-M", "ctrl", "v", "-m", "ctrl"]),
@@ -1854,20 +2043,61 @@ fn paste_from_clipboard() -> Result<String, String> {
     ];
     for (cmd, args) in candidates {
         if command_exists(cmd) {
-            let status = Command::new(cmd)
-                .args(args)
-                .status()
-                .map_err(|error| format!("{cmd} failed: {error}"))?;
-            return if status.success() {
-                Ok(cmd.to_string())
-            } else {
-                Err(format!(
-                    "{cmd} exited with an error. Transcript remains in clipboard."
-                ))
-            };
+            let mut command = Command::new(cmd);
+            command.args(args);
+            return run_paste_helper(&mut command, cmd, PASTE_HELPER_TIMEOUT);
         }
     }
     Err("Paste tool missing. Install wtype on Wayland or xdotool on X11.".to_string())
+}
+
+fn run_paste_helper(
+    command: &mut Command,
+    tool: &str,
+    timeout: Duration,
+) -> Result<String, String> {
+    let mut child = command
+        .spawn()
+        .map_err(|error| format!("{tool} failed to start: {error}"))?;
+    let deadline = Instant::now() + timeout;
+    loop {
+        let status = match child.try_wait() {
+            Ok(status) => status,
+            Err(error) => {
+                let cleanup_error = cleanup_paste_helper(&mut child);
+                let message = match cleanup_error {
+                    Some(cleanup_error) => format!("{tool} failed: {error}; {cleanup_error}"),
+                    None => format!("{tool} failed: {error}"),
+                };
+                return Err(message);
+            }
+        };
+        match status {
+            Some(status) if status.success() => return Ok(tool.to_string()),
+            Some(_) => return Err(format!("{tool} exited with an error.")),
+            None if Instant::now() >= deadline => {
+                let timeout_message = format!("{tool} timed out after {} ms.", timeout.as_millis());
+                return match cleanup_paste_helper(&mut child) {
+                    Some(cleanup_error) => Err(format!("{timeout_message} {cleanup_error}")),
+                    None => Err(timeout_message),
+                };
+            }
+            None => thread::sleep(PASTE_HELPER_POLL_INTERVAL),
+        }
+    }
+}
+
+fn cleanup_paste_helper(child: &mut std::process::Child) -> Option<String> {
+    let kill_error = child.kill().err();
+    let wait_error = child.wait().err();
+    let mut errors = Vec::new();
+    if let Some(error) = kill_error {
+        errors.push(format!("could not be stopped: {error}"));
+    }
+    if let Some(error) = wait_error {
+        errors.push(format!("could not be reaped: {error}"));
+    }
+    (!errors.is_empty()).then(|| errors.join("; "))
 }
 
 fn command_exists(name: &str) -> bool {
@@ -1909,63 +2139,49 @@ fn paste_tool_name() -> Option<String> {
     first_command(&["wtype", "xdotool", "ydotool"])
 }
 
-fn resolve_insert_status(
-    clipboard_fallback: bool,
-    auto_paste: bool,
-    copy_result: Option<Result<String, String>>,
-    paste_result: Option<Result<String, String>>,
-) -> InsertActionStatus {
-    let mut insert_status = "none".to_string();
-    let mut error = None;
-
-    if clipboard_fallback {
-        match copy_result {
-            Some(Ok(tool)) => insert_status = format!("copied:{tool}"),
-            Some(Err(copy_error)) => {
-                error = Some(copy_error);
-                insert_status = "clipboard_failed".to_string();
-            }
-            None => {
-                error = Some("Clipboard copy was not attempted.".to_string());
-                insert_status = "clipboard_failed".to_string();
-            }
-        }
-    }
-
-    if auto_paste {
-        match paste_result {
-            Some(Ok(tool)) => insert_status = format!("inserted:{tool}"),
-            Some(Err(paste_error)) => {
-                if error.is_none() {
-                    error = Some(paste_error);
-                }
-                if insert_status.starts_with("copied") {
-                    insert_status = "copied".to_string();
-                }
-            }
-            None if !clipboard_fallback => {
-                error = Some("Paste requires clipboard copy to run first.".to_string());
-            }
-            None => {}
-        }
-    }
-
+fn insert_action_status(report: &InsertionReport) -> InsertActionStatus {
+    let insert_status = match report.outcome {
+        InsertionOutcome::Inserted => report
+            .paste_status
+            .strip_prefix("pasted:")
+            .map(|tool| format!("inserted:{tool}"))
+            .unwrap_or_else(|| "inserted".to_string()),
+        InsertionOutcome::CopiedOnly => report
+            .copy_status
+            .strip_prefix("copied:")
+            .map(|tool| format!("copied:{tool}"))
+            .unwrap_or_else(|| "copied".to_string()),
+        InsertionOutcome::Failed => "failed".to_string(),
+        InsertionOutcome::Cancelled => "cancelled".to_string(),
+    };
     InsertActionStatus {
         insert_status,
-        error,
+        error: report.error.clone(),
     }
 }
 
-fn voice_state_for_insert_status(status: &InsertActionStatus) -> VoiceState {
-    if status.insert_status.starts_with("inserted") {
-        VoiceState::Inserted
-    } else if status.insert_status.starts_with("copied") {
-        VoiceState::Copied
-    } else if status.error.is_some() {
-        VoiceState::Error
-    } else {
-        VoiceState::Ready
+fn voice_state_for_insertion_report(report: &InsertionReport) -> VoiceState {
+    match report.outcome {
+        InsertionOutcome::Inserted => VoiceState::Inserted,
+        InsertionOutcome::CopiedOnly => VoiceState::Copied,
+        InsertionOutcome::Failed => VoiceState::Error,
+        InsertionOutcome::Cancelled => VoiceState::Ready,
     }
+}
+
+fn update_runtime_after_insertion(
+    app: &AppHandle,
+    data: &AppData,
+    text: &str,
+    report: &InsertionReport,
+) -> Result<(), String> {
+    let mut runtime = data.runtime.lock().map_err(|error| error.to_string())?;
+    runtime.voice_state = voice_state_for_insertion_report(report);
+    runtime.last_transcript = Some(text.to_string());
+    runtime.last_error = report.error.clone();
+    drop(runtime);
+    emit_state_changed(app);
+    Ok(())
 }
 
 fn default_dictionary() -> Vec<DictionaryRule> {
@@ -2187,6 +2403,7 @@ pub fn run() {
             runtime: Mutex::new(RuntimeState::default()),
             diagnostics_cache: Mutex::new(None),
             history: Mutex::new(()),
+            insertion: Mutex::new(()),
         })
         .invoke_handler(tauri::generate_handler![
             get_app_state,
@@ -2281,29 +2498,149 @@ mod tests {
     }
 
     #[test]
-    fn action_status_keeps_copy_success_when_paste_fails() {
-        let status = resolve_insert_status(
+    fn insertion_report_marks_paste_failure_as_failed() {
+        let report = insertion_report_from_results(
             true,
-            true,
-            Some(Ok("tauri-clipboard".to_string())),
+            Ok("tauri-clipboard".to_string()),
             Some(Err("Paste failed".to_string())),
+            Ok(()),
         );
 
-        assert_eq!(status.insert_status, "copied");
-        assert_eq!(status.error.as_deref(), Some("Paste failed"));
+        assert_eq!(report.outcome, InsertionOutcome::Failed);
+        assert_eq!(report.copy_status, "copied:tauri-clipboard");
+        assert_eq!(report.paste_status, "failed");
+        assert_eq!(report.error.as_deref(), Some("Paste failed"));
     }
 
     #[test]
-    fn action_status_reports_clipboard_failure_without_paste_attempt() {
-        let status = resolve_insert_status(
-            true,
+    fn insertion_report_marks_clipboard_failure_as_failed() {
+        let report = insertion_report_from_results(
             false,
-            Some(Err("Clipboard unavailable".to_string())),
+            Err("Clipboard unavailable".to_string()),
             None,
+            Ok(()),
         );
 
-        assert_eq!(status.insert_status, "clipboard_failed");
-        assert_eq!(status.error.as_deref(), Some("Clipboard unavailable"));
+        assert_eq!(report.outcome, InsertionOutcome::Failed);
+        assert_eq!(report.copy_status, "failed");
+        assert_eq!(report.error.as_deref(), Some("Clipboard unavailable"));
+    }
+
+    #[test]
+    fn insertion_report_records_clipboard_snapshot_failure() {
+        let report = execute_insertion_transaction(
+            "transcript",
+            true,
+            true,
+            || Err("Clipboard read failed: unavailable".to_string()),
+            || Ok("tauri-clipboard".to_string()),
+            || Ok("xdotool".to_string()),
+            |_| Ok(()),
+        );
+
+        assert_eq!(report.outcome, InsertionOutcome::Failed);
+        assert_eq!(report.copy_status, "not_attempted");
+        assert_eq!(report.paste_status, "not_attempted");
+        assert!(!report.clipboard_restored);
+        assert!(report.error.unwrap().contains("Clipboard read failed"));
+    }
+
+    #[test]
+    fn clipboard_only_output_does_not_snapshot_or_restore_clipboard() {
+        let report = execute_insertion_transaction(
+            "transcript",
+            true,
+            false,
+            || panic!("clipboard should not be read for an intentional copy"),
+            || Ok("tauri-clipboard".to_string()),
+            || panic!("paste should not run for clipboard-only output"),
+            |_| panic!("clipboard should not be restored for an intentional copy"),
+        );
+
+        assert_eq!(report.outcome, InsertionOutcome::CopiedOnly);
+        assert_eq!(report.copy_status, "copied:tauri-clipboard");
+        assert_eq!(report.paste_status, "not_requested");
+        assert!(!report.clipboard_restored);
+    }
+
+    #[test]
+    fn failed_paste_restores_the_previous_clipboard_text() {
+        let restored = Arc::new(Mutex::new(None));
+        let restored_text = Arc::clone(&restored);
+        let report = execute_insertion_transaction(
+            "transcript",
+            true,
+            true,
+            || Ok(ClipboardSnapshot::Text("previous clipboard".to_string())),
+            || Ok("tauri-clipboard".to_string()),
+            || Err("Paste target lost focus".to_string()),
+            move |snapshot| {
+                let ClipboardSnapshot::Text(text) = snapshot;
+                *restored_text.lock().unwrap() = Some(text.clone());
+                Ok(())
+            },
+        );
+
+        assert_eq!(report.outcome, InsertionOutcome::Failed);
+        assert!(report.clipboard_restored);
+        assert_eq!(
+            restored.lock().unwrap().as_deref(),
+            Some("previous clipboard")
+        );
+        assert!(report.error.unwrap().contains("lost focus"));
+    }
+
+    #[test]
+    fn insertion_lock_serializes_concurrent_transactions() {
+        let insertion_lock = Arc::new(Mutex::new(()));
+        let active = Arc::new(AtomicU32::new(0));
+        let peak = Arc::new(AtomicU32::new(0));
+        let workers: Vec<_> = (0..8)
+            .map(|_| {
+                let insertion_lock = Arc::clone(&insertion_lock);
+                let active = Arc::clone(&active);
+                let peak = Arc::clone(&peak);
+                thread::spawn(move || {
+                    with_insertion_lock(&insertion_lock, || {
+                        let current = active.fetch_add(1, Ordering::SeqCst) + 1;
+                        peak.fetch_max(current, Ordering::SeqCst);
+                        thread::sleep(Duration::from_millis(10));
+                        active.fetch_sub(1, Ordering::SeqCst);
+                        Ok(())
+                    })
+                    .unwrap();
+                })
+            })
+            .collect();
+
+        for worker in workers {
+            worker.join().unwrap();
+        }
+        assert_eq!(peak.load(Ordering::SeqCst), 1);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn paste_helper_timeout_kills_and_reaps_child() {
+        let mut command = Command::new("sleep");
+        command.arg("1");
+        let started = Instant::now();
+
+        let error = run_paste_helper(&mut command, "sleep", Duration::from_millis(30)).unwrap_err();
+
+        assert!(error.contains("timed out"));
+        assert!(started.elapsed() < Duration::from_millis(500));
+    }
+
+    #[test]
+    fn history_items_without_insertion_reports_use_defaults() {
+        let item = history_item("legacy transcript", Utc::now());
+        let mut legacy = serde_json::to_value(item).unwrap();
+        legacy.as_object_mut().unwrap().remove("insertion_report");
+
+        let restored: HistoryItem = serde_json::from_value(legacy).unwrap();
+
+        assert_eq!(restored.insertion_report, InsertionReport::default());
     }
 
     #[test]
@@ -2466,6 +2803,7 @@ mod tests {
             duration_ms: None,
             insert_status: "copied".to_string(),
             error: None,
+            insertion_report: InsertionReport::default(),
         }
     }
 }
