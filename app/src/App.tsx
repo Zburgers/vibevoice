@@ -3,7 +3,7 @@ import type { MouseEvent } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { LogicalSize, PhysicalPosition } from "@tauri-apps/api/dpi";
 import { listen } from "@tauri-apps/api/event";
-import { getCurrentWindow, monitorFromPoint, Window as TauriWindow } from "@tauri-apps/api/window";
+import { CursorIcon, getCurrentWindow, monitorFromPoint, Window as TauriWindow } from "@tauri-apps/api/window";
 import { relaunch } from "@tauri-apps/plugin-process";
 import { check } from "@tauri-apps/plugin-updater";
 import type { Update } from "@tauri-apps/plugin-updater";
@@ -24,6 +24,7 @@ import { DiagnosticsView } from "./views/DiagnosticsView";
 import { LibraryView } from "./views/LibraryView";
 import { SettingsView } from "./views/SettingsView";
 import "./App.css";
+import { compareReleaseVersions, normalizeReleaseVersion } from "./version";
 
 declare global {
   interface Window {
@@ -75,21 +76,6 @@ const initialUpdateStatus: UpdateStatus = {
   canInstall: false,
 };
 
-function normalizeVersion(version: string) {
-  return version.trim().replace(/^v/i, "");
-}
-
-function compareVersions(left: string, right: string) {
-  const leftParts = normalizeVersion(left).split(/[.-]/).map((part) => Number.parseInt(part, 10) || 0);
-  const rightParts = normalizeVersion(right).split(/[.-]/).map((part) => Number.parseInt(part, 10) || 0);
-  const count = Math.max(leftParts.length, rightParts.length, 3);
-  for (let index = 0; index < count; index += 1) {
-    const diff = (leftParts[index] ?? 0) - (rightParts[index] ?? 0);
-    if (diff !== 0) return diff;
-  }
-  return 0;
-}
-
 function App() {
   const [activeTab, setActiveTab] = useState<TabKey>(initialTab);
   const [libraryMode, setLibraryMode] = useState<LibraryMode>(initialLibraryMode);
@@ -108,6 +94,7 @@ function App() {
   const [pillFlipY, setPillFlipY] = useState(false);
   const settingsRef = useRef(fallbackState.settings);
   const pillExpansionRef = useRef({ flipX: false, flipY: false });
+  const refreshSequence = useRef(0);
 
   const inTauri = isTauriRuntime();
   const currentWindow = useMemo(() => (inTauri ? getCurrentWindow() : null), [inTauri]);
@@ -137,7 +124,9 @@ function App() {
     if (forceDiagnostics) {
       await invoke("refresh_diagnostics");
     }
+    const sequence = ++refreshSequence.current;
     const next = await invoke<AppState>("get_app_state");
+    if (sequence !== refreshSequence.current) return;
     setState(next);
     setSelectedHistoryId((currentId) => {
       if (currentId && next.history.some((entry) => entry.id === currentId)) return currentId;
@@ -159,12 +148,14 @@ function App() {
       try {
         const update = await check({ timeout: 12000 });
         if (update) {
+          const updateVersion = normalizeReleaseVersion(update.version);
+          if (!updateVersion) throw new Error("Updater returned a malformed release version.");
           setPendingUpdate(update);
           setUpdateStatus({
             state: "available",
-            latestVersion: update.version,
-            releaseUrl: `${RELEASES_URL}/tag/v${normalizeVersion(update.version)}`,
-            message: `Version ${update.version} is ready to install.`,
+            latestVersion: updateVersion,
+            releaseUrl: `${RELEASES_URL}/tag/v${updateVersion}`,
+            message: `Version ${updateVersion} is ready to install.`,
             canInstall: true,
           });
           return;
@@ -186,12 +177,16 @@ function App() {
         html_url?: string;
         name?: string;
       };
-      const latestVersion = normalizeVersion(release.tag_name || release.name || "");
+      const rawLatestVersion = release.tag_name || release.name || "";
+      const latestVersion = normalizeReleaseVersion(rawLatestVersion);
       if (!latestVersion) {
-        throw new Error("Latest release did not include a version.");
+        throw new Error("GitHub returned a malformed release version.");
       }
       const releaseUrl = release.html_url || `${RELEASES_URL}/tag/v${latestVersion}`;
-      const versionDelta = compareVersions(latestVersion, state.app_version);
+      const versionDelta = compareReleaseVersions(latestVersion, state.app_version);
+      if (versionDelta === null) {
+        throw new Error("Installed version is malformed; update comparison is unavailable.");
+      }
       const isNewer = versionDelta > 0;
       setUpdateStatus({
         state: isNewer ? "available" : "current",
@@ -223,12 +218,14 @@ function App() {
 
     let cleanupState: (() => void) | undefined;
     let cleanupMeter: (() => void) | undefined;
+    let disposed = false;
 
     listen("vibevoice-state-changed", () => {
       refresh().catch(() => undefined);
     })
       .then((cleanup) => {
-        cleanupState = cleanup;
+        if (disposed) cleanup();
+        else cleanupState = cleanup;
       })
       .catch((error) => setCommandStatus(errorMessage(error)));
 
@@ -236,11 +233,13 @@ function App() {
       setState((current) => ({ ...current, mic_level: event.payload.mic_level }));
     })
       .then((cleanup) => {
-        cleanupMeter = cleanup;
+        if (disposed) cleanup();
+        else cleanupMeter = cleanup;
       })
       .catch((error) => setCommandStatus(errorMessage(error)));
 
     return () => {
+      disposed = true;
       cleanupState?.();
       cleanupMeter?.();
     };
@@ -369,6 +368,14 @@ function App() {
     currentWindow?.startResizeDragging(direction).catch((error) => setCommandStatus(errorMessage(error)));
   }
 
+  function setResizeCursor(direction: ResizeDirection | null) {
+    if (!currentWindow) return;
+    const cursor: CursorIcon | null = direction
+      ? ({ North: "nResize", South: "sResize", East: "eResize", West: "wResize", NorthEast: "neResize", NorthWest: "nwResize", SouthEast: "seResize", SouthWest: "swResize" } as const)[direction]
+      : null;
+    currentWindow.setCursorIcon(cursor ?? "default").catch(() => undefined);
+  }
+
   async function handlePrimaryAction() {
     if (!canStartOrStop(state.voice_state)) return;
     if (!inTauri) {
@@ -443,6 +450,21 @@ function App() {
       await invoke("copy_text", { text: value });
       setCommandStatus("Copied");
       await refresh();
+    } catch (error) {
+      setCommandStatus(errorMessage(error));
+    }
+  }
+
+  async function handleCopyDiagnosticsReport() {
+    if (!inTauri) {
+      setCommandStatus("Desktop runtime unavailable in browser preview");
+      return;
+    }
+    try {
+      await invoke("copy_diagnostics_report", {
+        updaterStatus: updateStatus.state,
+      });
+      setCommandStatus("Diagnostics report copied");
     } catch (error) {
       setCommandStatus(errorMessage(error));
     }
@@ -613,6 +635,8 @@ function App() {
           key={direction}
           className={`window-resize-handle ${className}`}
           onMouseDown={(event) => startWindowResize(direction, event)}
+          onMouseEnter={() => setResizeCursor(direction)}
+          onMouseLeave={() => setResizeCursor(null)}
           aria-hidden="true"
         />
       ))}
@@ -739,6 +763,7 @@ function App() {
               onOpenReleasePage={handleOpenReleasePage}
               onSetup={handleSetup}
               onCopyCommand={() => handleCopyText(state.diagnostics.setup_command)}
+              onCopyReport={handleCopyDiagnosticsReport}
             />
           )}
         </main>

@@ -18,7 +18,7 @@ use tauri::{
     async_runtime,
     menu::{Menu, MenuItem},
     tray::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent},
-    AppHandle, Emitter, Manager,
+    AppHandle, Emitter, Manager, WebviewWindow,
 };
 use tauri_plugin_clipboard_manager::ClipboardExt;
 use tauri_plugin_global_shortcut::{Code, GlobalShortcutExt, Modifiers, Shortcut, ShortcutState};
@@ -108,6 +108,23 @@ struct Diagnostics {
     setup_script_path: Option<String>,
     setup_command: Option<String>,
     last_error: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+enum UpdaterStatus {
+    Idle,
+    Checking,
+    Available,
+    Current,
+    Installing,
+    Installed,
+    Error,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct DiagnosticsReport {
+    report: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -238,8 +255,24 @@ struct AppData {
     history: Mutex<()>,
 }
 
+fn authorize_window(window: &WebviewWindow, allowed: &[&str]) -> Result<(), String> {
+    if allowed.iter().any(|label| *label == window.label()) {
+        Ok(())
+    } else {
+        Err(format!(
+            "Command is not authorized for window '{}'.",
+            window.label()
+        ))
+    }
+}
+
 #[tauri::command]
-fn get_app_state(app: AppHandle, data: tauri::State<AppData>) -> Result<AppStateSnapshot, String> {
+fn get_app_state(
+    app: AppHandle,
+    data: tauri::State<AppData>,
+    window: WebviewWindow,
+) -> Result<AppStateSnapshot, String> {
+    authorize_window(&window, &["main", "pill"])?;
     let settings = load_settings(&app)?;
     let dictionary = load_dictionary(&app)?;
     let history = load_history_for_settings(&app, &settings, &data.history)?;
@@ -265,10 +298,48 @@ fn get_app_state(app: AppHandle, data: tauri::State<AppData>) -> Result<AppState
 }
 
 #[tauri::command]
-fn refresh_diagnostics(app: AppHandle, data: tauri::State<AppData>) -> Result<Diagnostics, String> {
+fn refresh_diagnostics(
+    app: AppHandle,
+    data: tauri::State<AppData>,
+    window: WebviewWindow,
+) -> Result<Diagnostics, String> {
+    authorize_window(&window, &["main"])?;
     let settings = load_settings(&app)?;
     let runtime = data.runtime.lock().map_err(|error| error.to_string())?;
     cached_diagnostics(&app, &data, &settings, runtime.last_error.clone(), true)
+}
+
+#[tauri::command]
+fn get_diagnostics_report(
+    app: AppHandle,
+    data: tauri::State<AppData>,
+    updater_status: UpdaterStatus,
+    window: WebviewWindow,
+) -> Result<DiagnosticsReport, String> {
+    authorize_window(&window, &["main"])?;
+    let settings = load_settings(&app)?;
+    let runtime = data.runtime.lock().map_err(|error| error.to_string())?;
+    let diagnostics =
+        cached_diagnostics(&app, &data, &settings, runtime.last_error.clone(), false)?;
+    Ok(DiagnosticsReport {
+        report: format_diagnostics_report(&diagnostics, &updater_status),
+    })
+}
+
+#[tauri::command]
+fn copy_diagnostics_report(
+    app: AppHandle,
+    data: tauri::State<AppData>,
+    updater_status: UpdaterStatus,
+    window: WebviewWindow,
+) -> Result<(), String> {
+    authorize_window(&window, &["main"])?;
+    let settings = load_settings(&app)?;
+    let runtime = data.runtime.lock().map_err(|error| error.to_string())?;
+    let diagnostics =
+        cached_diagnostics(&app, &data, &settings, runtime.last_error.clone(), false)?;
+    let report = format_diagnostics_report(&diagnostics, &updater_status);
+    copy_to_clipboard(&app, &report).map(|_| ())
 }
 
 #[tauri::command]
@@ -276,7 +347,9 @@ fn save_settings(
     app: AppHandle,
     data: tauri::State<AppData>,
     settings: Settings,
+    window: WebviewWindow,
 ) -> Result<(), String> {
+    authorize_window(&window, &["main"])?;
     let previous = load_settings(&app).unwrap_or_default();
     if settings.hotkey != previous.hotkey {
         register_global_hotkey(&app, &settings.hotkey)?;
@@ -290,7 +363,16 @@ fn save_settings(
 }
 
 #[tauri::command]
-async fn start_recording(app: AppHandle, data: tauri::State<'_, AppData>) -> Result<(), String> {
+async fn start_recording(
+    app: AppHandle,
+    data: tauri::State<'_, AppData>,
+    window: WebviewWindow,
+) -> Result<(), String> {
+    authorize_window(&window, &["main", "pill"])?;
+    start_recording_impl(app, data)
+}
+
+fn start_recording_impl(app: AppHandle, data: tauri::State<'_, AppData>) -> Result<(), String> {
     begin_recording(app, data)
 }
 
@@ -362,7 +444,19 @@ fn prepare_recording_session(app: &AppHandle) -> Result<RecordingSession, String
 }
 
 #[tauri::command]
-async fn stop_recording(app: AppHandle, data: tauri::State<'_, AppData>) -> Result<(), String> {
+async fn stop_recording(
+    app: AppHandle,
+    data: tauri::State<'_, AppData>,
+    window: WebviewWindow,
+) -> Result<(), String> {
+    authorize_window(&window, &["main", "pill"])?;
+    stop_recording_impl(app, data).await
+}
+
+async fn stop_recording_impl(
+    app: AppHandle,
+    data: tauri::State<'_, AppData>,
+) -> Result<(), String> {
     let mut session = {
         let mut runtime = data.runtime.lock().map_err(|error| error.to_string())?;
         match runtime.recording.take() {
@@ -463,7 +557,9 @@ async fn copy_text(
     app: AppHandle,
     text: String,
     data: tauri::State<'_, AppData>,
+    window: WebviewWindow,
 ) -> Result<(), String> {
+    authorize_window(&window, &["main"])?;
     copy_to_clipboard(&app, &text)?;
     let mut runtime = data.runtime.lock().map_err(|error| error.to_string())?;
     runtime.voice_state = VoiceState::Copied;
@@ -479,7 +575,9 @@ async fn insert_text(
     app: AppHandle,
     text: String,
     data: tauri::State<'_, AppData>,
+    window: WebviewWindow,
 ) -> Result<(), String> {
+    authorize_window(&window, &["main", "pill"])?;
     copy_to_clipboard(&app, &text)?;
     async_runtime::spawn_blocking(paste_from_clipboard)
         .await
@@ -498,7 +596,9 @@ fn delete_history_item(
     app: AppHandle,
     data: tauri::State<AppData>,
     id: String,
+    window: WebviewWindow,
 ) -> Result<(), String> {
+    authorize_window(&window, &["main"])?;
     with_history_lock(&data.history, || {
         let path = history_path(&app)?;
         let history: Vec<HistoryItem> = read_history_with_recovery(&path)?
@@ -510,7 +610,12 @@ fn delete_history_item(
 }
 
 #[tauri::command]
-fn clear_history(app: AppHandle, data: tauri::State<AppData>) -> Result<(), String> {
+fn clear_history(
+    app: AppHandle,
+    data: tauri::State<AppData>,
+    window: WebviewWindow,
+) -> Result<(), String> {
+    authorize_window(&window, &["main"])?;
     with_history_lock(&data.history, || {
         write_history(&history_path(&app)?, &Vec::<HistoryItem>::new())
     })
@@ -521,7 +626,9 @@ fn export_history(
     app: AppHandle,
     data: tauri::State<AppData>,
     format: String,
+    window: WebviewWindow,
 ) -> Result<String, String> {
+    authorize_window(&window, &["main"])?;
     let settings = load_settings(&app)?;
     let history = load_history_for_settings(&app, &settings, &data.history)?;
     if history.is_empty() {
@@ -551,7 +658,13 @@ fn export_history(
 }
 
 #[tauri::command]
-fn add_dictionary_rule(app: AppHandle, spoken: String, replacement: String) -> Result<(), String> {
+fn add_dictionary_rule(
+    app: AppHandle,
+    spoken: String,
+    replacement: String,
+    window: WebviewWindow,
+) -> Result<(), String> {
+    authorize_window(&window, &["main"])?;
     let mut dictionary = load_dictionary(&app)?;
     dictionary.push(DictionaryRule {
         id: Uuid::new_v4().to_string(),
@@ -563,7 +676,8 @@ fn add_dictionary_rule(app: AppHandle, spoken: String, replacement: String) -> R
 }
 
 #[tauri::command]
-fn delete_dictionary_rule(app: AppHandle, id: String) -> Result<(), String> {
+fn delete_dictionary_rule(app: AppHandle, id: String, window: WebviewWindow) -> Result<(), String> {
+    authorize_window(&window, &["main"])?;
     let dictionary: Vec<DictionaryRule> = load_dictionary(&app)?
         .into_iter()
         .filter(|rule| rule.id != id)
@@ -572,7 +686,13 @@ fn delete_dictionary_rule(app: AppHandle, id: String) -> Result<(), String> {
 }
 
 #[tauri::command]
-fn set_dictionary_rule_enabled(app: AppHandle, id: String, enabled: bool) -> Result<(), String> {
+fn set_dictionary_rule_enabled(
+    app: AppHandle,
+    id: String,
+    enabled: bool,
+    window: WebviewWindow,
+) -> Result<(), String> {
+    authorize_window(&window, &["main"])?;
     let mut dictionary = load_dictionary(&app)?;
     for rule in &mut dictionary {
         if rule.id == id {
@@ -641,7 +761,12 @@ fn trusted_setup_script_path(app: &AppHandle, script: &Path) -> Result<PathBuf, 
 }
 
 #[tauri::command]
-fn run_setup_script(app: AppHandle, data: tauri::State<AppData>) -> Result<String, String> {
+fn run_setup_script(
+    app: AppHandle,
+    data: tauri::State<AppData>,
+    window: WebviewWindow,
+) -> Result<String, String> {
+    authorize_window(&window, &["main"])?;
     if !setup_execution_enabled() {
         return Err(
             "In-app setup is only available in development builds. Use the release installer or documented setup commands."
@@ -678,7 +803,8 @@ fn run_setup_script(app: AppHandle, data: tauri::State<AppData>) -> Result<Strin
 }
 
 #[tauri::command]
-async fn show_main_window(app: AppHandle) -> Result<(), String> {
+async fn show_main_window(app: AppHandle, window: WebviewWindow) -> Result<(), String> {
+    authorize_window(&window, &["pill", "main"])?;
     if let Some(window) = app.get_webview_window("main") {
         // Window exists – just show and focus it
         let _ = window.show();
@@ -703,7 +829,8 @@ async fn show_main_window(app: AppHandle) -> Result<(), String> {
 }
 
 #[tauri::command]
-fn open_release_page(url: Option<String>) -> Result<(), String> {
+fn open_release_page(url: Option<String>, window: WebviewWindow) -> Result<(), String> {
+    authorize_window(&window, &["main"])?;
     let url = url.unwrap_or_else(|| RELEASES_URL.to_string());
     if !is_allowed_release_url(&url) {
         return Err("Release URL is outside the VibeVoice repository.".to_string());
@@ -1041,6 +1168,54 @@ fn diagnostics(app: &AppHandle, settings: &Settings, last_error: Option<String>)
         setup_command: setup_script.as_ref().map(|script| setup_command(script)),
         last_error,
     }
+}
+
+fn redact_home(value: &str) -> String {
+    let mut redacted = value.to_string();
+    if let Some(home) = dirs::home_dir() {
+        let home = home.display().to_string();
+        redacted = redacted.replace(&home, "<home>");
+    }
+    redacted
+        .replace("$HOME", "<home>")
+        .replace("%USERPROFILE%", "<home>")
+        .replace("%LOCALAPPDATA%", "<local-app-data>")
+}
+
+fn error_category(error: Option<&str>) -> &'static str {
+    let Some(error) = error else { return "none" };
+    let error = error.to_ascii_lowercase();
+    if error.contains("whisper") || error.contains("transcri") {
+        "engine"
+    } else if error.contains("clipboard") || error.contains("paste") {
+        "clipboard"
+    } else if error.contains("record") || error.contains("microphone") || error.contains("audio") {
+        "recorder"
+    } else {
+        "runtime"
+    }
+}
+
+fn format_diagnostics_report(diagnostics: &Diagnostics, updater_status: &UpdaterStatus) -> String {
+    let path = |value: &Option<String>| {
+        value
+            .as_deref()
+            .map(redact_home)
+            .unwrap_or_else(|| "unavailable".to_string())
+    };
+    format!(
+        "VibeVoice diagnostics\nversion: {}\nplatform: {}\nengine: whisper={}, model={}\nrecorder: {}\ninput_device: {}\nclipboard: {}\npaste_adapter: {}\nupdater: {:?}\nlast_error_category: {}\n",
+        env!("CARGO_PKG_VERSION"),
+        diagnostics.platform,
+        diagnostics.whisper_found,
+        diagnostics.model_found,
+        diagnostics.recorder.as_deref().unwrap_or("unavailable"),
+        diagnostics.input_device.as_deref().unwrap_or("unavailable"),
+        diagnostics.clipboard_tool.as_deref().unwrap_or("unavailable"),
+        diagnostics.paste_tool.as_deref().unwrap_or("unavailable"),
+        updater_status,
+        error_category(diagnostics.last_error.as_deref()),
+    ) + &format!("resolved_binary: {}\nresolved_model: {}\n", path(&diagnostics.whisper_path), path(&diagnostics.model_path))
 }
 
 fn cached_diagnostics(
@@ -1890,13 +2065,13 @@ fn register_hotkey_handler(app: &AppHandle, shortcut: Shortcut) -> Result<(), St
                 let app_for_stop = app_handle.clone();
                 async_runtime::spawn(async move {
                     let state = app_for_stop.state::<AppData>();
-                    let _ = stop_recording(app_for_stop.clone(), state).await;
+                    let _ = stop_recording_impl(app_for_stop.clone(), state).await;
                 });
             } else {
                 let app_for_start = app_handle.clone();
                 async_runtime::spawn(async move {
                     let state = app_for_start.state::<AppData>();
-                    let _ = start_recording(app_for_start.clone(), state).await;
+                    let _ = start_recording_impl(app_for_start.clone(), state);
                 });
             }
         })
@@ -1940,13 +2115,13 @@ fn toggle_recording(app: &AppHandle) {
         let app_for_stop = app.clone();
         async_runtime::spawn(async move {
             let state = app_for_stop.state::<AppData>();
-            let _ = stop_recording(app_for_stop.clone(), state).await;
+            let _ = stop_recording_impl(app_for_stop.clone(), state).await;
         });
     } else {
         let app_for_start = app.clone();
         async_runtime::spawn(async move {
             let state = app_for_start.state::<AppData>();
-            let _ = start_recording(app_for_start.clone(), state).await;
+            let _ = start_recording_impl(app_for_start.clone(), state);
         });
     }
 }
@@ -2016,6 +2191,8 @@ pub fn run() {
         .invoke_handler(tauri::generate_handler![
             get_app_state,
             refresh_diagnostics,
+            get_diagnostics_report,
+            copy_diagnostics_report,
             save_settings,
             start_recording,
             stop_recording,
@@ -2132,6 +2309,37 @@ mod tests {
     #[test]
     fn native_clipboard_capability_is_reported_without_shell_helper() {
         assert_eq!(clipboard_tool_name(), Some("tauri-clipboard".to_string()));
+    }
+
+    #[test]
+    fn diagnostics_report_is_redacted_and_does_not_include_sensitive_content() {
+        let diagnostics = Diagnostics {
+            whisper_found: true,
+            model_found: true,
+            mic_available: true,
+            clipboard_tool: Some("tauri-clipboard".to_string()),
+            paste_tool: Some("xdotool".to_string()),
+            whisper_path: Some(format!(
+                "{}/tools/whisper",
+                dirs::home_dir().unwrap().display()
+            )),
+            model_path: Some("/models/base.bin".to_string()),
+            recorder: Some("arecord".to_string()),
+            input_device: Some("Built-in Microphone".to_string()),
+            platform: "linux".to_string(),
+            setup_available: false,
+            setup_script_path: None,
+            setup_command: None,
+            last_error: Some("whisper failed with raw transcript: SECRET".to_string()),
+        };
+        let report = format_diagnostics_report(&diagnostics, &UpdaterStatus::Error);
+        assert!(report.contains("version:"));
+        assert!(report.contains("updater: Error"));
+        assert!(report.contains("last_error_category: engine"));
+        assert!(report.contains("<home>"));
+        assert!(!report.contains("SECRET"));
+        assert!(!report.contains("raw transcript"));
+        assert!(!report.contains("setup_command"));
     }
 
     #[test]
