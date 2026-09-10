@@ -1,11 +1,11 @@
 # VibeVoice — Product Specification and Engineering Handbook
 
 **Document version:** 0.2.6  
-**Last updated:** 2026-08-04  
+**Last updated:** 2026-09-10
 **Generated or audited by:** Repository Product Specification & Engineering Handbook Agent  
 **Repository:** `Zburgers/vibevoice`  
 **Authoritative branch:** `master`  
-**Verified branch commit:** `e833b36cbaabe8e6ba40b9a754320995b00e0473`  
+**Verified branch commit:** `316da5b375c73fdc0b6075877edef28cc67715be`
 **Working branch:** `docs/product-handbook-sync-2026-08-04`  
 **Working branch commit:** Document publication commit; inspect Git file history (the commit cannot embed its own SHA)  
 **Production status:** `VERIFIED_RELEASE_PRESENT` — public release documentation and release automation identify VibeVoice `0.2.6`; exact installed/deployed commit is unverified  
@@ -346,7 +346,7 @@ Abnormal termination can leave raw microphone WAV files indefinitely. See planne
 
 ## 4.4 Local transcription ✅ SHIPPED
 
-**Implementation completeness:** FULL but unbounded  
+**Implementation completeness:** FULL with bounded cancellation
 **Runtime state:** UNVERIFIED  
 **Evidence strength:** E3  
 **Confidence:** HIGH
@@ -387,9 +387,9 @@ The default model is `ggml-base.en.bin`.
 - transcript file is missing;
 - transcript is empty.
 
-### Known limitation
+### Timeout and cancellation
 
-`Command::output()` has no timeout, cancellation, process-tree termination, or bounded recovery path. A hung Whisper process can leave the app permanently in `Processing`. See C-003 and issue #48.
+Whisper runs as a managed child in its own process group. The timeout defaults to 900 seconds and is clamped to 30–3600 seconds in Settings. Processing exposes a cancel action; timeout and cancellation terminate and reap the process group, return an actionable error, restore `Error`, and remove temporary recording/transcript files.
 
 ---
 
@@ -806,22 +806,22 @@ No future feature may convert dictation phrases into arbitrary shell, filesystem
 
 ---
 
-## C-003 — Bound and cancel transcription processes ⚠️ CHANGE
+## C-003 — Bound and cancel transcription processes ✅ SHIPPED ON MASTER
 
 **Issue:** #48  
-**Current behavior:** `whisper-cli` runs through blocking `Command::output()` without timeout or cancellation.
+**Current behavior:** `whisper-cli` runs as a bounded, cancellable child process with process-group termination and reap. The default timeout is 900 seconds, clamped to 30–3600 seconds; the Processing action exposes cancellation.
 
-**Target behavior:**
+**Delivered behavior:**
 
 - managed child process;
 - bounded deadline derived from a conservative hard maximum;
 - user-visible cancel action while processing;
 - child/process-tree termination and reap;
-- typed timeout/cancel error;
+- actionable timeout/cancel error;
 - guaranteed state recovery;
 - guaranteed artifact cleanup or explicit retry retention contract.
 
-**Success criteria:** A fixture that sleeps forever cannot keep VibeVoice in `Processing` beyond the configured deadline.
+**Validation:** Rust tests cover timeout and cancellation with child termination/reaping; the full Rust suite passes on Linux.
 
 ---
 
@@ -1507,8 +1507,8 @@ In-process asynchronous work:
 
 ### Recovery limitations
 
-- no cancellation token;
-- no transcription timeout;
+- transcription cancellation is in-memory and applies to the active operation only;
+- transcription timeout is configurable and clamped to a safe range;
 - no startup temp reconciliation;
 - no multi-instance lock;
 - no process-level job journal.
@@ -1523,7 +1523,7 @@ In-process asynchronous work:
 **Authentication:** None.  
 **Credential storage:** Not applicable.  
 **Failure handling:** Exit status and transcript-file checks.  
-**Timeout:** Missing.  
+**Timeout:** Configurable 900-second default, clamped to 30–3600 seconds.
 **Current status:** Required and implemented.
 
 ### 24.2 OS microphone
@@ -1744,9 +1744,9 @@ Diagnostics on `master` displays complete resolved binary/model paths.
 
 Temporary WAV files can survive abnormal shutdown.
 
-#### SEC-005 — Unbounded child processes
+#### SEC-005 — Helper-process coverage
 
-Whisper and paste helpers have no general timeout/process-tree policy.
+Whisper has a timeout, cancellation token, process-group termination, and reap path. Paste helpers remain outside that policy and need a separate bounded-execution change.
 
 #### SEC-006 — Clipboard overwrite
 
@@ -1809,7 +1809,7 @@ Review expectations for future changes:
 
 | ID | Status | Severity | Category | Current behavior | Recommended direction |
 |---|---|---:|---|---|---|
-| L-001 | Open | Medium | Reliability | Whisper can hang indefinitely | C-003 / issue #48 |
+| L-001 | Resolved on master | Medium | Reliability | Whisper is bounded and cancellable; typed error categories and process metrics remain absent | Follow-up typed errors/metrics |
 | L-002 | Open | Medium | Privacy | Crash can retain raw WAV | C-002 / issue #47 |
 | L-003 | Branch fix | Medium | Security | CSP disabled and capabilities shared | Merge verified PR #35 subset |
 | L-004 | Branch fix | Medium | UI reliability | Controls may visually disappear after cycles | PR #35 + manual 10-cycle gate |
@@ -1832,6 +1832,13 @@ Review expectations for future changes:
 ---
 
 ## 31. Change history
+
+### 2026-09-10 — Issue #48 transcription reliability
+
+**Verified branch SHA:** `316da5b375c73fdc0b6075877edef28cc67715be`
+**Change:** Whisper execution is bounded, cancellable, process-group terminated, and reaped; temporary artifacts are cleaned after completion.
+**Validation:** 13 Rust tests passed, including timeout/cancellation tests; frontend production build passed.
+**Remaining gap:** Timeout/cancel reasons are user-facing strings rather than a typed error enum; cross-platform packaged runtime behavior remains unverified.
 
 ### 2026-08-04 — Version 0.2.6
 
@@ -1859,7 +1866,7 @@ Review expectations for future changes:
 | Floating pill | SHIPPED | FULL | UNVERIFIED | E3 | High | `PillWindow.tsx` | Pill window | Setting only | No master UI tests | v0.2.6 notes | Capability scope |
 | Tray/global hotkey | SHIPPED | FULL toggle | UNVERIFIED | E3 | High | `setup_tray`, `register_hotkey_handler` | Tray/system | Hotkey setting | Hotkey parser indirect | No runtime proof | Conflicts/platform |
 | Audio capture | SHIPPED | FULL adapters | UNVERIFIED | E3 | High | `start_audio_capture_impl` | Meter/status | Temp WAV | No adapter tests | Build evidence | Crash cleanup |
-| Whisper transcription | SHIPPED | FULL unbounded | UNVERIFIED | E3 | High | `transcribe` | State/errors | Temp TXT | Engine resolution tests | Build evidence | Timeout/cancel |
+| Whisper transcription | SHIPPED | FULL bounded/cancellable | UNVERIFIED | E3 | High | `transcribe`, `run_process_with_deadline` | State/errors | Temp TXT | Timeout/cancel tests | Build evidence | Runtime cross-platform smoke |
 | Cleanup | SHIPPED | FULL | UNVERIFIED | E2 | High | `cleanup_transcript`, `apply_dictionary` | Final transcript | History optional | Partial | Yes | Unicode matching |
 | Copy/paste | SHIPPED | PARTIAL | UNVERIFIED | E3 | High | `copy_to_clipboard`, `paste_from_clipboard` | Main/pill/history | Last runtime text | Outcome tests | Build evidence | Focus, clipboard restore, macOS |
 | History | SHIPPED | FULL | UNVERIFIED | E2 | High | history helpers | Library | JSON + backup | Strong unit tests | v0.2.6 | Multi-instance |
