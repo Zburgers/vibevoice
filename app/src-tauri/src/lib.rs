@@ -5,15 +5,20 @@ use std::{
     fs,
     io::{self, Write},
     path::{Path, PathBuf},
-    process::{Command, Stdio},
+    process::{Child, Command, Stdio},
     str::FromStr,
     sync::{
-        atomic::{AtomicU32, Ordering},
+        atomic::{AtomicBool, AtomicU32, Ordering},
         Arc, Mutex,
     },
     thread::{self},
     time::{Duration, Instant},
 };
+
+#[cfg(unix)]
+use std::os::unix::process::CommandExt;
+#[cfg(windows)]
+use std::os::windows::process::CommandExt;
 use tauri::{
     async_runtime,
     menu::{Menu, MenuItem},
@@ -43,6 +48,9 @@ const RELEASES_URL: &str = "https://github.com/Zburgers/vibevoice/releases";
 const DEFAULT_MAX_HISTORY_ENTRIES: usize = 100;
 const MAX_HISTORY_ENTRIES: usize = 1000;
 const DIAGNOSTICS_CACHE_TTL: Duration = Duration::from_secs(5);
+const DEFAULT_TRANSCRIPTION_TIMEOUT_SECONDS: u64 = 900;
+const MIN_TRANSCRIPTION_TIMEOUT_SECONDS: u64 = 30;
+const MAX_TRANSCRIPTION_TIMEOUT_SECONDS: u64 = 3600;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "PascalCase")]
@@ -61,6 +69,7 @@ enum VoiceState {
 struct Settings {
     whisper_binary_path: String,
     model_path: String,
+    transcription_timeout_seconds: u64,
     hotkey: String,
     recording_mode: String,
     auto_paste: bool,
@@ -78,6 +87,7 @@ impl Default for Settings {
         Self {
             whisper_binary_path: AUTO_PATH.to_string(),
             model_path: AUTO_PATH.to_string(),
+            transcription_timeout_seconds: DEFAULT_TRANSCRIPTION_TIMEOUT_SECONDS,
             hotkey: "Ctrl+Alt+Space".to_string(),
             recording_mode: "toggle".to_string(),
             auto_paste: true,
@@ -167,9 +177,6 @@ struct RecordingSession {
 }
 
 #[cfg(target_os = "linux")]
-use std::process::Child;
-
-#[cfg(target_os = "linux")]
 struct RecordingSession {
     audio_path: PathBuf,
     output_prefix: PathBuf,
@@ -236,6 +243,7 @@ struct AppData {
     runtime: Mutex<RuntimeState>,
     diagnostics_cache: Mutex<Option<DiagnosticsCache>>,
     history: Mutex<()>,
+    transcription_cancel: Mutex<Option<Arc<AtomicBool>>>,
 }
 
 #[tauri::command]
@@ -275,8 +283,12 @@ fn refresh_diagnostics(app: AppHandle, data: tauri::State<AppData>) -> Result<Di
 fn save_settings(
     app: AppHandle,
     data: tauri::State<AppData>,
-    settings: Settings,
+    mut settings: Settings,
 ) -> Result<(), String> {
+    settings.transcription_timeout_seconds = settings.transcription_timeout_seconds.clamp(
+        MIN_TRANSCRIPTION_TIMEOUT_SECONDS,
+        MAX_TRANSCRIPTION_TIMEOUT_SECONDS,
+    );
     let previous = load_settings(&app).unwrap_or_default();
     if settings.hotkey != previous.hotkey {
         register_global_hotkey(&app, &settings.hotkey)?;
@@ -386,26 +398,56 @@ async fn stop_recording(app: AppHandle, data: tauri::State<'_, AppData>) -> Resu
             }
         }
     };
+    let transcription_cancel = Arc::new(AtomicBool::new(false));
+    *data
+        .transcription_cancel
+        .lock()
+        .map_err(|error| error.to_string())? = Some(Arc::clone(&transcription_cancel));
     emit_state_changed(&app);
 
     let app_handle = app.clone();
     async_runtime::spawn_blocking(move || {
-        let result = finish_recording(app_handle.clone(), &mut session);
+        let result = finish_recording(app_handle.clone(), &mut session, &transcription_cancel);
         cleanup_recording_artifacts(&session);
         if let Err(error) = result {
             let state = app_handle.state::<AppData>();
             let _ = set_runtime_error(&state, &error);
             emit_state_changed(&app_handle);
         }
+        if let Ok(mut current) = app_handle.state::<AppData>().transcription_cancel.lock() {
+            *current = None;
+        }
     });
     Ok(())
 }
 
-fn finish_recording(app: AppHandle, session: &mut RecordingSession) -> Result<HistoryItem, String> {
+#[tauri::command]
+fn cancel_transcription(app: AppHandle, data: tauri::State<AppData>) -> Result<(), String> {
+    let cancel = data
+        .transcription_cancel
+        .lock()
+        .map_err(|error| error.to_string())?
+        .clone()
+        .ok_or_else(|| "No transcription is running.".to_string())?;
+    cancel.store(true, Ordering::Relaxed);
+    emit_state_changed(&app);
+    Ok(())
+}
+
+fn finish_recording(
+    app: AppHandle,
+    session: &mut RecordingSession,
+    transcription_cancel: &AtomicBool,
+) -> Result<HistoryItem, String> {
     stop_audio_capture(session)?;
     let settings = load_settings(&app)?;
     let dictionary = load_dictionary(&app)?;
-    let raw_transcript = transcribe(&settings, &session.audio_path, &session.output_prefix)?;
+    let raw_transcript = transcribe(
+        &settings,
+        &session.audio_path,
+        &session.output_prefix,
+        transcription_cancel,
+    )?;
     let mut final_transcript = cleanup_transcript(&raw_transcript);
     if settings.dictionary_cleanup {
         final_transcript = apply_dictionary(&final_transcript, &dictionary);
@@ -1108,9 +1150,11 @@ fn transcribe(
     settings: &Settings,
     audio_path: &Path,
     output_prefix: &Path,
+    cancel: &AtomicBool,
 ) -> Result<String, String> {
     let paths = resolve_engine_paths(settings)?;
-    let output = Command::new(paths.whisper_binary)
+    let mut command = Command::new(paths.whisper_binary);
+    command
         .arg("-m")
         .arg(paths.model)
         .arg("-f")
@@ -1118,17 +1162,118 @@ fn transcribe(
         .args(["-otxt", "-nt", "-np"])
         .arg("-of")
         .arg(output_prefix)
-        .output()
-        .map_err(|error| format!("Transcription failed to start: {error}"))?;
-    if !output.status.success() {
-        return Err(format!(
-            "Transcription failed: {}{}",
-            String::from_utf8_lossy(&output.stdout),
-            String::from_utf8_lossy(&output.stderr)
-        ));
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null());
+    let status = run_process_with_deadline(
+        &mut command,
+        Duration::from_secs(settings.transcription_timeout_seconds.clamp(
+            MIN_TRANSCRIPTION_TIMEOUT_SECONDS,
+            MAX_TRANSCRIPTION_TIMEOUT_SECONDS,
+        )),
+        cancel,
+    )?;
+    if !status.success() {
+        return Err(format!("Transcription failed with status {status}"));
     }
     fs::read_to_string(output_prefix.with_extension("txt"))
         .map_err(|error| format!("Transcript file missing: {error}"))
+}
+
+fn configure_process_group(command: &mut Command) {
+    #[cfg(unix)]
+    unsafe {
+        command.pre_exec(|| {
+            if libc::setpgid(0, 0) == -1 {
+                return Err(io::Error::last_os_error());
+            }
+            Ok(())
+        });
+    }
+
+    #[cfg(windows)]
+    command.creation_flags(0x0000_0200);
+}
+
+fn run_process_with_deadline(
+    command: &mut Command,
+    timeout: Duration,
+    cancel: &AtomicBool,
+) -> Result<std::process::ExitStatus, String> {
+    configure_process_group(command);
+    let mut child = command
+        .spawn()
+        .map_err(|error| format!("Transcription failed to start: {error}"))?;
+    let deadline = Instant::now() + timeout;
+    loop {
+        if cancel.load(Ordering::Relaxed) {
+            let cleanup = terminate_process_tree(&mut child);
+            return Err(process_stop_message("Transcription cancelled.", cleanup));
+        }
+        match child
+            .try_wait()
+            .map_err(|error| format!("Transcription status check failed: {error}"))?
+        {
+            Some(status) => return Ok(status),
+            None if Instant::now() >= deadline => {
+                let message = format!(
+                    "Transcription timed out after {} seconds.",
+                    timeout.as_secs()
+                );
+                let cleanup = terminate_process_tree(&mut child);
+                return Err(process_stop_message(&message, cleanup));
+            }
+            None => thread::sleep(Duration::from_millis(20)),
+        }
+    }
+}
+
+fn process_stop_message(message: &str, cleanup: Option<String>) -> String {
+    cleanup.map_or_else(|| message.to_string(), |error| format!("{message} {error}"))
+}
+
+fn terminate_process_tree(child: &mut Child) -> Option<String> {
+    let mut errors = Vec::new();
+
+    #[cfg(unix)]
+    {
+        let process_group = -(child.id() as i32);
+        if unsafe { libc::kill(process_group, libc::SIGKILL) } != 0 {
+            errors.push(format!(
+                "could not stop process group: {}",
+                io::Error::last_os_error()
+            ));
+            if let Err(error) = child.kill() {
+                errors.push(format!("could not stop process: {error}"));
+            }
+        }
+    }
+
+    #[cfg(windows)]
+    {
+        let pid = child.id().to_string();
+        match Command::new("taskkill")
+            .args(["/PID", &pid, "/T", "/F"])
+            .status()
+        {
+            Ok(status) if status.success() => {}
+            Ok(status) => errors.push(format!("taskkill exited with status {status}")),
+            Err(error) => errors.push(format!("could not stop process tree: {error}")),
+        }
+        if let Err(error) = child.kill() {
+            errors.push(format!("could not stop process: {error}"));
+        }
+    }
+
+    #[cfg(not(any(unix, windows)))]
+    if let Err(error) = child.kill() {
+        errors.push(format!("could not stop process: {error}"));
+    }
+
+    if let Err(error) = child.wait() {
+        errors.push(format!("could not reap process: {error}"));
+    }
+    (!errors.is_empty()).then(|| errors.join("; "))
 }
 
 fn resolve_engine_paths(settings: &Settings) -> Result<EnginePaths, String> {
@@ -2012,6 +2157,7 @@ pub fn run() {
             runtime: Mutex::new(RuntimeState::default()),
             diagnostics_cache: Mutex::new(None),
             history: Mutex::new(()),
+            transcription_cancel: Mutex::new(None),
         })
         .invoke_handler(tauri::generate_handler![
             get_app_state,
@@ -2019,6 +2165,7 @@ pub fn run() {
             save_settings,
             start_recording,
             stop_recording,
+            cancel_transcription,
             copy_text,
             insert_text,
             delete_history_item,
@@ -2051,6 +2198,36 @@ pub fn run() {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::atomic::AtomicBool;
+
+    #[cfg(unix)]
+    #[test]
+    fn transcription_process_timeout_kills_and_reaps_the_child() {
+        let mut command = Command::new("sh");
+        command.args(["-c", "sleep 1"]);
+
+        let error = run_process_with_deadline(
+            &mut command,
+            Duration::from_millis(30),
+            &AtomicBool::new(false),
+        )
+        .unwrap_err();
+
+        assert!(error.contains("timed out"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn transcription_process_cancellation_kills_and_reaps_the_child() {
+        let mut command = Command::new("sh");
+        command.args(["-c", "sleep 1"]);
+        let cancelled = AtomicBool::new(true);
+
+        let error = run_process_with_deadline(&mut command, Duration::from_secs(1), &cancelled)
+            .unwrap_err();
+
+        assert_eq!(error, "Transcription cancelled.");
+    }
 
     #[test]
     fn resolves_explicit_existing_engine_paths_first() {
