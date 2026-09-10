@@ -1,6 +1,8 @@
 use atomicwrites::{AllowOverwrite, AtomicFile};
 use chrono::{DateTime, Duration as ChronoDuration, Utc};
 use serde::{Deserialize, Serialize};
+#[cfg(unix)]
+use std::os::unix::fs::PermissionsExt;
 use std::{
     fs,
     io::{self, Write},
@@ -22,6 +24,7 @@ use tauri::{
 };
 use tauri_plugin_clipboard_manager::ClipboardExt;
 use tauri_plugin_global_shortcut::{Code, GlobalShortcutExt, Modifiers, Shortcut, ShortcutState};
+use tauri_plugin_opener::OpenerExt;
 use uuid::Uuid;
 
 #[cfg(any(target_os = "windows", target_os = "macos"))]
@@ -476,8 +479,7 @@ fn begin_recording(app: AppHandle, data: tauri::State<'_, AppData>) -> Result<()
 fn prepare_recording_session(app: &AppHandle) -> Result<RecordingSession, String> {
     let settings = load_settings(app)?;
     ensure_engine_ready(&settings)?;
-    let tmp = temp_workspace();
-    fs::create_dir_all(&tmp).map_err(|error| error.to_string())?;
+    let tmp = prepare_temp_workspace()?;
     let stem = format!("recording-{}", Uuid::new_v4());
     let audio_path = tmp.join(format!("{stem}.wav"));
     let output_prefix = tmp.join(stem);
@@ -663,7 +665,9 @@ fn clear_history(
 ) -> Result<(), String> {
     authorize_window(&window, &["main"])?;
     with_history_lock(&data.history, || {
-        write_history(&history_path(&app)?, &Vec::<HistoryItem>::new())
+        let path = history_path(&app)?;
+        write_history(&path, &[])?;
+        remove_corrupt_history_copies(&path)
     })
 }
 
@@ -882,31 +886,29 @@ fn open_release_page(url: Option<String>, window: WebviewWindow) -> Result<(), S
         return Err("Release URL is outside the VibeVoice repository.".to_string());
     }
 
-    let mut command = if cfg!(target_os = "windows") {
-        let mut command = Command::new("cmd");
-        command.args(["/C", "start", "", &url]);
-        command
-    } else if cfg!(target_os = "macos") {
-        let mut command = Command::new("open");
-        command.arg(&url);
-        command
-    } else {
-        let mut command = Command::new("xdg-open");
-        command.arg(&url);
-        command
-    };
-
-    command
-        .spawn()
-        .map(|_| ())
+    window
+        .app_handle()
+        .opener()
+        .open_url(&url, None::<&str>)
         .map_err(|error| format!("Could not open release page: {error}"))
 }
 
 fn is_allowed_release_url(url: &str) -> bool {
-    url == RELEASES_URL
-        || url
-            .strip_prefix(RELEASES_URL)
-            .is_some_and(|suffix| suffix.starts_with("/tag/v") || suffix.starts_with("/download/"))
+    if url == RELEASES_URL {
+        return true;
+    }
+    let Some(suffix) = url.strip_prefix(RELEASES_URL) else {
+        return false;
+    };
+    let path = suffix
+        .strip_prefix("/tag/v")
+        .or_else(|| suffix.strip_prefix("/download/"));
+    path.is_some_and(|path| {
+        !path.is_empty()
+            && path
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || b"._-~/".contains(&byte))
+    })
 }
 
 fn load_settings(app: &AppHandle) -> Result<Settings, String> {
@@ -1099,6 +1101,21 @@ fn preserve_corrupt_history(path: &Path) -> Result<PathBuf, String> {
     fs::copy(path, &preserved)
         .map(|_| preserved)
         .map_err(|error| format!("Could not preserve corrupt history: {error}"))
+}
+
+fn remove_corrupt_history_copies(path: &Path) -> Result<(), String> {
+    let parent = path.parent().unwrap_or_else(|| Path::new("."));
+    for entry in fs::read_dir(parent).map_err(|error| error.to_string())? {
+        let entry = entry.map_err(|error| error.to_string())?;
+        let name = entry.file_name();
+        if name.to_string_lossy().starts_with("history.corrupt-")
+            && name.to_string_lossy().ends_with(".json")
+        {
+            fs::remove_file(entry.path())
+                .map_err(|error| format!("Could not remove corrupt history copy: {error}"))?;
+        }
+    }
+    Ok(())
 }
 
 fn read_history_with_recovery(path: &Path) -> Result<Vec<HistoryItem>, String> {
@@ -1514,9 +1531,39 @@ fn temp_workspace() -> PathBuf {
     std::env::temp_dir().join("vibevoice")
 }
 
+fn prepare_temp_workspace() -> Result<PathBuf, String> {
+    let path = temp_workspace();
+    fs::create_dir_all(&path).map_err(|error| error.to_string())?;
+    #[cfg(unix)]
+    fs::set_permissions(&path, fs::Permissions::from_mode(0o700))
+        .map_err(|error| error.to_string())?;
+    Ok(path)
+}
+
 fn cleanup_recording_artifacts(session: &RecordingSession) {
     let _ = fs::remove_file(&session.audio_path);
     let _ = fs::remove_file(session.output_prefix.with_extension("txt"));
+}
+
+fn cleanup_stale_recording_artifacts() -> Result<(), String> {
+    cleanup_recording_outputs_in(&prepare_temp_workspace()?)
+}
+
+fn cleanup_recording_outputs_in(directory: &Path) -> Result<(), String> {
+    for entry in fs::read_dir(directory).map_err(|error| error.to_string())? {
+        let entry = entry.map_err(|error| error.to_string())?;
+        let path = entry.path();
+        let name = entry.file_name().to_string_lossy().to_string();
+        if name.starts_with("recording-")
+            && matches!(
+                path.extension().and_then(|extension| extension.to_str()),
+                Some("wav" | "txt")
+            )
+        {
+            fs::remove_file(path).map_err(|error| error.to_string())?;
+        }
+    }
+    Ok(())
 }
 
 #[cfg(any(target_os = "windows", target_os = "macos"))]
@@ -1847,22 +1894,41 @@ fn apply_dictionary(text: &str, dictionary: &[DictionaryRule]) -> String {
     result
 }
 
+/* ponytail: linear folded storage keeps Unicode byte boundaries safe; replace with a
+dedicated case-fold search only if dictionary sizes make this measurable. */
 fn replace_case_insensitive(input: &str, needle: &str, replacement: &str) -> String {
     if needle.is_empty() {
         return input.to_string();
     }
-    let lower_input = input.to_lowercase();
-    let lower_needle = needle.to_lowercase();
-    let mut output = String::new();
-    let mut index = 0;
-    while let Some(found) = lower_input[index..].find(&lower_needle) {
-        let start = index + found;
-        let end = start + needle.len();
-        output.push_str(&input[index..start]);
-        output.push_str(replacement);
-        index = end;
+    let lower_needle: Vec<char> = needle.chars().flat_map(char::to_lowercase).collect();
+    let mut lower_input = Vec::new();
+    let mut ranges = Vec::new();
+    for (start, character) in input.char_indices() {
+        let end = start + character.len_utf8();
+        for lower in character.to_lowercase() {
+            lower_input.push(lower);
+            ranges.push((start, end));
+        }
     }
-    output.push_str(&input[index..]);
+    let mut output = String::new();
+    let mut lower_index = 0;
+    let mut input_index = 0;
+    while lower_index + lower_needle.len() <= lower_input.len() {
+        if lower_input[lower_index..].starts_with(&lower_needle) {
+            let start = ranges[lower_index].0;
+            let end = ranges[lower_index + lower_needle.len() - 1].1;
+            output.push_str(&input[input_index..start]);
+            output.push_str(replacement);
+            input_index = end;
+            lower_index += lower_needle.len();
+            while lower_index < ranges.len() && ranges[lower_index].1 <= input_index {
+                lower_index += 1;
+            }
+        } else {
+            lower_index += 1;
+        }
+    }
+    output.push_str(&input[input_index..]);
     output
 }
 
@@ -2426,6 +2492,9 @@ pub fn run() {
             show_main_window
         ])
         .setup(|app| {
+            if let Err(error) = cleanup_stale_recording_artifacts() {
+                eprintln!("Could not clean stale recording artifacts: {error}");
+            }
             setup_tray(app.handle())?;
             let hotkey = load_settings(app.handle())
                 .map(|settings| settings.hotkey)
@@ -2685,12 +2754,56 @@ mod tests {
         assert!(is_allowed_release_url(
             "https://github.com/Zburgers/vibevoice/releases/tag/v0.2.4"
         ));
+        assert!(is_allowed_release_url(
+            "https://github.com/Zburgers/vibevoice/releases/download/v0.2.4/VibeVoice_0.2.4_x64.dmg"
+        ));
         assert!(!is_allowed_release_url(
             "https://github.com/Zburgers/vibevoice/releases.evil.example/tag/v0.2.4"
         ));
         assert!(!is_allowed_release_url(
             "https://github.com/Zburgers/vibevoice/issues"
         ));
+        assert!(!is_allowed_release_url(
+            "https://github.com/Zburgers/vibevoice/releases/tag/v0.2.4?next=evil"
+        ));
+    }
+
+    #[test]
+    fn dictionary_cleanup_handles_unicode_case_expansion() {
+        assert_eq!(replace_case_insensitive("İstanbul", "i", "X"), "Xstanbul");
+        assert_eq!(replace_case_insensitive("CAFÉ", "café", "coffee"), "coffee");
+    }
+
+    #[test]
+    fn clear_history_removes_corrupt_recovery_copies() {
+        let root = std::env::temp_dir().join(format!("vibevoice-history-test-{}", Uuid::new_v4()));
+        fs::create_dir_all(&root).unwrap();
+        let path = root.join("history.json");
+        fs::write(root.join("history.corrupt-old.json"), b"private transcript").unwrap();
+        fs::write(root.join("history.keep.json"), b"keep").unwrap();
+
+        remove_corrupt_history_copies(&path).unwrap();
+
+        assert!(!root.join("history.corrupt-old.json").exists());
+        assert!(root.join("history.keep.json").exists());
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn stale_recording_cleanup_removes_only_recording_outputs() {
+        let root =
+            std::env::temp_dir().join(format!("vibevoice-recording-test-{}", Uuid::new_v4()));
+        fs::create_dir_all(&root).unwrap();
+        fs::write(root.join("recording-old.wav"), b"audio").unwrap();
+        fs::write(root.join("recording-old.txt"), b"transcript").unwrap();
+        fs::write(root.join("keep.txt"), b"keep").unwrap();
+
+        cleanup_recording_outputs_in(&root).unwrap();
+
+        assert!(!root.join("recording-old.wav").exists());
+        assert!(!root.join("recording-old.txt").exists());
+        assert!(root.join("keep.txt").exists());
+        let _ = fs::remove_dir_all(root);
     }
 
     #[test]

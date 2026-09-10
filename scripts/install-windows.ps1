@@ -5,7 +5,22 @@ param(
 
 $ErrorActionPreference = "Stop"
 $ModelFile = "ggml-$ModelName.bin"
-$ModelUrl = "https://huggingface.co/ggerganov/whisper.cpp/resolve/main/$ModelFile"
+$WhisperRef = "v1.9.3"
+$WhisperCommit = "7246b7311e089fe092c4abe7cfad5d0921f8be00"
+$ModelRevision = "5359861c739e955e79d9a303bcbc70fb988958b1"
+$DefaultModelSha256 = "a03779c86df3323075f5e796cb2ce5029f00ec8869eee3fdfb897afe36c6d002"
+$ModelSha256 = if ($env:VIBEVOICE_MODEL_SHA256) { $env:VIBEVOICE_MODEL_SHA256 } else { $DefaultModelSha256 }
+$ModelUrl = "https://huggingface.co/ggerganov/whisper.cpp/resolve/$ModelRevision/$ModelFile"
+
+if ($ModelName -notmatch '^[A-Za-z0-9][A-Za-z0-9._-]*$') {
+  throw "Invalid model name: $ModelName"
+}
+if (($ModelName -ne "base.en") -and [string]::IsNullOrWhiteSpace($env:VIBEVOICE_MODEL_SHA256)) {
+  throw "Set VIBEVOICE_MODEL_SHA256 when using a non-default model."
+}
+if ($ModelSha256 -notmatch '^[A-Fa-f0-9]{64}$') {
+  throw "VIBEVOICE_MODEL_SHA256 must be a 64-character SHA-256 digest."
+}
 
 function Write-Step($Message) {
   Write-Host $Message
@@ -126,7 +141,24 @@ function Ensure-WhisperCpp {
   $AltWhisperCli = Join-Path $EngineRoot "build\bin\whisper-cli.exe"
   $ModelPath = Join-Path $EngineRoot "models\$ModelFile"
 
+  function Verify-WhisperCheckout {
+    $actual = (& $script:GitExe -C $EngineRoot rev-parse HEAD).Trim()
+    if ($actual -ne $WhisperCommit) {
+      throw "Refusing unverified whisper.cpp checkout: $actual"
+    }
+  }
+
+  function Verify-Model {
+    $actual = (Get-FileHash -Algorithm SHA256 -LiteralPath $ModelPath).Hash
+    if ($actual -ne $ModelSha256.ToUpperInvariant()) {
+      Remove-Item -Force -LiteralPath $ModelPath
+      throw "Refusing model with unexpected SHA-256: $actual"
+    }
+  }
+
   if ((Test-Path $WhisperCli) -and (Test-Path $ModelPath)) {
+    Verify-WhisperCheckout
+    Verify-Model
     Write-Step "Existing whisper.cpp engine detected: $EngineRoot"
     return
   }
@@ -138,11 +170,12 @@ function Ensure-WhisperCpp {
     if ((Test-Path $EngineRoot) -and ((Get-ChildItem -Force $EngineRoot | Select-Object -First 1) -ne $null)) {
       throw "$EngineRoot exists but is not a whisper.cpp git checkout. Set VIBEVOICE_ENGINE_DIR to an empty directory or existing checkout."
     }
-    Write-Step "+ git clone https://github.com/ggml-org/whisper.cpp.git `"$EngineRoot`""
-    & $script:GitExe clone https://github.com/ggml-org/whisper.cpp.git $EngineRoot
+    Write-Step "+ git clone --branch $WhisperRef --depth 1 https://github.com/ggml-org/whisper.cpp.git `"$EngineRoot`""
+    & $script:GitExe clone --branch $WhisperRef --depth 1 https://github.com/ggml-org/whisper.cpp.git $EngineRoot
   } else {
     Write-Step "Reusing whisper.cpp checkout: $EngineRoot"
   }
+  Verify-WhisperCheckout
 
   New-Item -ItemType Directory -Force -Path (Join-Path $EngineRoot "models") | Out-Null
   if (-not (Test-Path $ModelPath)) {
@@ -151,6 +184,7 @@ function Ensure-WhisperCpp {
   } else {
     Write-Step "Model already present: $ModelPath"
   }
+  Verify-Model
 
   if (-not ((Test-Path $WhisperCli) -or (Test-Path $AltWhisperCli))) {
     Write-Step "+ cmake -S `"$EngineRoot`" -B `"$EngineRoot\build`" -A x64"

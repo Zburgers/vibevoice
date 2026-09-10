@@ -3,6 +3,11 @@ set -euo pipefail
 
 MODEL_NAME="${VIBEVOICE_MODEL_NAME:-base.en}"
 MODEL_FILE="ggml-${MODEL_NAME}.bin"
+WHISPER_REF="v1.9.3"
+WHISPER_COMMIT="7246b7311e089fe092c4abe7cfad5d0921f8be00"
+MODEL_REVISION="5359861c739e955e79d9a303bcbc70fb988958b1"
+DEFAULT_MODEL_SHA256="a03779c86df3323075f5e796cb2ce5029f00ec8869eee3fdfb897afe36c6d002"
+MODEL_SHA256="${VIBEVOICE_MODEL_SHA256:-$DEFAULT_MODEL_SHA256}"
 DATA_HOME="${XDG_DATA_HOME:-$HOME/.local/share}"
 ENGINE_ROOT="${VIBEVOICE_ENGINE_DIR:-$DATA_HOME/vibevoice/engines/whisper.cpp}"
 TMP_DIR="${VIBEVOICE_TMP_DIR:-${TMPDIR:-/tmp}/vibevoice}"
@@ -10,6 +15,19 @@ TMP_DIR="${VIBEVOICE_TMP_DIR:-${TMPDIR:-/tmp}/vibevoice}"
 say() {
   printf '%s\n' "$1"
 }
+
+if [[ ! "$MODEL_NAME" =~ ^[A-Za-z0-9][A-Za-z0-9._-]*$ ]]; then
+  say "Invalid model name: $MODEL_NAME"
+  exit 1
+fi
+if [[ "$MODEL_NAME" != "base.en" && -z "${VIBEVOICE_MODEL_SHA256:-}" ]]; then
+  say "Set VIBEVOICE_MODEL_SHA256 when using a non-default model."
+  exit 1
+fi
+if [[ ! "$MODEL_SHA256" =~ ^[A-Fa-f0-9]{64}$ ]]; then
+  say "VIBEVOICE_MODEL_SHA256 must be a 64-character SHA-256 digest."
+  exit 1
+fi
 
 run() {
   say "+ $*"
@@ -86,7 +104,28 @@ ensure_whisper_repo() {
   local cli="$ENGINE_ROOT/build/bin/whisper-cli"
   local model="$ENGINE_ROOT/models/$MODEL_FILE"
 
+  verify_checkout() {
+    local actual
+    actual="$(git -C "$ENGINE_ROOT" rev-parse HEAD)"
+    if [[ "$actual" != "$WHISPER_COMMIT" ]]; then
+      say "Refusing unverified whisper.cpp checkout: $actual"
+      exit 1
+    fi
+  }
+
+  verify_model() {
+    local actual
+    actual="$(sha256sum "$model" | cut -d ' ' -f 1)"
+    if [[ "$actual" != "$MODEL_SHA256" ]]; then
+      say "Refusing model with unexpected SHA-256: $actual"
+      rm -f "$model"
+      exit 1
+    fi
+  }
+
   if [[ -x "$cli" && -f "$model" ]]; then
+    verify_checkout
+    verify_model
     say "Existing whisper.cpp engine detected: $ENGINE_ROOT"
     return 0
   fi
@@ -102,16 +141,18 @@ ensure_whisper_repo() {
       say "Set VIBEVOICE_ENGINE_DIR to an empty directory or an existing whisper.cpp checkout."
       exit 1
     fi
-    run git clone https://github.com/ggml-org/whisper.cpp.git "$ENGINE_ROOT"
+    run git clone --branch "$WHISPER_REF" --depth 1 https://github.com/ggml-org/whisper.cpp.git "$ENGINE_ROOT"
   else
     say "Reusing whisper.cpp checkout: $ENGINE_ROOT"
   fi
+  verify_checkout
 
   if [[ ! -f "$model" ]]; then
     (cd "$ENGINE_ROOT" && run sh ./models/download-ggml-model.sh "$MODEL_NAME")
   else
     say "Model already present: $model"
   fi
+  verify_model
 
   if [[ ! -x "$cli" ]]; then
     (cd "$ENGINE_ROOT" && run cmake -B build -S . && run cmake --build build -j --config Release)
