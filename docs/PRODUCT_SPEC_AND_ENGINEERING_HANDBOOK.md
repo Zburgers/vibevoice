@@ -18,9 +18,9 @@
 
 ## Document contract
 
-This handbook is the canonical rolling source of truth for VibeVoice product behavior and engineering implementation.
+This handbook is a repository-grounded audit of VibeVoice behavior plus proposed product contracts. It is not, by itself, an owner-approval record.
 
-- **Part I is normative.** It defines product intent, approved behavior, invariants, planned changes, and decision history.
+- **Part I separates observations, proposals, and explicitly approved decisions.** Only an entry with recorded owner, date, and approval provenance is normative.
 - **Part II is descriptive.** It records what the authoritative `master` implementation actually does at the verified commit.
 - A feature is not `SHIPPED` merely because it appears in an issue, plan, README, branch, or pull request.
 - Unmerged work is marked `BRANCH_ONLY`.
@@ -32,7 +32,7 @@ This handbook is the canonical rolling source of truth for VibeVoice product beh
 ### Status vocabulary
 
 - ✅ **SHIPPED** — implemented on the authoritative branch.
-- 🔨 **BUILD** — approved behavior that is not fully implemented.
+- 🔨 **BUILD** — approved behavior that is not fully implemented; without approval provenance, use **CANDIDATE** instead.
 - ⚠️ **CHANGE** — existing behavior must deliberately change.
 - ❌ **REMOVE** — existing behavior or artifact must be retired.
 - 💡 **CANDIDATE — NOT APPROVED** — a possible future capability, not an implementation instruction.
@@ -48,7 +48,7 @@ This handbook is the canonical rolling source of truth for VibeVoice product beh
 
 ### Documentation precedence
 
-1. Active product decisions in this handbook.
+1. Separately recorded, owner-approved product decisions.
 2. Executable implementation on the authoritative branch.
 3. Tests and release automation.
 4. Current narrow-purpose documents such as `docs/INSTALL.md`.
@@ -59,7 +59,9 @@ This handbook is the canonical rolling source of truth for VibeVoice product beh
 
 ---
 
-# Part I — Normative Product Specification
+# Part I — Product Intent, Observed Constraints, and Proposed Contract
+
+No owner approval record was available for this audit. The material in Part I is therefore repository-derived observation or proposal unless a section explicitly names approval provenance. It must not be treated as canonical product policy without that provenance.
 
 ## 1. Product definition
 
@@ -925,13 +927,15 @@ No future feature may convert dictation phrases into arbitrary shell, filesystem
 
 ---
 
-## 11. Decision log
+## 11. Repository-derived decision log
+
+The entries below are conclusions inferred from implementation, release, and historical-document evidence. They are not owner-approved product decisions: no approving owner, approval date, or source artifact was available in this repository. Reclassify them as normative only after that provenance is added.
 
 ### D-001
 
 **Date:** 2026-08-04  
-**Status:** ACTIVE  
-**Decision:** VibeVoice remains local-first and does not require cloud transcription.  
+**Status:** OBSERVED — NOT OWNER-APPROVED
+**Repository-derived conclusion:** VibeVoice remains local-first and does not require cloud transcription.
 **Rationale:** Privacy, offline use, and predictable developer workflow are core product identity.  
 **Rejected alternatives:** Cloud-first transcription as default.  
 **Implementation consequences:** Local engine resolution, local model, no transcript upload.
@@ -939,59 +943,59 @@ No future feature may convert dictation phrases into arbitrary shell, filesystem
 ### D-002
 
 **Date:** 2026-08-04  
-**Status:** ACTIVE  
-**Decision:** VibeVoice is a single-user desktop utility, not a multi-user service.  
+**Status:** OBSERVED — NOT OWNER-APPROVED
+**Repository-derived conclusion:** VibeVoice is a single-user desktop utility, not a multi-user service.
 **Implementation consequences:** No auth, tenants, server database, billing, or remote account state.
 
 ### D-003
 
 **Date:** 2026-08-04  
-**Status:** ACTIVE  
-**Decision:** Toggle is the only shipped recording mode.  
+**Status:** OBSERVED — NOT OWNER-APPROVED
+**Repository-derived conclusion:** Toggle is the only shipped recording mode.
 **Rationale:** Backend hotkey behavior ignores the persisted mode field.  
 **Implementation consequences:** Do not advertise push-to-talk until implemented and tested.
 
 ### D-004
 
 **Date:** 2026-08-04  
-**Status:** ACTIVE  
-**Decision:** Transcript history is opt-in and disabled by default.  
+**Status:** OBSERVED — NOT OWNER-APPROVED
+**Repository-derived conclusion:** Transcript history is opt-in and disabled by default.
 **Implementation consequences:** A completed transcript may remain in volatile runtime state, but persistent history requires explicit user enablement.
 
 ### D-005
 
 **Date:** 2026-08-04  
-**Status:** ACTIVE  
-**Decision:** Local JSON persistence is the current storage model.  
+**Status:** OBSERVED — NOT OWNER-APPROVED
+**Repository-derived conclusion:** Local JSON persistence is the current storage model.
 **Rationale:** The authoritative implementation uses atomic JSON files, not the SQLite recommendation in the MVP document.  
 **Implementation consequences:** Do not claim a database or migration system exists.
 
 ### D-006
 
 **Date:** 2026-08-04  
-**Status:** ACTIVE  
-**Decision:** Windows/macOS capture uses CPAL; Linux uses runtime recorder binaries.  
+**Status:** OBSERVED — NOT OWNER-APPROVED
+**Repository-derived conclusion:** Windows/macOS capture uses CPAL; Linux uses runtime recorder binaries.
 **Implementation consequences:** Linux readiness depends on `pw-record`, `arecord`, or `ffmpeg`.
 
 ### D-007
 
 **Date:** 2026-08-04  
-**Status:** ACTIVE  
-**Decision:** Automated application updates require signed Tauri updater artifacts.  
+**Status:** OBSERVED — NOT OWNER-APPROVED
+**Repository-derived conclusion:** Automated application updates require signed Tauri updater artifacts.
 **Implementation consequences:** GitHub latest-release fallback remains informational.
 
 ### D-008
 
 **Date:** 2026-08-04  
-**Status:** ACTIVE  
-**Decision:** In-app engine setup script execution is development-only.  
+**Status:** OBSERVED — NOT OWNER-APPROVED
+**Repository-derived conclusion:** In-app engine setup script execution is development-only.
 **Implementation consequences:** Production directs users to release installers or documented setup commands.
 
 ### D-009
 
 **Date:** 2026-08-04  
-**Status:** ACTIVE  
-**Decision:** Open feature issues without an implementation commitment remain candidates, not `BUILD` requirements.
+**Status:** OBSERVED — NOT OWNER-APPROVED
+**Repository-derived conclusion:** Open feature issues without an implementation commitment remain candidates, not `BUILD` requirements.
 
 ---
 
@@ -1838,7 +1842,7 @@ Review expectations for future changes:
 **Changed behavior documented:** PR #35 branch-only stabilization  
 **Resolved limitations recorded:** v0.2.6 history persistence, timer, pill geometry, resizing  
 **New limitations recorded:** process timeout, crash audio retention, CSP/capabilities, settings drift, dictionary drift, macOS paste uncertainty  
-**Decisions added:** D-001 through D-009  
+**Repository-derived conclusions added:** D-001 through D-009
 **Open rulings added:** R-001, R-002  
 **Evidence strengthened:** Exact Rust commands, React surfaces, release workflow, local file contracts  
 **Evidence weakened:** Exact deployed commit and installed cross-platform runtime remain unverified
