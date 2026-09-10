@@ -1,6 +1,8 @@
 use atomicwrites::{AllowOverwrite, AtomicFile};
 use chrono::{DateTime, Duration as ChronoDuration, Utc};
 use serde::{Deserialize, Serialize};
+#[cfg(target_os = "windows")]
+use std::os::windows::process::CommandExt;
 use std::{
     fs,
     io::{self, Read, Write},
@@ -45,6 +47,16 @@ const MAX_HISTORY_ENTRIES: usize = 1000;
 const DIAGNOSTICS_CACHE_TTL: Duration = Duration::from_secs(5);
 const PASTE_HELPER_TIMEOUT: Duration = Duration::from_secs(2);
 const PASTE_HELPER_POLL_INTERVAL: Duration = Duration::from_millis(20);
+
+#[cfg(target_os = "windows")]
+const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+
+fn configure_command(command: &mut Command) {
+    #[cfg(target_os = "windows")]
+    command.creation_flags(CREATE_NO_WINDOW);
+    #[cfg(not(target_os = "windows"))]
+    let _ = command;
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "PascalCase")]
@@ -295,6 +307,7 @@ struct AppData {
     diagnostics_cache: Mutex<Option<DiagnosticsCache>>,
     history: Mutex<()>,
     insertion: Mutex<()>,
+    lifecycle: Mutex<()>,
     shutdown: Arc<AtomicBool>,
     worker_threads: Mutex<Vec<thread::JoinHandle<()>>>,
     meter_threads: Mutex<Vec<thread::JoinHandle<()>>>,
@@ -424,6 +437,7 @@ fn start_recording_impl(app: AppHandle, data: tauri::State<'_, AppData>) -> Resu
 }
 
 fn begin_recording(app: AppHandle, data: tauri::State<'_, AppData>) -> Result<(), String> {
+    let lifecycle = data.lifecycle.lock().map_err(|error| error.to_string())?;
     if data.shutdown.load(Ordering::Acquire) {
         return Err("VibeVoice is shutting down.".to_string());
     }
@@ -442,8 +456,6 @@ fn begin_recording(app: AppHandle, data: tauri::State<'_, AppData>) -> Result<()
         runtime.mic_level = 0.0;
         runtime.recording = None;
     }
-    emit_state_changed(&app);
-
     let app_handle = app.clone();
     let shutdown = Arc::clone(&data.shutdown);
     let worker = thread::spawn(move || match prepare_recording_session(&app_handle) {
@@ -476,7 +488,7 @@ fn begin_recording(app: AppHandle, data: tauri::State<'_, AppData>) -> Result<()
             emit_state_changed(&app_handle);
             let meter_thread =
                 spawn_meter_emitter(app_handle.clone(), mic_level, Arc::clone(&shutdown));
-            let _ = track_thread(&data.meter_threads, meter_thread);
+            track_thread(&data.meter_threads, meter_thread);
         }
         Err(error) => {
             if shutdown.load(Ordering::Acquire) {
@@ -487,7 +499,9 @@ fn begin_recording(app: AppHandle, data: tauri::State<'_, AppData>) -> Result<()
             emit_state_changed(&app_handle);
         }
     });
-    track_thread(&data.worker_threads, worker)?;
+    track_thread(&data.worker_threads, worker);
+    drop(lifecycle);
+    emit_state_changed(&app);
     Ok(())
 }
 
@@ -519,6 +533,10 @@ async fn stop_recording_impl(
     app: AppHandle,
     data: tauri::State<'_, AppData>,
 ) -> Result<(), String> {
+    let lifecycle = data.lifecycle.lock().map_err(|error| error.to_string())?;
+    if data.shutdown.load(Ordering::Acquire) {
+        return Err("VibeVoice is shutting down.".to_string());
+    }
     let mut session = {
         let mut runtime = data.runtime.lock().map_err(|error| error.to_string())?;
         match runtime.recording.take() {
@@ -542,8 +560,6 @@ async fn stop_recording_impl(
             }
         }
     };
-    emit_state_changed(&app);
-
     let app_handle = app.clone();
     let shutdown = Arc::clone(&data.shutdown);
     let worker = thread::spawn(move || {
@@ -558,7 +574,9 @@ async fn stop_recording_impl(
             emit_state_changed(&app_handle);
         }
     });
-    track_thread(&data.worker_threads, worker)?;
+    track_thread(&data.worker_threads, worker);
+    drop(lifecycle);
+    emit_state_changed(&app);
     Ok(())
 }
 
@@ -859,11 +877,13 @@ fn run_setup_script(
         setup_script_path(&app).ok_or_else(|| format!("Setup script not found: {script_name}"))?;
     let mut command = if cfg!(target_os = "windows") {
         let mut command = Command::new("powershell");
+        configure_command(&mut command);
         command.args(["-NoProfile", "-ExecutionPolicy", "Bypass", "-File"]);
         command.arg(script);
         command
     } else {
         let mut command = Command::new("bash");
+        configure_command(&mut command);
         command.arg(script);
         command
     };
@@ -919,14 +939,17 @@ fn open_release_page(url: Option<String>, window: WebviewWindow) -> Result<(), S
 
     let mut command = if cfg!(target_os = "windows") {
         let mut command = Command::new("cmd");
+        configure_command(&mut command);
         command.args(["/C", "start", "", &url]);
         command
     } else if cfg!(target_os = "macos") {
         let mut command = Command::new("open");
+        configure_command(&mut command);
         command.arg(&url);
         command
     } else {
         let mut command = Command::new("xdg-open");
+        configure_command(&mut command);
         command.arg(&url);
         command
     };
@@ -1370,7 +1393,9 @@ fn transcribe(
         return Err("Transcription cancelled during shutdown.".to_string());
     }
     let paths = resolve_engine_paths(settings)?;
-    let mut child = Command::new(paths.whisper_binary)
+    let mut command = Command::new(paths.whisper_binary);
+    configure_command(&mut command);
+    let mut child = command
         .arg("-m")
         .arg(paths.model)
         .arg("-f")
@@ -1752,7 +1777,9 @@ fn start_audio_capture_impl(
         "No supported Linux audio recorder found. Install pw-record, arecord, or ffmpeg."
             .to_string()
     })?;
-    let child = Command::new(command)
+    let mut recorder = Command::new(command);
+    configure_command(&mut recorder);
+    let child = recorder
         .args(args)
         .arg(&audio_path)
         .stdin(Stdio::null())
@@ -2133,6 +2160,7 @@ fn insertion_report_from_results(
 fn paste_from_clipboard() -> Result<String, String> {
     if cfg!(target_os = "windows") {
         let mut command = Command::new("powershell");
+        configure_command(&mut command);
         command.args([
             "-STA",
             "-NoProfile",
@@ -2149,6 +2177,7 @@ fn paste_from_clipboard() -> Result<String, String> {
     for (cmd, args) in candidates {
         if command_exists(cmd) {
             let mut command = Command::new(cmd);
+            configure_command(&mut command);
             command.args(args);
             return run_paste_helper(&mut command, cmd, PASTE_HELPER_TIMEOUT);
         }
@@ -2207,7 +2236,9 @@ fn cleanup_paste_helper(child: &mut std::process::Child) -> Option<String> {
 
 fn command_exists(name: &str) -> bool {
     if cfg!(target_os = "windows") {
-        return Command::new("where")
+        let mut command = Command::new("where");
+        configure_command(&mut command);
+        return command
             .arg(name)
             .stdout(Stdio::null())
             .stderr(Stdio::null())
@@ -2215,7 +2246,9 @@ fn command_exists(name: &str) -> bool {
             .map(|status| status.success())
             .unwrap_or(false);
     }
-    Command::new("sh")
+    let mut command = Command::new("sh");
+    configure_command(&mut command);
+    command
         .arg("-c")
         .arg(format!(
             "command -v '{}' >/dev/null 2>&1",
@@ -2507,6 +2540,9 @@ fn setup_tray(app: &AppHandle) -> Result<(), String> {
 
 fn shutdown_app(app: &AppHandle) {
     let data = app.state::<AppData>();
+    let Ok(lifecycle) = data.lifecycle.lock() else {
+        return;
+    };
     if data.shutdown.swap(true, Ordering::AcqRel) {
         return;
     }
@@ -2529,17 +2565,20 @@ fn shutdown_app(app: &AppHandle) {
         for meter in meters.drain(..) {
             let _ = meter.join();
         }
-    };
+    }
+    drop(lifecycle);
 }
 
-fn track_thread(
-    threads: &Mutex<Vec<thread::JoinHandle<()>>>,
-    thread: thread::JoinHandle<()>,
-) -> Result<(), String> {
-    let mut tracked = threads.lock().map_err(|error| error.to_string())?;
-    tracked.retain(|thread| !thread.is_finished());
-    tracked.push(thread);
-    Ok(())
+fn track_thread(threads: &Mutex<Vec<thread::JoinHandle<()>>>, thread: thread::JoinHandle<()>) {
+    match threads.lock() {
+        Ok(mut tracked) => {
+            tracked.retain(|thread| !thread.is_finished());
+            tracked.push(thread);
+        }
+        Err(_) => {
+            let _ = thread.join();
+        }
+    }
 }
 
 pub fn run() {
@@ -2553,6 +2592,7 @@ pub fn run() {
             diagnostics_cache: Mutex::new(None),
             history: Mutex::new(()),
             insertion: Mutex::new(()),
+            lifecycle: Mutex::new(()),
             shutdown: Arc::new(AtomicBool::new(false)),
             worker_threads: Mutex::new(Vec::new()),
             meter_threads: Mutex::new(Vec::new()),
