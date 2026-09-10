@@ -3,12 +3,12 @@ use chrono::{DateTime, Duration as ChronoDuration, Utc};
 use serde::{Deserialize, Serialize};
 use std::{
     fs,
-    io::{self, Write},
+    io::{self, Read, Write},
     path::{Path, PathBuf},
-    process::{Command, Stdio},
+    process::{Command, ExitStatus, Stdio},
     str::FromStr,
     sync::{
-        atomic::{AtomicU32, Ordering},
+        atomic::{AtomicBool, AtomicU32, Ordering},
         Arc, Mutex,
     },
     thread::{self},
@@ -295,6 +295,9 @@ struct AppData {
     diagnostics_cache: Mutex<Option<DiagnosticsCache>>,
     history: Mutex<()>,
     insertion: Mutex<()>,
+    shutdown: Arc<AtomicBool>,
+    worker_threads: Mutex<Vec<thread::JoinHandle<()>>>,
+    meter_threads: Mutex<Vec<thread::JoinHandle<()>>>,
 }
 
 fn authorize_window(window: &WebviewWindow, allowed: &[&str]) -> Result<(), String> {
@@ -421,6 +424,9 @@ fn start_recording_impl(app: AppHandle, data: tauri::State<'_, AppData>) -> Resu
 }
 
 fn begin_recording(app: AppHandle, data: tauri::State<'_, AppData>) -> Result<(), String> {
+    if data.shutdown.load(Ordering::Acquire) {
+        return Err("VibeVoice is shutting down.".to_string());
+    }
     {
         let mut runtime = data.runtime.lock().map_err(|error| error.to_string())?;
         match runtime.voice_state {
@@ -439,8 +445,14 @@ fn begin_recording(app: AppHandle, data: tauri::State<'_, AppData>) -> Result<()
     emit_state_changed(&app);
 
     let app_handle = app.clone();
-    async_runtime::spawn_blocking(move || match prepare_recording_session(&app_handle) {
+    let shutdown = Arc::clone(&data.shutdown);
+    let worker = thread::spawn(move || match prepare_recording_session(&app_handle) {
         Ok(mut session) => {
+            if shutdown.load(Ordering::Acquire) {
+                let _ = stop_audio_capture(&mut session);
+                cleanup_recording_artifacts(&session);
+                return;
+            }
             let mic_level = Arc::clone(&session.mic_level);
             let data = app_handle.state::<AppData>();
             let mut runtime = match data.runtime.lock() {
@@ -462,14 +474,20 @@ fn begin_recording(app: AppHandle, data: tauri::State<'_, AppData>) -> Result<()
             runtime.recording = Some(session);
             drop(runtime);
             emit_state_changed(&app_handle);
-            spawn_meter_emitter(app_handle.clone(), mic_level);
+            let meter_thread =
+                spawn_meter_emitter(app_handle.clone(), mic_level, Arc::clone(&shutdown));
+            let _ = track_thread(&data.meter_threads, meter_thread);
         }
         Err(error) => {
+            if shutdown.load(Ordering::Acquire) {
+                return;
+            }
             let data = app_handle.state::<AppData>();
             let _ = set_runtime_error(&data, &error);
             emit_state_changed(&app_handle);
         }
     });
+    track_thread(&data.worker_threads, worker)?;
     Ok(())
 }
 
@@ -527,23 +545,40 @@ async fn stop_recording_impl(
     emit_state_changed(&app);
 
     let app_handle = app.clone();
-    async_runtime::spawn_blocking(move || {
-        let result = finish_recording(app_handle.clone(), &mut session);
+    let shutdown = Arc::clone(&data.shutdown);
+    let worker = thread::spawn(move || {
+        let result = finish_recording(app_handle.clone(), &mut session, &shutdown);
         cleanup_recording_artifacts(&session);
         if let Err(error) = result {
+            if shutdown.load(Ordering::Acquire) {
+                return;
+            }
             let state = app_handle.state::<AppData>();
             let _ = set_runtime_error(&state, &error);
             emit_state_changed(&app_handle);
         }
     });
+    track_thread(&data.worker_threads, worker)?;
     Ok(())
 }
 
-fn finish_recording(app: AppHandle, session: &mut RecordingSession) -> Result<HistoryItem, String> {
+fn finish_recording(
+    app: AppHandle,
+    session: &mut RecordingSession,
+    shutdown: &AtomicBool,
+) -> Result<HistoryItem, String> {
     stop_audio_capture(session)?;
+    if shutdown.load(Ordering::Acquire) {
+        return Err("Recording cancelled during shutdown.".to_string());
+    }
     let settings = load_settings(&app)?;
     let dictionary = load_dictionary(&app)?;
-    let raw_transcript = transcribe(&settings, &session.audio_path, &session.output_prefix)?;
+    let raw_transcript = transcribe(
+        &settings,
+        &session.audio_path,
+        &session.output_prefix,
+        shutdown,
+    )?;
     let mut final_transcript = cleanup_transcript(&raw_transcript);
     if settings.dictionary_cleanup {
         final_transcript = apply_dictionary(&final_transcript, &dictionary);
@@ -897,7 +932,7 @@ fn open_release_page(url: Option<String>, window: WebviewWindow) -> Result<(), S
     };
 
     command
-        .spawn()
+        .status()
         .map(|_| ())
         .map_err(|error| format!("Could not open release page: {error}"))
 }
@@ -1329,9 +1364,13 @@ fn transcribe(
     settings: &Settings,
     audio_path: &Path,
     output_prefix: &Path,
+    shutdown: &AtomicBool,
 ) -> Result<String, String> {
+    if shutdown.load(Ordering::Acquire) {
+        return Err("Transcription cancelled during shutdown.".to_string());
+    }
     let paths = resolve_engine_paths(settings)?;
-    let output = Command::new(paths.whisper_binary)
+    let mut child = Command::new(paths.whisper_binary)
         .arg("-m")
         .arg(paths.model)
         .arg("-f")
@@ -1339,17 +1378,83 @@ fn transcribe(
         .args(["-otxt", "-nt", "-np"])
         .arg("-of")
         .arg(output_prefix)
-        .output()
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
         .map_err(|error| format!("Transcription failed to start: {error}"))?;
-    if !output.status.success() {
+
+    let stdout = match child.stdout.take() {
+        Some(stdout) => stdout,
+        None => {
+            kill_and_reap(&mut child);
+            return Err("Transcription stdout was not captured.".to_string());
+        }
+    };
+    let stderr = match child.stderr.take() {
+        Some(stderr) => stderr,
+        None => {
+            kill_and_reap(&mut child);
+            return Err("Transcription stderr was not captured.".to_string());
+        }
+    };
+    let stdout_reader = thread::spawn(move || read_child_output(stdout));
+    let stderr_reader = thread::spawn(move || read_child_output(stderr));
+    let status = match wait_for_child(&mut child, shutdown) {
+        Ok(status) => status,
+        Err(error) => {
+            let _ = stdout_reader.join();
+            let _ = stderr_reader.join();
+            return Err(error);
+        }
+    };
+    let stdout = stdout_reader
+        .join()
+        .map_err(|_| "Transcription stdout reader panicked.".to_string())?
+        .map_err(|error| format!("Transcription stdout read failed: {error}"))?;
+    let stderr = stderr_reader
+        .join()
+        .map_err(|_| "Transcription stderr reader panicked.".to_string())?
+        .map_err(|error| format!("Transcription stderr read failed: {error}"))?;
+    if !status.success() {
         return Err(format!(
             "Transcription failed: {}{}",
-            String::from_utf8_lossy(&output.stdout),
-            String::from_utf8_lossy(&output.stderr)
+            String::from_utf8_lossy(&stdout),
+            String::from_utf8_lossy(&stderr)
         ));
     }
     fs::read_to_string(output_prefix.with_extension("txt"))
         .map_err(|error| format!("Transcript file missing: {error}"))
+}
+
+fn read_child_output<R: Read>(mut reader: R) -> io::Result<Vec<u8>> {
+    let mut output = Vec::new();
+    reader.read_to_end(&mut output)?;
+    Ok(output)
+}
+
+fn kill_and_reap(child: &mut std::process::Child) {
+    let _ = child.kill();
+    let _ = child.wait();
+}
+
+fn wait_for_child(
+    child: &mut std::process::Child,
+    shutdown: &AtomicBool,
+) -> Result<ExitStatus, String> {
+    loop {
+        if shutdown.load(Ordering::Acquire) {
+            kill_and_reap(child);
+            return Err("Transcription cancelled during shutdown.".to_string());
+        }
+        match child.try_wait() {
+            Ok(Some(status)) => return Ok(status),
+            Ok(None) => thread::sleep(PASTE_HELPER_POLL_INTERVAL),
+            Err(error) => {
+                kill_and_reap(child);
+                return Err(format!("Transcription failed: {error}"));
+            }
+        }
+    }
 }
 
 fn resolve_engine_paths(settings: &Settings) -> Result<EnginePaths, String> {
@@ -2228,8 +2333,15 @@ fn emit_meter_changed(app: &AppHandle, mic_level: f32) {
     let _ = app.emit(METER_CHANGED_EVENT, MeterPayload { mic_level });
 }
 
-fn spawn_meter_emitter(app: AppHandle, mic_level: Arc<AtomicU32>) {
+fn spawn_meter_emitter(
+    app: AppHandle,
+    mic_level: Arc<AtomicU32>,
+    shutdown: Arc<AtomicBool>,
+) -> thread::JoinHandle<()> {
     thread::spawn(move || loop {
+        if shutdown.load(Ordering::Acquire) {
+            break;
+        }
         let is_recording = app
             .state::<AppData>()
             .runtime
@@ -2241,7 +2353,7 @@ fn spawn_meter_emitter(app: AppHandle, mic_level: Arc<AtomicU32>) {
         }
         emit_meter_changed(&app, mic_level.load(Ordering::Relaxed) as f32 / 1000.0);
         thread::sleep(Duration::from_millis(180));
-    });
+    })
 }
 
 fn parse_hotkey(hotkey: &str) -> Result<Shortcut, String> {
@@ -2393,8 +2505,45 @@ fn setup_tray(app: &AppHandle) -> Result<(), String> {
         .map_err(|error| error.to_string())
 }
 
+fn shutdown_app(app: &AppHandle) {
+    let data = app.state::<AppData>();
+    if data.shutdown.swap(true, Ordering::AcqRel) {
+        return;
+    }
+
+    let session = data.runtime.lock().ok().and_then(|mut runtime| {
+        runtime.voice_state = VoiceState::Ready;
+        runtime.recording.take()
+    });
+    if let Some(mut session) = session {
+        let _ = stop_audio_capture(&mut session);
+        cleanup_recording_artifacts(&session);
+    }
+
+    if let Ok(mut workers) = data.worker_threads.lock() {
+        for worker in workers.drain(..) {
+            let _ = worker.join();
+        }
+    }
+    if let Ok(mut meters) = data.meter_threads.lock() {
+        for meter in meters.drain(..) {
+            let _ = meter.join();
+        }
+    };
+}
+
+fn track_thread(
+    threads: &Mutex<Vec<thread::JoinHandle<()>>>,
+    thread: thread::JoinHandle<()>,
+) -> Result<(), String> {
+    let mut tracked = threads.lock().map_err(|error| error.to_string())?;
+    tracked.retain(|thread| !thread.is_finished());
+    tracked.push(thread);
+    Ok(())
+}
+
 pub fn run() {
-    tauri::Builder::default()
+    let app = tauri::Builder::default()
         .plugin(tauri_plugin_global_shortcut::Builder::new().build())
         .plugin(tauri_plugin_clipboard_manager::init())
         .plugin(tauri_plugin_process::init())
@@ -2404,6 +2553,9 @@ pub fn run() {
             diagnostics_cache: Mutex::new(None),
             history: Mutex::new(()),
             insertion: Mutex::new(()),
+            shutdown: Arc::new(AtomicBool::new(false)),
+            worker_threads: Mutex::new(Vec::new()),
+            meter_threads: Mutex::new(Vec::new()),
         })
         .invoke_handler(tauri::generate_handler![
             get_app_state,
@@ -2438,8 +2590,16 @@ pub fn run() {
             }
             Ok(())
         })
-        .run(tauri::generate_context!())
-        .expect("error while running VibeVoice");
+        .build(tauri::generate_context!())
+        .expect("error while building VibeVoice");
+    app.run(|app, event| {
+        if matches!(
+            event,
+            tauri::RunEvent::ExitRequested { .. } | tauri::RunEvent::Exit
+        ) {
+            shutdown_app(app);
+        }
+    });
 }
 
 #[cfg(test)]
@@ -2630,6 +2790,18 @@ mod tests {
 
         assert!(error.contains("timed out"));
         assert!(started.elapsed() < Duration::from_millis(500));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn shutdown_cancels_and_reaps_transcription_child() {
+        let mut child = Command::new("sleep").arg("1").spawn().unwrap();
+        let shutdown = AtomicBool::new(true);
+
+        let error = wait_for_child(&mut child, &shutdown).unwrap_err();
+
+        assert!(error.contains("cancelled during shutdown"));
+        assert!(child.try_wait().unwrap().is_some());
     }
 
     #[test]
