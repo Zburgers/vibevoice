@@ -14,7 +14,7 @@ use std::{
     process::{Child, Command, ExitStatus, Stdio},
     str::FromStr,
     sync::{
-        atomic::{AtomicBool, AtomicU32, Ordering},
+        atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering},
         Arc, Mutex,
     },
     thread::{self},
@@ -276,6 +276,13 @@ struct RuntimeState {
     last_transcript: Option<String>,
     last_error: Option<String>,
     mic_level: f32,
+    /// Identity of the in-flight preparation, if any (#50).
+    ///
+    /// Every `begin_recording` allocates a fresh generation. A stop (or
+    /// shutdown) during `Preparing` clears this slot, which invalidates the
+    /// outstanding start: the late worker must discard its session instead of
+    /// installing it, even if audio resources were already acquired.
+    preparing_generation: Option<u64>,
 }
 
 impl Default for RuntimeState {
@@ -286,6 +293,7 @@ impl Default for RuntimeState {
             last_transcript: None,
             last_error: None,
             mic_level: 0.0,
+            preparing_generation: None,
         }
     }
 }
@@ -321,6 +329,9 @@ struct AppData {
     transcription_cancel: Mutex<Option<Arc<AtomicBool>>>,
     worker_threads: Mutex<Vec<thread::JoinHandle<()>>>,
     meter_threads: Mutex<Vec<thread::JoinHandle<()>>>,
+    /// Monotonic allocator for recording-start identities (#50). Never zero
+    /// for an allocated generation; `0` means "no generation".
+    preparation_counter: AtomicU64,
 }
 
 fn authorize_window(window: &WebviewWindow, allowed: &[&str]) -> Result<(), String> {
@@ -450,30 +461,88 @@ fn start_recording_impl(app: AppHandle, data: tauri::State<'_, AppData>) -> Resu
     begin_recording(app, data)
 }
 
+/// Allocate a fresh, never-zero preparation identity (#50).
+fn next_preparation_generation(counter: &AtomicU64) -> u64 {
+    // `fetch_add` returns the previous value; add one so the allocated id is
+    // never zero (`0` is reserved for "no generation"). Wrapping is
+    // acceptable: the counter is only compared for equality against the single
+    // currently-valid slot, and allocation happens under the lifecycle lock.
+    let next = counter.fetch_add(1, Ordering::Relaxed).wrapping_add(1);
+    if next == 0 {
+        counter.fetch_add(1, Ordering::Relaxed).wrapping_add(1)
+    } else {
+        next
+    }
+}
+
+/// Attempt to claim the `Preparing` slot for `generation`.
+///
+/// Must be called with the lifecycle lock held and without holding the runtime
+/// lock across any blocking audio work (callers only mutate state here).
+fn try_claim_preparation_slot(runtime: &mut RuntimeState, generation: u64) -> Result<(), String> {
+    match runtime.voice_state {
+        VoiceState::Preparing => return Err("Recording is still starting.".to_string()),
+        VoiceState::Recording => return Err("Recording is already active.".to_string()),
+        VoiceState::Processing => {
+            return Err("Recording is still processing. Please wait.".to_string())
+        }
+        _ => {}
+    }
+    runtime.voice_state = VoiceState::Preparing;
+    runtime.last_error = None;
+    runtime.mic_level = 0.0;
+    runtime.recording = None;
+    runtime.preparing_generation = Some(generation);
+    Ok(())
+}
+
+/// Cancel an in-flight preparation for the stop-during-Preparing path (#50).
+///
+/// Returns the invalidated generation, if any. The late worker holding that
+/// generation must discard its session (stopping/cleaning audio resources if
+/// they were already acquired) and must never install itself or touch state.
+fn cancel_preparation_for_stop(runtime: &mut RuntimeState) -> Option<u64> {
+    if !matches!(runtime.voice_state, VoiceState::Preparing) {
+        return None;
+    }
+    let generation = runtime.preparing_generation.take();
+    runtime.voice_state = VoiceState::Ready;
+    runtime.last_error = None;
+    runtime.mic_level = 0.0;
+    runtime.recording = None;
+    generation
+}
+
+/// True only when `generation` is still the valid in-flight preparation.
+fn is_preparation_current(runtime: &RuntimeState, generation: u64) -> bool {
+    matches!(runtime.voice_state, VoiceState::Preparing)
+        && runtime.preparing_generation == Some(generation)
+}
+
+/// Invalidate any outstanding preparation (shutdown path, #50).
+fn invalidate_preparation(runtime: &mut RuntimeState) {
+    runtime.preparing_generation = None;
+}
+
 fn begin_recording(app: AppHandle, data: tauri::State<'_, AppData>) -> Result<(), String> {
     let lifecycle = data.lifecycle.lock().map_err(|error| error.to_string())?;
     if data.shutdown.load(Ordering::Acquire) {
         return Err("VibeVoice is shutting down.".to_string());
     }
+    // Each start owns a fresh identity. The generation is allocated up front
+    // so stop/shutdown can invalidate this exact start even while audio
+    // initialization is still blocking off-lock.
+    let generation = next_preparation_generation(&data.preparation_counter);
     {
         let mut runtime = data.runtime.lock().map_err(|error| error.to_string())?;
-        match runtime.voice_state {
-            VoiceState::Preparing => return Err("Recording is still starting.".to_string()),
-            VoiceState::Recording => return Err("Recording is already active.".to_string()),
-            VoiceState::Processing => {
-                return Err("Recording is still processing. Please wait.".to_string())
-            }
-            _ => {}
-        }
-        runtime.voice_state = VoiceState::Preparing;
-        runtime.last_error = None;
-        runtime.mic_level = 0.0;
-        runtime.recording = None;
+        try_claim_preparation_slot(&mut runtime, generation)?;
     }
     let app_handle = app.clone();
     let shutdown = Arc::clone(&data.shutdown);
     let worker = thread::spawn(move || match prepare_recording_session(&app_handle) {
         Ok(mut session) => {
+            // Shutdown invalidates every outstanding preparation. Stop any
+            // acquired audio resources immediately and never install.
             if shutdown.load(Ordering::Acquire) {
                 let _ = stop_audio_capture(&mut session);
                 cleanup_recording_artifacts(&session);
@@ -490,10 +559,18 @@ fn begin_recording(app: AppHandle, data: tauri::State<'_, AppData>) -> Result<()
                     return;
                 }
             };
-            if !matches!(runtime.voice_state, VoiceState::Preparing) {
+            // A cancelled (or superseded) preparation may never install
+            // itself. If audio resources were already acquired, stop and clean
+            // them immediately without touching the current state, so
+            // start → stop → start cannot let the first generation corrupt
+            // the second.
+            if !is_preparation_current(&runtime, generation) {
+                drop(runtime);
                 let _ = stop_audio_capture(&mut session);
+                cleanup_recording_artifacts(&session);
                 return;
             }
+            runtime.preparing_generation = None;
             runtime.voice_state = VoiceState::Recording;
             runtime.last_error = None;
             runtime.mic_level = 0.0;
@@ -509,7 +586,21 @@ fn begin_recording(app: AppHandle, data: tauri::State<'_, AppData>) -> Result<()
                 return;
             }
             let data = app_handle.state::<AppData>();
-            let _ = set_runtime_error(&data, &error);
+            let mut runtime = match data.runtime.lock() {
+                Ok(runtime) => runtime,
+                Err(_) => return,
+            };
+            // A failed preparation after cancellation (or after a newer start
+            // claimed the slot) remains harmless: leave the current state
+            // alone instead of overwriting it with a stale error.
+            if !is_preparation_current(&runtime, generation) {
+                return;
+            }
+            runtime.preparing_generation = None;
+            runtime.voice_state = VoiceState::Error;
+            runtime.last_error = Some(error);
+            runtime.mic_level = 0.0;
+            drop(runtime);
             emit_state_changed(&app_handle);
         }
     });
@@ -552,24 +643,28 @@ async fn stop_recording_impl(
     }
     let mut session = {
         let mut runtime = data.runtime.lock().map_err(|error| error.to_string())?;
+        // Stop during Preparing (#50): invalidate the outstanding start and
+        // report success. The late preparation worker owns `generation` and
+        // will stop/clean any already-acquired audio resources without ever
+        // installing itself as the active session.
+        if matches!(runtime.voice_state, VoiceState::Preparing) && runtime.recording.is_none() {
+            cancel_preparation_for_stop(&mut runtime);
+            drop(runtime);
+            drop(lifecycle);
+            emit_state_changed(&app);
+            return Ok(());
+        }
         match runtime.recording.take() {
             Some(session) => {
+                runtime.preparing_generation = None;
                 runtime.voice_state = VoiceState::Processing;
                 session
             }
             None => {
-                let message = if matches!(runtime.voice_state, VoiceState::Preparing) {
-                    "Recording is still starting. Try stopping again in a moment."
-                } else {
-                    "No active recording to stop."
-                };
-                runtime.voice_state = if matches!(runtime.voice_state, VoiceState::Preparing) {
-                    VoiceState::Preparing
-                } else {
-                    VoiceState::Ready
-                };
-                runtime.last_error = Some(message.to_string());
-                return Err(message.to_string());
+                let message = "No active recording to stop.".to_string();
+                runtime.voice_state = VoiceState::Ready;
+                runtime.last_error = Some(message.clone());
+                return Err(message);
             }
         }
     };
@@ -2135,6 +2230,10 @@ fn start_audio_capture_impl(
     })?;
     let mut recorder = Command::new(command);
     configure_command(&mut recorder);
+    // Isolate the recorder in its own process group (#51) so shutdown can
+    // terminate the whole tree (recorder plus any grandchildren) without
+    // touching VibeVoice itself. Mirrors the transcription path.
+    configure_process_group(&mut recorder);
     let child = recorder
         .args(args)
         .arg(&audio_path)
@@ -2289,6 +2388,10 @@ fn recorder_command() -> Option<(&'static str, &'static [&'static str])> {
 
 #[cfg(target_os = "linux")]
 fn stop_linux_recorder(child: &mut Child) -> Result<(), String> {
+    // Graceful stop first so the recorder can finalize the WAV header, then
+    // force-kill the whole process group so an unresponsive (SIGINT-ignoring)
+    // recorder — and any grandchildren — can never survive shutdown (#51).
+    // The child is always reaped (`wait`) on every path, leaving no zombie.
     let pid = child.id() as i32;
     unsafe {
         let _ = libc::kill(pid, libc::SIGINT);
@@ -2299,14 +2402,21 @@ fn stop_linux_recorder(child: &mut Child) -> Result<(), String> {
             .map_err(|error| error.to_string())?
             .is_some()
         {
+            // The leader exited gracefully, but forked grandchildren may still
+            // be alive in the recorder's private process group (see
+            // `start_audio_capture_impl`). Sweep the group best-effort so no
+            // recorder descendant survives shutdown; ESRCH (group already
+            // gone) is the expected common case and is ignored.
+            unsafe {
+                let _ = libc::kill(-pid, libc::SIGKILL);
+            }
             return Ok(());
         }
         thread::sleep(std::time::Duration::from_millis(100));
     }
-    child
-        .kill()
-        .map_err(|error| format!("Failed to stop recorder: {error}"))?;
-    let _ = child.wait();
+    if let Some(cleanup_error) = terminate_process_tree(child) {
+        return Err(format!("Failed to stop recorder. {cleanup_error}"));
+    }
     Ok(())
 }
 
@@ -2802,12 +2912,19 @@ fn register_hotkey_handler(app: &AppHandle, shortcut: Shortcut) -> Result<(), St
                 return;
             }
             let state = app_handle.state::<AppData>();
-            let is_recording = state
+            // Fast toggle during Preparing cancels the in-flight start (#50):
+            // both Recording and Preparing route to stop.
+            let should_stop = state
                 .runtime
                 .lock()
-                .map(|runtime| matches!(runtime.voice_state, VoiceState::Recording))
+                .map(|runtime| {
+                    matches!(
+                        runtime.voice_state,
+                        VoiceState::Recording | VoiceState::Preparing
+                    )
+                })
                 .unwrap_or(false);
-            if is_recording {
+            if should_stop {
                 let app_for_stop = app_handle.clone();
                 async_runtime::spawn(async move {
                     let state = app_for_stop.state::<AppData>();
@@ -2852,12 +2969,18 @@ fn toggle_window(app: &AppHandle, label: &str) {
 
 fn toggle_recording(app: &AppHandle) {
     let state = app.state::<AppData>();
-    let is_recording = state
+    // Fast toggle during Preparing cancels the in-flight start (#50).
+    let should_stop = state
         .runtime
         .lock()
-        .map(|runtime| matches!(runtime.voice_state, VoiceState::Recording))
+        .map(|runtime| {
+            matches!(
+                runtime.voice_state,
+                VoiceState::Recording | VoiceState::Preparing
+            )
+        })
         .unwrap_or(false);
-    if is_recording {
+    if should_stop {
         let app_for_stop = app.clone();
         async_runtime::spawn(async move {
             let state = app_for_stop.state::<AppData>();
@@ -2923,6 +3046,16 @@ fn setup_tray(app: &AppHandle) -> Result<(), String> {
         .map_err(|error| error.to_string())
 }
 
+/// Shared shutdown/stop cleanup for an installed session (#51).
+///
+/// Stops audio capture (terminating and reaping the Linux recorder child)
+/// and removes the temporary wav/partial-txt artifacts. Never holds the
+/// runtime mutex: callers must take the session out of `RuntimeState` first.
+fn shutdown_recording_session(session: &mut RecordingSession) {
+    let _ = stop_audio_capture(session);
+    cleanup_recording_artifacts(session);
+}
+
 fn shutdown_app(app: &AppHandle) {
     let data = app.state::<AppData>();
     let Ok(lifecycle) = data.lifecycle.lock() else {
@@ -2932,13 +3065,17 @@ fn shutdown_app(app: &AppHandle) {
         return;
     }
 
+    // Invalidate any outstanding preparation (#50) so a late worker can never
+    // install itself after shutdown, then take the installed session (if any)
+    // without holding the runtime lock across blocking audio termination.
     let session = data.runtime.lock().ok().and_then(|mut runtime| {
+        invalidate_preparation(&mut runtime);
         runtime.voice_state = VoiceState::Ready;
+        runtime.last_error = None;
         runtime.recording.take()
     });
     if let Some(mut session) = session {
-        let _ = stop_audio_capture(&mut session);
-        cleanup_recording_artifacts(&session);
+        shutdown_recording_session(&mut session);
     }
 
     if let Ok(mut workers) = data.worker_threads.lock() {
@@ -2983,6 +3120,7 @@ pub fn run() {
             transcription_cancel: Mutex::new(None),
             worker_threads: Mutex::new(Vec::new()),
             meter_threads: Mutex::new(Vec::new()),
+            preparation_counter: AtomicU64::new(0),
         })
         .invoke_handler(tauri::generate_handler![
             get_app_state,
@@ -4087,6 +4225,670 @@ mod tests {
             let mode = fs::metadata(&path).unwrap().mode() & 0o777;
             assert_eq!(mode, 0o700);
         }
+    }
+
+    // ---- WP4 #50: pending-start ownership / cancellation ---- //
+    //
+    // These tests exercise the production helpers
+    // (`next_preparation_generation`, `try_claim_preparation_slot`,
+    // `cancel_preparation_for_stop`, `is_preparation_current`,
+    // `invalidate_preparation`) with deterministic gating (mpsc channels and
+    // barriers) rather than timing luck. The "worker" closures below mirror
+    // the exact decision sequence in `begin_recording`'s spawned thread:
+    // shutdown check → lock → `is_preparation_current` → install or
+    // stop-and-clean without touching state.
+
+    fn wp4_begin(
+        runtime: &Mutex<RuntimeState>,
+        counter: &AtomicU64,
+        shutdown: &AtomicBool,
+    ) -> Result<u64, String> {
+        if shutdown.load(Ordering::Acquire) {
+            return Err("VibeVoice is shutting down.".to_string());
+        }
+        let generation = next_preparation_generation(counter);
+        let mut state = runtime.lock().unwrap();
+        try_claim_preparation_slot(&mut state, generation)?;
+        Ok(generation)
+    }
+
+    /// Mirror of the `Ok(session)` branch in `begin_recording`.
+    /// `resource_live` stands in for acquired audio resources: `true` means
+    /// the fake device/child is held, and discarding must stop it.
+    /// Returns `true` when the session was installed as Recording.
+    fn wp4_worker_ok(
+        runtime: &Mutex<RuntimeState>,
+        shutdown: &AtomicBool,
+        generation: u64,
+        resource_live: &AtomicBool,
+    ) -> bool {
+        if shutdown.load(Ordering::Acquire) {
+            resource_live.store(false, Ordering::Relaxed);
+            return false;
+        }
+        let mut state = runtime.lock().unwrap();
+        if !is_preparation_current(&state, generation) {
+            drop(state);
+            resource_live.store(false, Ordering::Relaxed);
+            return false;
+        }
+        state.preparing_generation = None;
+        state.voice_state = VoiceState::Recording;
+        state.last_error = None;
+        true
+    }
+
+    /// Mirror of the `Err(error)` branch in `begin_recording`.
+    /// Returns `true` when the error was reported (state → Error).
+    fn wp4_worker_err(
+        runtime: &Mutex<RuntimeState>,
+        shutdown: &AtomicBool,
+        generation: u64,
+        message: &str,
+    ) -> bool {
+        if shutdown.load(Ordering::Acquire) {
+            return false;
+        }
+        let mut state = runtime.lock().unwrap();
+        if !is_preparation_current(&state, generation) {
+            return false;
+        }
+        state.preparing_generation = None;
+        state.voice_state = VoiceState::Error;
+        state.last_error = Some(message.to_string());
+        true
+    }
+
+    #[test]
+    fn wp4_start_then_immediate_stop_cancels_preparation() {
+        let runtime = Mutex::new(RuntimeState::default());
+        let counter = AtomicU64::new(0);
+        let shutdown = AtomicBool::new(false);
+
+        let generation = wp4_begin(&runtime, &counter, &shutdown).unwrap();
+        assert!(generation != 0);
+        {
+            let state = runtime.lock().unwrap();
+            assert!(matches!(state.voice_state, VoiceState::Preparing));
+            assert_eq!(state.preparing_generation, Some(generation));
+        }
+        // Stop during Preparing invalidates that exact start and reports
+        // success (no "still starting" rejection).
+        let cancelled = cancel_preparation_for_stop(&mut runtime.lock().unwrap());
+        assert_eq!(cancelled, Some(generation));
+        {
+            let state = runtime.lock().unwrap();
+            assert!(matches!(state.voice_state, VoiceState::Ready));
+            assert_eq!(state.preparing_generation, None);
+            assert!(state.recording.is_none());
+        }
+        // The late preparation must never install itself; acquired resources
+        // are stopped immediately.
+        let resource_live = AtomicBool::new(true);
+        assert!(!wp4_worker_ok(
+            &runtime,
+            &shutdown,
+            generation,
+            &resource_live
+        ));
+        assert!(!resource_live.load(Ordering::Relaxed));
+        let state = runtime.lock().unwrap();
+        assert!(matches!(state.voice_state, VoiceState::Ready));
+    }
+
+    #[test]
+    fn wp4_stop_before_preparation_completes_discards_late_session() {
+        let runtime = Arc::new(Mutex::new(RuntimeState::default()));
+        let counter = AtomicU64::new(0);
+        let shutdown = Arc::new(AtomicBool::new(false));
+
+        let generation = wp4_begin(&runtime, &counter, &shutdown).unwrap();
+        // Gate preparation completion deterministically: the worker blocks on
+        // `gate` until the test has performed the stop.
+        let (gate_tx, gate_rx) = std::sync::mpsc::channel::<()>();
+        let (done_tx, done_rx) = std::sync::mpsc::channel::<(bool, bool)>();
+        let worker_runtime = Arc::clone(&runtime);
+        let worker_shutdown = Arc::clone(&shutdown);
+        let worker = thread::spawn(move || {
+            gate_rx.recv().unwrap();
+            let resource_live = AtomicBool::new(true);
+            let installed = wp4_worker_ok(
+                &worker_runtime,
+                &worker_shutdown,
+                generation,
+                &resource_live,
+            );
+            done_tx
+                .send((installed, resource_live.load(Ordering::Relaxed)))
+                .unwrap();
+        });
+
+        // Stop while the preparation is still gated (blocked).
+        let cancelled = cancel_preparation_for_stop(&mut runtime.lock().unwrap());
+        assert_eq!(cancelled, Some(generation));
+        // Now let the preparation finish late: it must be discarded.
+        gate_tx.send(()).unwrap();
+        let (installed, resource_live) = done_rx.recv().unwrap();
+        worker.join().unwrap();
+        assert!(!installed, "cancelled preparation installed itself");
+        assert!(!resource_live, "acquired audio resources were not stopped");
+        let state = runtime.lock().unwrap();
+        assert!(matches!(state.voice_state, VoiceState::Ready));
+        assert_eq!(state.preparing_generation, None);
+    }
+
+    #[test]
+    fn wp4_start_stop_start_second_generation_wins() {
+        let runtime = Mutex::new(RuntimeState::default());
+        let counter = AtomicU64::new(0);
+        let shutdown = AtomicBool::new(false);
+
+        let first = wp4_begin(&runtime, &counter, &shutdown).unwrap();
+        cancel_preparation_for_stop(&mut runtime.lock().unwrap());
+        let second = wp4_begin(&runtime, &counter, &shutdown).unwrap();
+        assert_ne!(first, second, "each start must have a distinct identity");
+        {
+            let state = runtime.lock().unwrap();
+            assert_eq!(state.preparing_generation, Some(second));
+        }
+        // First generation completes late: must not corrupt the second.
+        let stale_resource = AtomicBool::new(true);
+        assert!(!wp4_worker_ok(&runtime, &shutdown, first, &stale_resource));
+        assert!(!stale_resource.load(Ordering::Relaxed));
+        {
+            let state = runtime.lock().unwrap();
+            assert!(matches!(state.voice_state, VoiceState::Preparing));
+            assert_eq!(state.preparing_generation, Some(second));
+        }
+        // Second generation completes: installs normally.
+        let current_resource = AtomicBool::new(true);
+        assert!(wp4_worker_ok(
+            &runtime,
+            &shutdown,
+            second,
+            &current_resource
+        ));
+        assert!(current_resource.load(Ordering::Relaxed));
+        let state = runtime.lock().unwrap();
+        assert!(matches!(state.voice_state, VoiceState::Recording));
+        assert_eq!(state.preparing_generation, None);
+    }
+
+    #[test]
+    fn wp4_first_preparation_completes_after_second_start_is_discarded() {
+        // Deterministic out-of-order completion via two gates: both
+        // preparations are in-flight, gen1 finishes after gen2 started, and
+        // gen1 must still be discarded while gen2 installs.
+        let runtime = Arc::new(Mutex::new(RuntimeState::default()));
+        let counter = AtomicU64::new(0);
+        let shutdown = Arc::new(AtomicBool::new(false));
+
+        let first = wp4_begin(&runtime, &counter, &shutdown).unwrap();
+        cancel_preparation_for_stop(&mut runtime.lock().unwrap());
+        let second = wp4_begin(&runtime, &counter, &shutdown).unwrap();
+
+        let (first_gate_tx, first_gate_rx) = std::sync::mpsc::channel::<()>();
+        let (second_gate_tx, second_gate_rx) = std::sync::mpsc::channel::<()>();
+        let (result_tx, result_rx) = std::sync::mpsc::channel::<(u64, bool)>();
+
+        for (generation, gate) in [(first, first_gate_rx), (second, second_gate_rx)] {
+            let worker_runtime = Arc::clone(&runtime);
+            let worker_shutdown = Arc::clone(&shutdown);
+            let result_tx = result_tx.clone();
+            thread::spawn(move || {
+                gate.recv().unwrap();
+                let resource = AtomicBool::new(true);
+                let installed =
+                    wp4_worker_ok(&worker_runtime, &worker_shutdown, generation, &resource);
+                result_tx.send((generation, installed)).unwrap();
+            });
+        }
+        // Complete the FIRST generation while the second is still valid.
+        first_gate_tx.send(()).unwrap();
+        let (completed, installed) = result_rx.recv().unwrap();
+        assert_eq!(completed, first);
+        assert!(!installed, "stale first generation installed itself");
+        {
+            let state = runtime.lock().unwrap();
+            assert_eq!(state.preparing_generation, Some(second));
+            assert!(matches!(state.voice_state, VoiceState::Preparing));
+        }
+        // Then complete the second generation: it installs.
+        second_gate_tx.send(()).unwrap();
+        let (completed, installed) = result_rx.recv().unwrap();
+        assert_eq!(completed, second);
+        assert!(installed);
+        let state = runtime.lock().unwrap();
+        assert!(matches!(state.voice_state, VoiceState::Recording));
+    }
+
+    #[test]
+    fn wp4_preparation_failure_after_cancellation_is_harmless() {
+        let runtime = Mutex::new(RuntimeState::default());
+        let counter = AtomicU64::new(0);
+        let shutdown = AtomicBool::new(false);
+
+        let generation = wp4_begin(&runtime, &counter, &shutdown).unwrap();
+        cancel_preparation_for_stop(&mut runtime.lock().unwrap());
+        // Failed preparation after cancellation must not overwrite Ready.
+        assert!(!wp4_worker_err(
+            &runtime,
+            &shutdown,
+            generation,
+            "microphone unavailable"
+        ));
+        {
+            let state = runtime.lock().unwrap();
+            assert!(matches!(state.voice_state, VoiceState::Ready));
+            assert_eq!(state.last_error, None);
+        }
+
+        // A failure for the CURRENT generation still reports normally.
+        let current = wp4_begin(&runtime, &counter, &shutdown).unwrap();
+        assert!(wp4_worker_err(
+            &runtime,
+            &shutdown,
+            current,
+            "microphone unavailable"
+        ));
+        {
+            let state = runtime.lock().unwrap();
+            assert!(matches!(state.voice_state, VoiceState::Error));
+            assert_eq!(state.last_error.as_deref(), Some("microphone unavailable"));
+        }
+    }
+
+    #[test]
+    fn wp4_shutdown_during_preparation_invalidates_and_discards() {
+        let runtime = Arc::new(Mutex::new(RuntimeState::default()));
+        let counter = AtomicU64::new(0);
+        let shutdown = Arc::new(AtomicBool::new(false));
+
+        let generation = wp4_begin(&runtime, &counter, &shutdown).unwrap();
+        let (gate_tx, gate_rx) = std::sync::mpsc::channel::<()>();
+        let (done_tx, done_rx) = std::sync::mpsc::channel::<bool>();
+        let worker_runtime = Arc::clone(&runtime);
+        let worker_shutdown = Arc::clone(&shutdown);
+        let worker = thread::spawn(move || {
+            gate_rx.recv().unwrap();
+            let resource_live = AtomicBool::new(true);
+            let installed = wp4_worker_ok(
+                &worker_runtime,
+                &worker_shutdown,
+                generation,
+                &resource_live,
+            );
+            done_tx.send(installed).unwrap();
+        });
+
+        // Shutdown invalidates outstanding preparation (mirrors shutdown_app).
+        shutdown.store(true, Ordering::Release);
+        invalidate_preparation(&mut runtime.lock().unwrap());
+        {
+            let mut state = runtime.lock().unwrap();
+            state.voice_state = VoiceState::Ready;
+        }
+        gate_tx.send(()).unwrap();
+        assert!(!done_rx.recv().unwrap());
+        worker.join().unwrap();
+        let state = runtime.lock().unwrap();
+        assert!(matches!(state.voice_state, VoiceState::Ready));
+        assert_eq!(state.preparing_generation, None);
+        // New starts are rejected while shut down.
+        assert!(wp4_begin(&runtime, &counter, &shutdown).is_err());
+    }
+
+    #[test]
+    fn wp4_repeated_fast_toggles_are_safe() {
+        // Sequential rapid toggle storm: start → cancel × N leaves a clean
+        // Ready state with no stuck generation, and the next real start still
+        // installs.
+        let runtime = Mutex::new(RuntimeState::default());
+        let counter = AtomicU64::new(0);
+        let shutdown = AtomicBool::new(false);
+        let mut seen = Vec::new();
+        for _ in 0..50 {
+            let generation = wp4_begin(&runtime, &counter, &shutdown).unwrap();
+            seen.push(generation);
+            let cancelled = cancel_preparation_for_stop(&mut runtime.lock().unwrap());
+            assert_eq!(cancelled, Some(generation));
+            // Late worker for the just-cancelled start is always discarded.
+            let resource = AtomicBool::new(true);
+            assert!(!wp4_worker_ok(&runtime, &shutdown, generation, &resource));
+        }
+        // Generations are unique across the storm.
+        let mut sorted = seen.clone();
+        sorted.sort_unstable();
+        sorted.dedup();
+        assert_eq!(sorted.len(), seen.len());
+        {
+            let state = runtime.lock().unwrap();
+            assert!(matches!(state.voice_state, VoiceState::Ready));
+            assert_eq!(state.preparing_generation, None);
+        }
+        let fresh = wp4_begin(&runtime, &counter, &shutdown).unwrap();
+        let resource = AtomicBool::new(true);
+        assert!(wp4_worker_ok(&runtime, &shutdown, fresh, &resource));
+        assert!(matches!(
+            runtime.lock().unwrap().voice_state,
+            VoiceState::Recording
+        ));
+
+        // Concurrent toggle storm with a deterministic barrier: N threads
+        // race begin/cancel pairs against a shared runtime. Exactly the
+        // thread that still owns the slot may install; the test only asserts
+        // global safety (no panic, no stuck Preparing-with-None, state is a
+        // single valid variant), which is the toggle-safety contract.
+        let runtime = Arc::new(Mutex::new(RuntimeState::default()));
+        let counter = Arc::new(AtomicU64::new(0));
+        let shutdown = Arc::new(AtomicBool::new(false));
+        let barrier = Arc::new(std::sync::Barrier::new(8));
+        let mut handles = Vec::new();
+        for _ in 0..8 {
+            let runtime = Arc::clone(&runtime);
+            let counter = Arc::clone(&counter);
+            let shutdown = Arc::clone(&shutdown);
+            let barrier = Arc::clone(&barrier);
+            handles.push(thread::spawn(move || {
+                barrier.wait();
+                for _ in 0..25 {
+                    let Ok(generation) = wp4_begin(&runtime, &counter, &shutdown) else {
+                        // Another thread owns Preparing; treat toggle as stop.
+                        cancel_preparation_for_stop(&mut runtime.lock().unwrap());
+                        continue;
+                    };
+                    let resource = AtomicBool::new(true);
+                    // Randomly cancel or complete; both paths are safe.
+                    if generation % 2 == 0 {
+                        cancel_preparation_for_stop(&mut runtime.lock().unwrap());
+                        assert!(!wp4_worker_ok(&runtime, &shutdown, generation, &resource));
+                    } else {
+                        let _ = wp4_worker_ok(&runtime, &shutdown, generation, &resource);
+                        cancel_preparation_for_stop(&mut runtime.lock().unwrap());
+                    }
+                }
+            }));
+        }
+        for handle in handles {
+            handle.join().unwrap();
+        }
+        let state = runtime.lock().unwrap();
+        // Either Ready (cancelled last) or Recording/Preparing with a matching
+        // generation — never a stuck Preparing with no owner.
+        match state.voice_state {
+            VoiceState::Preparing => assert!(state.preparing_generation.is_some()),
+            VoiceState::Recording | VoiceState::Ready => {}
+            _ => panic!("unexpected terminal state after toggle storm"),
+        }
+    }
+
+    #[test]
+    fn wp4_generations_are_unique_and_never_zero() {
+        let counter = AtomicU64::new(0);
+        let mut seen = std::collections::HashSet::new();
+        for _ in 0..100 {
+            let generation = next_preparation_generation(&counter);
+            assert_ne!(generation, 0);
+            assert!(seen.insert(generation));
+        }
+    }
+
+    // ---- WP4 #51: Linux recorder must not survive shutdown ---- //
+    //
+    // PR #58 introduced the shutdown path; these fixture tests prove the
+    // remaining behavior instead of rewriting it. Fixtures spawn
+    // recorder-like children with the SAME spawn properties as the app
+    // (null stdio, isolated process group via `configure_process_group`) and
+    // exercise them through the SAME teardown (`stop_linux_recorder` /
+    // `shutdown_recording_session`) used by `shutdown_app`. Every test ends
+    // with the child terminated AND reaped (no zombie, no survivor).
+
+    #[cfg(target_os = "linux")]
+    fn wp4_spawn_fixture_child(script: &str) -> Child {
+        let mut command = Command::new("sh");
+        configure_command(&mut command);
+        configure_process_group(&mut command);
+        command
+            .args(["-c", script])
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("recorder fixture spawns")
+    }
+
+    #[cfg(target_os = "linux")]
+    fn wp4_assert_reaped(child: &mut Child, pid: i32, context: &str) {
+        assert!(
+            child.try_wait().unwrap().is_some(),
+            "{context}: fixture child was reaped, no zombie left"
+        );
+        assert!(
+            process_state_is_dead(pid),
+            "{context}: fixture child {pid} did not survive"
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    fn wp4_fixture_session(dir: &Path, stem: &str, child: Child) -> RecordingSession {
+        fs::write(dir.join(format!("{stem}.wav")), b"fake-audio").unwrap();
+        fs::write(dir.join(format!("{stem}.txt")), b"partial").unwrap();
+        RecordingSession {
+            audio_path: dir.join(format!("{stem}.wav")),
+            output_prefix: dir.join(stem),
+            started: Instant::now(),
+            started_at: Utc::now(),
+            recorder_process: child,
+            mic_level: Arc::new(AtomicU32::new(0)),
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn wp4_recorder_fixture_normal_exit_is_reaped() {
+        // Normal recorder: terminates on graceful SIGINT and is reaped.
+        let mut child = wp4_spawn_fixture_child("sleep 30");
+        let pid = child.id() as i32;
+        assert!(pid > 0, "fixture pid captured");
+
+        stop_linux_recorder(&mut child).expect("graceful stop succeeds");
+        wp4_assert_reaped(&mut child, pid, "normal recorder");
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn wp4_recorder_fixture_ignoring_sigint_requires_force_kill() {
+        // Stubborn recorder: ignores SIGINT, so the graceful phase cannot
+        // reap it and the force-kill (process-group SIGKILL + wait) path must
+        // terminate and reap it. Deterministic: only the final state is
+        // asserted, not timing.
+        //
+        // `trap '' INT` marks SIGINT ignored, and `exec` preserves ignored
+        // dispositions across the image replacement (POSIX), so the `sleep`
+        // process itself ignores the graceful SIGINT and only the SIGKILL
+        // fallback can reap it.
+        let mut child = wp4_spawn_fixture_child("trap '' INT; exec sleep 30");
+        let pid = child.id() as i32;
+
+        stop_linux_recorder(&mut child).expect("force kill stops SIGINT-ignoring child");
+        wp4_assert_reaped(&mut child, pid, "sigint-ignoring recorder");
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn wp4_shutdown_during_recording_terminates_and_reaps_child() {
+        // Installed Recording + application shutdown path: the exact helper
+        // `shutdown_app` uses (`shutdown_recording_session`) must terminate
+        // and reap the child and remove temp artifacts.
+        let dir =
+            std::env::temp_dir().join(format!("vibevoice-wp4-shutdown-rec-{}", Uuid::new_v4()));
+        fs::create_dir_all(&dir).unwrap();
+        let child = wp4_spawn_fixture_child("sleep 30");
+        let mut session = wp4_fixture_session(&dir, "recording-fixture", child);
+        let pid = session.recorder_process.id() as i32;
+
+        shutdown_recording_session(&mut session);
+        wp4_assert_reaped(
+            &mut session.recorder_process,
+            pid,
+            "shutdown during Recording",
+        );
+        assert!(
+            !session.audio_path.exists(),
+            "recording wav removed on shutdown"
+        );
+        assert!(
+            !session.output_prefix.with_extension("txt").exists(),
+            "partial transcript removed on shutdown"
+        );
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn wp4_shutdown_during_preparing_never_installs_and_kills_child() {
+        // Preparation in-flight + shutdown: the child is acquired in a gated
+        // worker thread, shutdown invalidates the generation, and the late
+        // worker must discard (kill + never install).
+        let runtime = Arc::new(Mutex::new(RuntimeState::default()));
+        let counter = AtomicU64::new(0);
+        let shutdown = Arc::new(AtomicBool::new(false));
+        let dir =
+            std::env::temp_dir().join(format!("vibevoice-wp4-shutdown-prep-{}", Uuid::new_v4()));
+        fs::create_dir_all(&dir).unwrap();
+
+        let generation = wp4_begin(&runtime, &counter, &shutdown).unwrap();
+        let (gate_tx, gate_rx) = std::sync::mpsc::channel::<()>();
+        let (done_tx, done_rx) = std::sync::mpsc::channel::<(bool, i32)>();
+        let worker_runtime = Arc::clone(&runtime);
+        let worker_shutdown = Arc::clone(&shutdown);
+        let dir_clone = dir.clone();
+        let worker = thread::spawn(move || {
+            gate_rx.recv().unwrap();
+            // Acquire audio resources AFTER the gate, like a slow prepare.
+            let child = wp4_spawn_fixture_child("sleep 30");
+            let pid = child.id() as i32;
+            let mut session = wp4_fixture_session(&dir_clone, "recording-prep", child);
+            // Mirror begin_recording Ok branch exactly.
+            if worker_shutdown.load(Ordering::Acquire) {
+                shutdown_recording_session(&mut session);
+                done_tx.send((false, pid)).unwrap();
+                return;
+            }
+            let mut state = worker_runtime.lock().unwrap();
+            if !is_preparation_current(&state, generation) {
+                drop(state);
+                shutdown_recording_session(&mut session);
+                done_tx.send((false, pid)).unwrap();
+                return;
+            }
+            state.preparing_generation = None;
+            state.voice_state = VoiceState::Recording;
+            done_tx.send((true, pid)).unwrap();
+        });
+
+        // Trigger the same invalidation `shutdown_app` performs.
+        shutdown.store(true, Ordering::Release);
+        invalidate_preparation(&mut runtime.lock().unwrap());
+        runtime.lock().unwrap().voice_state = VoiceState::Ready;
+        gate_tx.send(()).unwrap();
+        let (installed, pid) = done_rx.recv().unwrap();
+        worker.join().unwrap();
+        assert!(!installed, "preparation installed itself after shutdown");
+        // The worker cleaned its own session; prove no survivor by pid.
+        assert!(
+            process_state_is_dead(pid),
+            "preparation child {pid} survived shutdown"
+        );
+        assert!(
+            !dir.join("recording-prep.wav").exists(),
+            "preparation wav cleaned after shutdown"
+        );
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn wp4_normal_stop_followed_by_quit_leaves_no_child() {
+        // Recording → Stop (Processing path) → Quit (shutdown with no
+        // session): no child may survive either step, and quit is idempotent.
+        let dir = std::env::temp_dir().join(format!("vibevoice-wp4-stop-quit-{}", Uuid::new_v4()));
+        fs::create_dir_all(&dir).unwrap();
+        let child = wp4_spawn_fixture_child("sleep 30");
+        let mut session = wp4_fixture_session(&dir, "recording-stopquit", child);
+        let pid = session.recorder_process.id() as i32;
+
+        // Normal Stop: terminate + reap + clean artifacts.
+        shutdown_recording_session(&mut session);
+        wp4_assert_reaped(&mut session.recorder_process, pid, "stop before quit");
+        assert!(!session.audio_path.exists());
+        // Quit with no session installed: nothing to kill, still clean.
+        // (Mirrors shutdown_app's `recording.take() == None` branch.)
+        let runtime = Mutex::new(RuntimeState::default());
+        let taken = runtime.lock().unwrap().recording.take();
+        assert!(taken.is_none());
+        assert!(
+            process_state_is_dead(pid),
+            "recorder {pid} survived stop+quit"
+        );
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn wp4_no_recorder_process_survives_group_kill_including_grandchild() {
+        // Recorder with a grandchild in the same process group: the group
+        // kill in `stop_linux_recorder` must take both, proving no survivor
+        // even when the recorder forks.
+        let pid_file = std::env::temp_dir().join(format!(
+            "vibevoice-wp4-grandchild-{}.pid",
+            std::process::id()
+        ));
+        let _ = fs::remove_file(&pid_file);
+        let script = format!("sleep 30 & echo $! > {}; wait", pid_file.display());
+        let mut child = wp4_spawn_fixture_child(&script);
+        let pid = child.id() as i32;
+
+        // Capture the grandchild PID first (the shell records it at startup),
+        // then exercise the shutdown path. Waiting before stopping removes
+        // the spawn-vs-SIGINT race: the fixture must be fully started before
+        // teardown, exactly like a real recording session.
+        let grandchild = wait_for_pid_file(&pid_file, Duration::from_secs(5));
+        let _ = fs::remove_file(&pid_file);
+        let grandchild = grandchild.expect("fixture grandchild pid recorded");
+
+        stop_linux_recorder(&mut child).expect("group stop succeeds");
+        wp4_assert_reaped(&mut child, pid, "group leader");
+
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while !process_state_is_dead(grandchild) && Instant::now() < deadline {
+            thread::sleep(Duration::from_millis(10));
+        }
+        assert!(
+            process_state_is_dead(grandchild),
+            "grandchild {grandchild} survived the recorder group kill"
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn wp4_temporary_artifacts_have_defined_cleanup_on_shutdown() {
+        let dir = std::env::temp_dir().join(format!("vibevoice-wp4-artifacts-{}", Uuid::new_v4()));
+        fs::create_dir_all(&dir).unwrap();
+        let child = wp4_spawn_fixture_child("sleep 30");
+        let mut session = wp4_fixture_session(&dir, "recording-artifacts", child);
+        assert!(session.audio_path.exists());
+        assert!(session.output_prefix.with_extension("txt").exists());
+
+        shutdown_recording_session(&mut session);
+        assert!(!session.audio_path.exists(), "wav removed");
+        assert!(
+            !session.output_prefix.with_extension("txt").exists(),
+            "partial txt removed"
+        );
+        // Idempotent: second cleanup is harmless.
+        cleanup_recording_artifacts(&session);
+        let _ = fs::remove_dir_all(dir);
     }
 
     fn history_item(final_transcript: &str, created_at: DateTime<Utc>) -> HistoryItem {
