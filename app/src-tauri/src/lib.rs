@@ -2766,6 +2766,123 @@ mod tests {
         assert!(error.contains("timed out"));
     }
 
+    #[cfg(target_os = "linux")]
+    fn wait_for_pid_file(path: &Path, timeout: Duration) -> Option<i32> {
+        let deadline = Instant::now() + timeout;
+        while Instant::now() < deadline {
+            if let Ok(contents) = fs::read_to_string(path) {
+                if let Ok(pid) = contents.trim().parse::<i32>() {
+                    if pid > 0 {
+                        return Some(pid);
+                    }
+                }
+            }
+            thread::sleep(Duration::from_millis(10));
+        }
+        None
+    }
+
+    #[cfg(target_os = "linux")]
+    fn process_state_is_dead(pid: i32) -> bool {
+        if unsafe { libc::kill(pid, 0) } != 0 {
+            return io::Error::last_os_error().raw_os_error() == Some(libc::ESRCH);
+        }
+        // Signal 0 succeeded: the pid may still exist as an unreaped zombie
+        // under init, which still proves the group kill was delivered.
+        let stat = fs::read_to_string(format!("/proc/{pid}/stat")).unwrap_or_default();
+        stat.rsplit(')')
+            .next()
+            .unwrap_or("")
+            .trim_start()
+            .starts_with('Z')
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn transcription_timeout_terminates_grandchild_processes_in_the_group() {
+        let pid_file =
+            std::env::temp_dir().join(format!("vibevoice-pgroup-test-{}.pid", std::process::id()));
+        let _ = fs::remove_file(&pid_file);
+        let script = format!("sleep 30 & echo $! > {}; wait", pid_file.display());
+        let mut command = Command::new("sh");
+        command.args(["-c", &script]);
+
+        let error = run_process_with_deadline(
+            &mut command,
+            Duration::from_millis(200),
+            &AtomicBool::new(false),
+            &AtomicBool::new(false),
+        )
+        .unwrap_err();
+        assert!(error.contains("timed out"));
+
+        let grandchild = wait_for_pid_file(&pid_file, Duration::from_secs(5));
+        let _ = fs::remove_file(&pid_file);
+        let grandchild = grandchild.expect("fixture grandchild pid was recorded");
+
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while !process_state_is_dead(grandchild) && Instant::now() < deadline {
+            thread::sleep(Duration::from_millis(10));
+        }
+        assert!(
+            process_state_is_dead(grandchild),
+            "grandchild {grandchild} survived the process-group kill"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn terminate_process_tree_reaps_the_child_without_residue() {
+        let mut command = Command::new("sleep");
+        command.arg("30");
+        configure_process_group(&mut command);
+        let mut child = command.spawn().expect("fixture process spawns");
+        let pid = child.id() as i32;
+
+        assert_eq!(terminate_process_tree(&mut child), None);
+        assert!(
+            child.try_wait().unwrap().is_some(),
+            "terminated child was reaped, no zombie left"
+        );
+        assert_ne!(
+            unsafe { libc::kill(pid, 0) },
+            0,
+            "reaped child process is fully gone"
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn cleanup_recording_artifacts_removes_audio_and_partial_transcript() {
+        let dir =
+            std::env::temp_dir().join(format!("vibevoice-cleanup-test-{}", std::process::id()));
+        let _ = fs::create_dir_all(&dir);
+        let audio_path = dir.join("recording.wav");
+        let output_prefix = dir.join("recording");
+        fs::write(&audio_path, b"fake-audio").unwrap();
+        fs::write(output_prefix.with_extension("txt"), b"partial").unwrap();
+
+        let session = RecordingSession {
+            audio_path: audio_path.clone(),
+            output_prefix: output_prefix.clone(),
+            started: Instant::now(),
+            started_at: Utc::now(),
+            recorder_process: Command::new("sleep").arg("30").spawn().unwrap(),
+            mic_level: Arc::new(AtomicU32::new(0)),
+        };
+        cleanup_recording_artifacts(&session);
+        let mut session = session;
+        let _ = session.recorder_process.kill();
+        let _ = session.recorder_process.wait();
+
+        assert!(!audio_path.exists(), "recording wav was removed");
+        assert!(
+            !output_prefix.with_extension("txt").exists(),
+            "partial transcript was removed"
+        );
+        let _ = fs::remove_dir(&dir);
+    }
+
     #[cfg(unix)]
     #[test]
     fn transcription_process_cancellation_kills_and_reaps_the_child() {
