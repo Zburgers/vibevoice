@@ -208,6 +208,16 @@ export function SettingsView({
           </select>
         </label>
         <label className="field">
+          <span>Transcription timeout (seconds)</span>
+          <input
+            type="number"
+            min={30}
+            max={1800}
+            value={state.settings.transcription_timeout_seconds}
+            onChange={(e) => onUpdate({ transcription_timeout_seconds: Number(e.target.value) || 30 })}
+          />
+        </label>
+        <label className="field">
           <span>Maximum saved transcripts</span>
           <input
             type="number"

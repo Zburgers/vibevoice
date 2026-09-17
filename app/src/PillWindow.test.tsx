@@ -5,6 +5,31 @@ import { PillWindow } from "./PillWindow";
 import { fallbackState, stateToPhase } from "./types";
 
 describe("pill renderer regressions", () => {
+  it("offers cancellation while transcription is processing", () => {
+    const onPrimary = vi.fn();
+    const view = render(
+      <PillWindow
+        state={{ ...fallbackState, voice_state: "Processing" }}
+        phase={stateToPhase.Processing}
+        expanded={true}
+        lastText="Transcribing"
+        recordingSeconds={0}
+        primaryDisabled={false}
+        ActionIcon={Mic}
+        onToggleExpanded={vi.fn()}
+        onCollapse={vi.fn()}
+        onDrag={vi.fn()}
+        onPrimary={onPrimary}
+        onPaste={vi.fn()}
+        onOpenMain={vi.fn()}
+      />,
+    );
+    const cancel = screen.getByRole("button", { name: /cancel/i });
+    expect(cancel).toBeEnabled();
+    fireEvent.click(cancel);
+    expect(onPrimary).toHaveBeenCalledOnce();
+    view.unmount();
+  });
   it("keeps content visible through repeated expand/collapse transitions", () => {
     const view = render(
       <PillWindow

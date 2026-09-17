@@ -407,7 +407,10 @@ function App() {
       return;
     }
     try {
-      if (state.voice_state === "Recording") {
+      if (state.voice_state === "Processing") {
+        setCommandStatus("Cancelling transcription");
+        await invoke("cancel_transcription");
+      } else if (state.voice_state === "Recording") {
         setCommandStatus("Stopping recording");
         await invoke("stop_recording");
         setCommandStatus("Transcribing");

@@ -21,6 +21,7 @@ export type Tone = "good" | "warn" | "bad" | "neutral" | "accent";
 export type Settings = {
   whisper_binary_path: string;
   model_path: string;
+  transcription_timeout_seconds: number;
   hotkey: string;
   recording_mode: "toggle";
   auto_paste: boolean;
@@ -109,6 +110,7 @@ export const fallbackState: AppState = {
   settings: {
     whisper_binary_path: "auto",
     model_path: "auto",
+    transcription_timeout_seconds: 900,
     hotkey: "Ctrl+Alt+Space",
     recording_mode: "toggle",
     auto_paste: true,
@@ -200,13 +202,13 @@ export function formatDuration(duration: number | null) {
 export function actionLabel(state: VoiceState) {
   if (state === "Recording") return "Stop recording";
   if (state === "Preparing") return "Starting";
-  if (state === "Processing") return "Transcribing";
+  if (state === "Processing") return "Cancel transcription";
   if (state === "Error") return "Retry recording";
   return "Start recording";
 }
 
 export function canStartOrStop(state: VoiceState) {
-  return state !== "Preparing" && state !== "Processing";
+  return state !== "Preparing";
 }
 
 export function actionIcon(state: VoiceState): LucideIcon {

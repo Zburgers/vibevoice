@@ -1,13 +1,15 @@
 use atomicwrites::{AllowOverwrite, AtomicFile};
 use chrono::{DateTime, Duration as ChronoDuration, Utc};
 use serde::{Deserialize, Serialize};
+#[cfg(unix)]
+use std::os::unix::process::CommandExt;
 #[cfg(target_os = "windows")]
 use std::os::windows::process::CommandExt;
 use std::{
     fs,
-    io::{self, Read, Write},
+    io::{self, Write},
     path::{Path, PathBuf},
-    process::{Command, ExitStatus, Stdio},
+    process::{Child, Command, ExitStatus, Stdio},
     str::FromStr,
     sync::{
         atomic::{AtomicBool, AtomicU32, Ordering},
@@ -47,9 +49,14 @@ const MAX_HISTORY_ENTRIES: usize = 1000;
 const DIAGNOSTICS_CACHE_TTL: Duration = Duration::from_secs(5);
 const PASTE_HELPER_TIMEOUT: Duration = Duration::from_secs(2);
 const PASTE_HELPER_POLL_INTERVAL: Duration = Duration::from_millis(20);
+const DEFAULT_TRANSCRIPTION_TIMEOUT_SECONDS: u64 = 900;
+const MIN_TRANSCRIPTION_TIMEOUT_SECONDS: u64 = 30;
+const MAX_TRANSCRIPTION_TIMEOUT_SECONDS: u64 = 1800;
 
 #[cfg(target_os = "windows")]
 const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+#[cfg(target_os = "windows")]
+const CREATE_NEW_PROCESS_GROUP: u32 = 0x0000_0200;
 
 fn configure_command(command: &mut Command) {
     #[cfg(target_os = "windows")]
@@ -75,6 +82,7 @@ enum VoiceState {
 struct Settings {
     whisper_binary_path: String,
     model_path: String,
+    transcription_timeout_seconds: u64,
     hotkey: String,
     recording_mode: String,
     auto_paste: bool,
@@ -92,6 +100,7 @@ impl Default for Settings {
         Self {
             whisper_binary_path: AUTO_PATH.to_string(),
             model_path: AUTO_PATH.to_string(),
+            transcription_timeout_seconds: DEFAULT_TRANSCRIPTION_TIMEOUT_SECONDS,
             hotkey: "Ctrl+Alt+Space".to_string(),
             recording_mode: "toggle".to_string(),
             auto_paste: true,
@@ -237,9 +246,6 @@ struct RecordingSession {
 }
 
 #[cfg(target_os = "linux")]
-use std::process::Child;
-
-#[cfg(target_os = "linux")]
 struct RecordingSession {
     audio_path: PathBuf,
     output_prefix: PathBuf,
@@ -309,6 +315,7 @@ struct AppData {
     insertion: Mutex<()>,
     lifecycle: Mutex<()>,
     shutdown: Arc<AtomicBool>,
+    transcription_cancel: Mutex<Option<Arc<AtomicBool>>>,
     worker_threads: Mutex<Vec<thread::JoinHandle<()>>>,
     meter_threads: Mutex<Vec<thread::JoinHandle<()>>>,
 }
@@ -406,10 +413,14 @@ fn copy_diagnostics_report(
 fn save_settings(
     app: AppHandle,
     data: tauri::State<AppData>,
-    settings: Settings,
+    mut settings: Settings,
     window: WebviewWindow,
 ) -> Result<(), String> {
     authorize_window(&window, &["main"])?;
+    settings.transcription_timeout_seconds = settings.transcription_timeout_seconds.clamp(
+        MIN_TRANSCRIPTION_TIMEOUT_SECONDS,
+        MAX_TRANSCRIPTION_TIMEOUT_SECONDS,
+    );
     let previous = load_settings(&app).unwrap_or_default();
     if settings.hotkey != previous.hotkey {
         register_global_hotkey(&app, &settings.hotkey)?;
@@ -560,18 +571,43 @@ async fn stop_recording_impl(
             }
         }
     };
+    let transcription_cancel = Arc::new(AtomicBool::new(false));
+    if let Ok(mut current) = data.transcription_cancel.lock() {
+        *current = Some(Arc::clone(&transcription_cancel));
+    }
     let app_handle = app.clone();
     let shutdown = Arc::clone(&data.shutdown);
     let worker = thread::spawn(move || {
-        let result = finish_recording(app_handle.clone(), &mut session, &shutdown);
+        let result = finish_recording(
+            app_handle.clone(),
+            &mut session,
+            &transcription_cancel,
+            &shutdown,
+        );
         cleanup_recording_artifacts(&session);
         if let Err(error) = result {
             if shutdown.load(Ordering::Acquire) {
+                if let Ok(mut current) = app_handle.state::<AppData>().transcription_cancel.lock() {
+                    if current
+                        .as_ref()
+                        .is_some_and(|token| Arc::ptr_eq(token, &transcription_cancel))
+                    {
+                        *current = None;
+                    }
+                }
                 return;
             }
             let state = app_handle.state::<AppData>();
             let _ = set_runtime_error(&state, &error);
             emit_state_changed(&app_handle);
+        }
+        if let Ok(mut current) = app_handle.state::<AppData>().transcription_cancel.lock() {
+            if current
+                .as_ref()
+                .is_some_and(|token| Arc::ptr_eq(token, &transcription_cancel))
+            {
+                *current = None;
+            }
         }
     });
     track_thread(&data.worker_threads, worker);
@@ -580,9 +616,28 @@ async fn stop_recording_impl(
     Ok(())
 }
 
+#[tauri::command]
+fn cancel_transcription(
+    app: AppHandle,
+    data: tauri::State<AppData>,
+    window: WebviewWindow,
+) -> Result<(), String> {
+    authorize_window(&window, &["main", "pill"])?;
+    let cancel = data
+        .transcription_cancel
+        .lock()
+        .map_err(|error| error.to_string())?
+        .clone()
+        .ok_or_else(|| "No transcription is running.".to_string())?;
+    cancel.store(true, Ordering::Relaxed);
+    emit_state_changed(&app);
+    Ok(())
+}
+
 fn finish_recording(
     app: AppHandle,
     session: &mut RecordingSession,
+    transcription_cancel: &AtomicBool,
     shutdown: &AtomicBool,
 ) -> Result<HistoryItem, String> {
     stop_audio_capture(session)?;
@@ -595,6 +650,7 @@ fn finish_recording(
         &settings,
         &session.audio_path,
         &session.output_prefix,
+        transcription_cancel,
         shutdown,
     )?;
     let mut final_transcript = cleanup_transcript(&raw_transcript);
@@ -605,6 +661,10 @@ fn finish_recording(
     if final_transcript.is_empty() {
         let message = "Whisper returned an empty transcript.".to_string();
         return Err(message);
+    }
+
+    if shutdown.load(Ordering::Acquire) {
+        return Err("Recording cancelled during shutdown.".to_string());
     }
 
     let data = app.state::<AppData>();
@@ -1387,15 +1447,12 @@ fn transcribe(
     settings: &Settings,
     audio_path: &Path,
     output_prefix: &Path,
+    cancel: &AtomicBool,
     shutdown: &AtomicBool,
 ) -> Result<String, String> {
-    if shutdown.load(Ordering::Acquire) {
-        return Err("Transcription cancelled during shutdown.".to_string());
-    }
     let paths = resolve_engine_paths(settings)?;
     let mut command = Command::new(paths.whisper_binary);
-    configure_command(&mut command);
-    let mut child = command
+    command
         .arg("-m")
         .arg(paths.model)
         .arg("-f")
@@ -1403,83 +1460,126 @@ fn transcribe(
         .args(["-otxt", "-nt", "-np"])
         .arg("-of")
         .arg(output_prefix)
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .map_err(|error| format!("Transcription failed to start: {error}"))?;
-
-    let stdout = match child.stdout.take() {
-        Some(stdout) => stdout,
-        None => {
-            kill_and_reap(&mut child);
-            return Err("Transcription stdout was not captured.".to_string());
-        }
-    };
-    let stderr = match child.stderr.take() {
-        Some(stderr) => stderr,
-        None => {
-            kill_and_reap(&mut child);
-            return Err("Transcription stderr was not captured.".to_string());
-        }
-    };
-    let stdout_reader = thread::spawn(move || read_child_output(stdout));
-    let stderr_reader = thread::spawn(move || read_child_output(stderr));
-    let status = match wait_for_child(&mut child, shutdown) {
-        Ok(status) => status,
-        Err(error) => {
-            let _ = stdout_reader.join();
-            let _ = stderr_reader.join();
-            return Err(error);
-        }
-    };
-    let stdout = stdout_reader
-        .join()
-        .map_err(|_| "Transcription stdout reader panicked.".to_string())?
-        .map_err(|error| format!("Transcription stdout read failed: {error}"))?;
-    let stderr = stderr_reader
-        .join()
-        .map_err(|_| "Transcription stderr reader panicked.".to_string())?
-        .map_err(|error| format!("Transcription stderr read failed: {error}"))?;
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null());
+    let status = run_process_with_deadline(
+        &mut command,
+        Duration::from_secs(settings.transcription_timeout_seconds.clamp(
+            MIN_TRANSCRIPTION_TIMEOUT_SECONDS,
+            MAX_TRANSCRIPTION_TIMEOUT_SECONDS,
+        )),
+        cancel,
+        shutdown,
+    )?;
     if !status.success() {
-        return Err(format!(
-            "Transcription failed: {}{}",
-            String::from_utf8_lossy(&stdout),
-            String::from_utf8_lossy(&stderr)
-        ));
+        return Err(format!("Transcription failed with status {status}"));
     }
     fs::read_to_string(output_prefix.with_extension("txt"))
         .map_err(|error| format!("Transcript file missing: {error}"))
 }
 
-fn read_child_output<R: Read>(mut reader: R) -> io::Result<Vec<u8>> {
-    let mut output = Vec::new();
-    reader.read_to_end(&mut output)?;
-    Ok(output)
+fn configure_process_group(command: &mut Command) {
+    #[cfg(unix)]
+    unsafe {
+        command.pre_exec(|| {
+            if libc::setpgid(0, 0) == -1 {
+                return Err(io::Error::last_os_error());
+            }
+            Ok(())
+        });
+    }
+
+    #[cfg(windows)]
+    command.creation_flags(CREATE_NO_WINDOW | CREATE_NEW_PROCESS_GROUP);
 }
 
-fn kill_and_reap(child: &mut std::process::Child) {
-    let _ = child.kill();
-    let _ = child.wait();
-}
-
-fn wait_for_child(
-    child: &mut std::process::Child,
+fn run_process_with_deadline(
+    command: &mut Command,
+    timeout: Duration,
+    cancel: &AtomicBool,
     shutdown: &AtomicBool,
 ) -> Result<ExitStatus, String> {
+    if shutdown.load(Ordering::Acquire) || cancel.load(Ordering::Relaxed) {
+        return Err("Transcription cancelled.".to_string());
+    }
+    configure_process_group(command);
+    let mut child = command
+        .spawn()
+        .map_err(|error| format!("Transcription failed to start: {error}"))?;
+    let deadline = Instant::now() + timeout;
     loop {
-        if shutdown.load(Ordering::Acquire) {
-            kill_and_reap(child);
-            return Err("Transcription cancelled during shutdown.".to_string());
+        if cancel.load(Ordering::Relaxed) || shutdown.load(Ordering::Acquire) {
+            let cleanup = terminate_process_tree(&mut child);
+            return Err(process_stop_message("Transcription cancelled.", cleanup));
         }
         match child.try_wait() {
             Ok(Some(status)) => return Ok(status),
-            Ok(None) => thread::sleep(PASTE_HELPER_POLL_INTERVAL),
+            Ok(None) if Instant::now() >= deadline => {
+                let message = format!(
+                    "Transcription timed out after {} seconds.",
+                    timeout.as_secs()
+                );
+                let cleanup = terminate_process_tree(&mut child);
+                return Err(process_stop_message(&message, cleanup));
+            }
+            Ok(None) => thread::sleep(Duration::from_millis(20)),
             Err(error) => {
-                kill_and_reap(child);
-                return Err(format!("Transcription failed: {error}"));
+                let cleanup = terminate_process_tree(&mut child);
+                return Err(process_stop_message(
+                    &format!("Transcription status check failed: {error}"),
+                    cleanup,
+                ));
             }
         }
     }
+}
+
+fn process_stop_message(message: &str, cleanup: Option<String>) -> String {
+    cleanup.map_or_else(|| message.to_string(), |error| format!("{message} {error}"))
+}
+
+fn terminate_process_tree(child: &mut Child) -> Option<String> {
+    let mut errors = Vec::new();
+
+    #[cfg(unix)]
+    {
+        let process_group = -(child.id() as i32);
+        if unsafe { libc::kill(process_group, libc::SIGKILL) } != 0 {
+            errors.push(format!(
+                "could not stop process group: {}",
+                io::Error::last_os_error()
+            ));
+            if let Err(error) = child.kill() {
+                errors.push(format!("could not stop process: {error}"));
+            }
+        }
+    }
+
+    #[cfg(windows)]
+    {
+        let pid = child.id().to_string();
+        let mut taskkill = Command::new("taskkill");
+        configure_command(&mut taskkill);
+        match taskkill.args(["/PID", &pid, "/T", "/F"]).status() {
+            Ok(status) if status.success() => {}
+            Ok(status) => errors.push(format!("taskkill exited with status {status}")),
+            Err(error) => errors.push(format!("could not stop process tree: {error}")),
+        }
+        if let Err(error) = child.kill() {
+            errors.push(format!("could not stop process: {error}"));
+        }
+    }
+
+    #[cfg(not(any(unix, windows)))]
+    if let Err(error) = child.kill() {
+        errors.push(format!("could not stop process: {error}"));
+    }
+
+    if let Err(error) = child.wait() {
+        errors.push(format!("could not reap process: {error}"));
+    }
+    (!errors.is_empty()).then(|| errors.join("; "))
 }
 
 fn resolve_engine_paths(settings: &Settings) -> Result<EnginePaths, String> {
@@ -2594,6 +2694,7 @@ pub fn run() {
             insertion: Mutex::new(()),
             lifecycle: Mutex::new(()),
             shutdown: Arc::new(AtomicBool::new(false)),
+            transcription_cancel: Mutex::new(None),
             worker_threads: Mutex::new(Vec::new()),
             meter_threads: Mutex::new(Vec::new()),
         })
@@ -2605,6 +2706,7 @@ pub fn run() {
             save_settings,
             start_recording,
             stop_recording,
+            cancel_transcription,
             copy_text,
             insert_text,
             delete_history_item,
@@ -2645,6 +2747,214 @@ pub fn run() {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::atomic::AtomicBool;
+
+    #[cfg(unix)]
+    #[test]
+    fn transcription_process_timeout_kills_and_reaps_the_child() {
+        let mut command = Command::new("sh");
+        command.args(["-c", "sleep 1"]);
+
+        let error = run_process_with_deadline(
+            &mut command,
+            Duration::from_millis(30),
+            &AtomicBool::new(false),
+            &AtomicBool::new(false),
+        )
+        .unwrap_err();
+
+        assert!(error.contains("timed out"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn transcription_process_cancellation_kills_and_reaps_the_child() {
+        let mut command = Command::new("sh");
+        command.args(["-c", "sleep 1"]);
+        let cancelled = AtomicBool::new(true);
+
+        let error = run_process_with_deadline(
+            &mut command,
+            Duration::from_secs(1),
+            &cancelled,
+            &AtomicBool::new(false),
+        )
+        .unwrap_err();
+
+        assert_eq!(error, "Transcription cancelled.");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn transcription_process_success_exits_cleanly() {
+        let mut command = Command::new("sh");
+        command.args(["-c", "exit 0"]);
+
+        let status = run_process_with_deadline(
+            &mut command,
+            Duration::from_secs(1),
+            &AtomicBool::new(false),
+            &AtomicBool::new(false),
+        )
+        .unwrap();
+
+        assert!(status.success());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn transcription_process_failure_returns_error_status() {
+        let mut command = Command::new("sh");
+        command.args(["-c", "exit 1"]);
+
+        let status = run_process_with_deadline(
+            &mut command,
+            Duration::from_secs(1),
+            &AtomicBool::new(false),
+            &AtomicBool::new(false),
+        )
+        .unwrap();
+
+        assert!(!status.success());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn shutdown_flag_aborts_transcription_before_spawn() {
+        let mut command = Command::new("sh");
+        command.args(["-c", "sleep 10"]);
+        let shutdown = AtomicBool::new(true);
+
+        let error = run_process_with_deadline(
+            &mut command,
+            Duration::from_secs(10),
+            &AtomicBool::new(false),
+            &shutdown,
+        )
+        .unwrap_err();
+
+        assert_eq!(error, "Transcription cancelled.");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn shutdown_flag_terminates_running_child() {
+        let mut command = Command::new("sh");
+        command.args(["-c", "sleep 10"]);
+        let shutdown = Arc::new(AtomicBool::new(false));
+        let shutdown_clone = Arc::clone(&shutdown);
+
+        let handle = thread::spawn(move || {
+            run_process_with_deadline(
+                &mut command,
+                Duration::from_secs(10),
+                &AtomicBool::new(false),
+                &shutdown_clone,
+            )
+        });
+
+        thread::sleep(Duration::from_millis(50));
+        shutdown.store(true, Ordering::Relaxed);
+
+        let error = handle.join().unwrap().unwrap_err();
+        assert!(error.contains("cancelled"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn cancel_flag_terminates_running_child() {
+        let mut command = Command::new("sh");
+        command.args(["-c", "sleep 10"]);
+        let cancel = Arc::new(AtomicBool::new(false));
+        let cancel_clone = Arc::clone(&cancel);
+
+        let handle = thread::spawn(move || {
+            run_process_with_deadline(
+                &mut command,
+                Duration::from_secs(10),
+                &cancel_clone,
+                &AtomicBool::new(false),
+            )
+        });
+
+        thread::sleep(Duration::from_millis(50));
+        cancel.store(true, Ordering::Relaxed);
+
+        let error = handle.join().unwrap().unwrap_err();
+        assert!(error.contains("cancelled"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn transcription_try_wait_error_terminates_child() {
+        let mut command = Command::new("sh");
+        command.args(["-c", "sleep 10"]);
+        let cancel = AtomicBool::new(true);
+
+        let error = run_process_with_deadline(
+            &mut command,
+            Duration::from_secs(1),
+            &cancel,
+            &AtomicBool::new(false),
+        )
+        .unwrap_err();
+
+        assert!(error.contains("cancelled"));
+    }
+
+    #[test]
+    fn settings_deserializes_old_config_without_timeout() {
+        let json = r#"{
+            "whisper_binary_path": "auto",
+            "model_path": "auto",
+            "hotkey": "Ctrl+Alt+Space",
+            "recording_mode": "toggle",
+            "auto_paste": true,
+            "clipboard_fallback": true,
+            "dictionary_cleanup": true,
+            "history_enabled": false,
+            "max_history_entries": 100,
+            "history_retention_days": 0,
+            "pill_always_on_top": true,
+            "start_on_login": false
+        }"#;
+        let settings: Settings = serde_json::from_str(json).unwrap();
+        assert_eq!(
+            settings.transcription_timeout_seconds,
+            DEFAULT_TRANSCRIPTION_TIMEOUT_SECONDS
+        );
+    }
+
+    #[test]
+    fn settings_normalizes_out_of_range_timeout_on_save() {
+        let settings = Settings {
+            transcription_timeout_seconds: 99999,
+            ..Settings::default()
+        };
+        let clamped = settings.transcription_timeout_seconds.clamp(
+            MIN_TRANSCRIPTION_TIMEOUT_SECONDS,
+            MAX_TRANSCRIPTION_TIMEOUT_SECONDS,
+        );
+        assert_eq!(clamped, MAX_TRANSCRIPTION_TIMEOUT_SECONDS);
+
+        let settings = Settings {
+            transcription_timeout_seconds: 5,
+            ..Settings::default()
+        };
+        let clamped = settings.transcription_timeout_seconds.clamp(
+            MIN_TRANSCRIPTION_TIMEOUT_SECONDS,
+            MAX_TRANSCRIPTION_TIMEOUT_SECONDS,
+        );
+        assert_eq!(clamped, MIN_TRANSCRIPTION_TIMEOUT_SECONDS);
+    }
+
+    #[test]
+    fn settings_default_transcription_timeout_is_900() {
+        assert_eq!(
+            Settings::default().transcription_timeout_seconds,
+            DEFAULT_TRANSCRIPTION_TIMEOUT_SECONDS
+        );
+    }
 
     #[test]
     fn resolves_explicit_existing_engine_paths_first() {
@@ -2690,7 +3000,8 @@ mod tests {
             ..Settings::default()
         };
 
-        let resolved = resolve_engine_paths_with_candidates(&settings, &[root.clone()]).unwrap();
+        let resolved =
+            resolve_engine_paths_with_candidates(&settings, std::slice::from_ref(&root)).unwrap();
 
         assert_eq!(resolved.whisper_binary, whisper);
         assert_eq!(resolved.model, model);
@@ -2835,13 +3146,25 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn shutdown_cancels_and_reaps_transcription_child() {
-        let mut child = Command::new("sleep").arg("1").spawn().unwrap();
-        let shutdown = AtomicBool::new(true);
+        let mut command = Command::new("sh");
+        command.args(["-c", "sleep 10"]);
+        let shutdown = Arc::new(AtomicBool::new(false));
+        let shutdown_clone = Arc::clone(&shutdown);
 
-        let error = wait_for_child(&mut child, &shutdown).unwrap_err();
+        let handle = thread::spawn(move || {
+            run_process_with_deadline(
+                &mut command,
+                Duration::from_secs(10),
+                &AtomicBool::new(false),
+                &shutdown_clone,
+            )
+        });
 
-        assert!(error.contains("cancelled during shutdown"));
-        assert!(child.try_wait().unwrap().is_some());
+        thread::sleep(Duration::from_millis(50));
+        shutdown.store(true, Ordering::Relaxed);
+
+        let error = handle.join().unwrap().unwrap_err();
+        assert!(error.contains("cancelled"));
     }
 
     #[test]
