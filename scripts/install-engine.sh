@@ -3,6 +3,11 @@ set -euo pipefail
 
 MODEL_NAME="${VIBEVOICE_MODEL_NAME:-base.en}"
 MODEL_FILE="ggml-${MODEL_NAME}.bin"
+WHISPER_REF="v1.9.3"
+WHISPER_COMMIT="7246b7311e089fe092c4abe7cfad5d0921f8be00"
+MODEL_REVISION="5359861c739e955e79d9a303bcbc70fb988958b1"
+DEFAULT_MODEL_SHA256="a03779c86df3323075f5e796cb2ce5029f00ec8869eee3fdfb897afe36c6d002"
+MODEL_SHA256="${VIBEVOICE_MODEL_SHA256:-$DEFAULT_MODEL_SHA256}"
 DATA_HOME="${XDG_DATA_HOME:-$HOME/.local/share}"
 ENGINE_ROOT="${VIBEVOICE_ENGINE_DIR:-$DATA_HOME/vibevoice/engines/whisper.cpp}"
 TMP_DIR="${VIBEVOICE_TMP_DIR:-${TMPDIR:-/tmp}/vibevoice}"
@@ -10,6 +15,22 @@ TMP_DIR="${VIBEVOICE_TMP_DIR:-${TMPDIR:-/tmp}/vibevoice}"
 say() {
   printf '%s\n' "$1"
 }
+
+if [[ ! "$MODEL_NAME" =~ ^[A-Za-z0-9][A-Za-z0-9._-]*$ ]]; then
+  say "Invalid model name: $MODEL_NAME"
+  exit 1
+fi
+if [[ "$MODEL_NAME" != "base.en" && -z "${VIBEVOICE_MODEL_SHA256:-}" ]]; then
+  say "Set VIBEVOICE_MODEL_SHA256 when using a non-default model."
+  exit 1
+fi
+if [[ ! "$MODEL_SHA256" =~ ^[A-Fa-f0-9]{64}$ ]]; then
+  say "VIBEVOICE_MODEL_SHA256 must be a 64-character SHA-256 digest."
+  exit 1
+fi
+# Normalize case so valid uppercase and lowercase SHA-256 representations
+# compare identically.
+MODEL_SHA256="$(printf '%s' "$MODEL_SHA256" | tr '[:upper:]' '[:lower:]')"
 
 run() {
   say "+ $*"
@@ -86,9 +107,42 @@ ensure_whisper_repo() {
   local cli="$ENGINE_ROOT/build/bin/whisper-cli"
   local model="$ENGINE_ROOT/models/$MODEL_FILE"
 
-  if [[ -x "$cli" && -f "$model" ]]; then
-    say "Existing whisper.cpp engine detected: $ENGINE_ROOT"
+  # Normalize case before comparing digests so valid uppercase and lowercase
+  # SHA-256 representations behave identically.
+  normalize_digest() {
+    printf '%s' "$1" | tr '[:upper:]' '[:lower:]'
+  }
+
+  verify_checkout() {
+    local actual
+    actual="$(git -C "$ENGINE_ROOT" rev-parse HEAD)"
+    if [[ "$actual" != "$WHISPER_COMMIT" ]]; then
+      say "Refusing unverified whisper.cpp checkout: $actual"
+      exit 1
+    fi
+  }
+
+  verify_model() {
+    local path="$1"
+    local actual
+    actual="$(normalize_digest "$(sha256sum "$path" | cut -d ' ' -f 1)")"
+    if [[ "$actual" != "$MODEL_SHA256" ]]; then
+      say "Refusing model with unexpected SHA-256: $actual"
+      return 1
+    fi
     return 0
+  }
+
+  if [[ -x "$cli" && -f "$model" ]]; then
+    verify_checkout
+    if verify_model "$model"; then
+      say "Existing whisper.cpp engine detected: $ENGINE_ROOT"
+      return 0
+    fi
+    # Fail closed: a present-but-unverifiable model is refused and removed,
+    # never silently kept or overwritten by an unverified artifact.
+    rm -f "$model"
+    exit 1
   fi
 
   mkdir -p "$(dirname "$ENGINE_ROOT")"
@@ -102,15 +156,35 @@ ensure_whisper_repo() {
       say "Set VIBEVOICE_ENGINE_DIR to an empty directory or an existing whisper.cpp checkout."
       exit 1
     fi
-    run git clone https://github.com/ggml-org/whisper.cpp.git "$ENGINE_ROOT"
+    run git clone --branch "$WHISPER_REF" --depth 1 https://github.com/ggml-org/whisper.cpp.git "$ENGINE_ROOT"
   else
     say "Reusing whisper.cpp checkout: $ENGINE_ROOT"
   fi
+  verify_checkout
 
   if [[ ! -f "$model" ]]; then
-    (cd "$ENGINE_ROOT" && run sh ./models/download-ggml-model.sh "$MODEL_NAME")
+    # Download to a temporary location and verify before activating, so an
+    # interrupted or tampered download can never replace a known-good model
+    # or linger as a partial artifact at the final path.
+    mkdir -p "$ENGINE_ROOT/models"
+    tmp_model="$ENGINE_ROOT/models/$MODEL_FILE.tmp"
+    rm -f "$tmp_model"
+    if command -v curl >/dev/null 2>&1; then
+      run curl -fL --retry 3 -o "$tmp_model" "https://huggingface.co/ggerganov/whisper.cpp/resolve/$MODEL_REVISION/$MODEL_FILE"
+    else
+      run wget -O "$tmp_model" "https://huggingface.co/ggerganov/whisper.cpp/resolve/$MODEL_REVISION/$MODEL_FILE"
+    fi
+    if verify_model "$tmp_model"; then
+      mv -f "$tmp_model" "$model"
+      say "Model verified and installed: $model"
+    else
+      rm -f "$tmp_model"
+      say "Downloaded model failed SHA-256 verification; nothing was installed."
+      exit 1
+    fi
   else
     say "Model already present: $model"
+    verify_model "$model"
   fi
 
   if [[ ! -x "$cli" ]]; then

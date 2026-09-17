@@ -5,7 +5,22 @@ param(
 
 $ErrorActionPreference = "Stop"
 $ModelFile = "ggml-$ModelName.bin"
-$ModelUrl = "https://huggingface.co/ggerganov/whisper.cpp/resolve/main/$ModelFile"
+$WhisperRef = "v1.9.3"
+$WhisperCommit = "7246b7311e089fe092c4abe7cfad5d0921f8be00"
+$ModelRevision = "5359861c739e955e79d9a303bcbc70fb988958b1"
+$DefaultModelSha256 = "a03779c86df3323075f5e796cb2ce5029f00ec8869eee3fdfb897afe36c6d002"
+$ModelSha256 = if ($env:VIBEVOICE_MODEL_SHA256) { $env:VIBEVOICE_MODEL_SHA256 } else { $DefaultModelSha256 }
+$ModelUrl = "https://huggingface.co/ggerganov/whisper.cpp/resolve/$ModelRevision/$ModelFile"
+
+if ($ModelName -notmatch '^[A-Za-z0-9][A-Za-z0-9._-]*$') {
+  throw "Invalid model name: $ModelName"
+}
+if (($ModelName -ne "base.en") -and [string]::IsNullOrWhiteSpace($env:VIBEVOICE_MODEL_SHA256)) {
+  throw "Set VIBEVOICE_MODEL_SHA256 when using a non-default model."
+}
+if ($ModelSha256 -notmatch '^[A-Fa-f0-9]{64}$') {
+  throw "VIBEVOICE_MODEL_SHA256 must be a 64-character SHA-256 digest."
+}
 
 function Write-Step($Message) {
   Write-Host $Message
@@ -126,9 +141,45 @@ function Ensure-WhisperCpp {
   $AltWhisperCli = Join-Path $EngineRoot "build\bin\whisper-cli.exe"
   $ModelPath = Join-Path $EngineRoot "models\$ModelFile"
 
+  # Normalize case before comparing digests so valid uppercase and lowercase
+  # SHA-256 representations behave identically.
+  function Normalize-Digest([string]$Digest) {
+    return $Digest.ToLowerInvariant()
+  }
+
+  function Test-ModelDigest([string]$Path) {
+    $actual = Normalize-Digest (Get-FileHash -Algorithm SHA256 -LiteralPath $Path).Hash
+    $expected = Normalize-Digest $ModelSha256
+    return $actual -eq $expected
+  }
+
+  function Verify-WhisperCheckout {
+    $actual = (& $script:GitExe -C $EngineRoot rev-parse HEAD).Trim()
+    if ($actual -ne $WhisperCommit) {
+      throw "Refusing unverified whisper.cpp checkout: $actual"
+    }
+  }
+
+  function Verify-Model {
+    param([string]$Path)
+    if (-not (Test-ModelDigest $Path)) {
+      $actual = (Get-FileHash -Algorithm SHA256 -LiteralPath $Path).Hash
+      Remove-Item -Force -LiteralPath $Path
+      throw "Refusing model with unexpected SHA-256: $actual"
+    }
+  }
+
   if ((Test-Path $WhisperCli) -and (Test-Path $ModelPath)) {
-    Write-Step "Existing whisper.cpp engine detected: $EngineRoot"
-    return
+    Verify-WhisperCheckout
+    if (Test-ModelDigest $ModelPath) {
+      Write-Step "Existing whisper.cpp engine detected: $EngineRoot"
+      return
+    }
+    # Fail closed: a present-but-unverifiable model is refused and removed,
+    # never silently kept or overwritten by an unverified artifact.
+    $badDigest = (Get-FileHash -Algorithm SHA256 -LiteralPath $ModelPath).Hash
+    Remove-Item -Force -LiteralPath $ModelPath
+    throw "Refusing model with unexpected SHA-256: $badDigest"
   }
 
   $EngineParent = Split-Path -Parent $EngineRoot
@@ -138,18 +189,34 @@ function Ensure-WhisperCpp {
     if ((Test-Path $EngineRoot) -and ((Get-ChildItem -Force $EngineRoot | Select-Object -First 1) -ne $null)) {
       throw "$EngineRoot exists but is not a whisper.cpp git checkout. Set VIBEVOICE_ENGINE_DIR to an empty directory or existing checkout."
     }
-    Write-Step "+ git clone https://github.com/ggml-org/whisper.cpp.git `"$EngineRoot`""
-    & $script:GitExe clone https://github.com/ggml-org/whisper.cpp.git $EngineRoot
+    Write-Step "+ git clone --branch $WhisperRef --depth 1 https://github.com/ggml-org/whisper.cpp.git `"$EngineRoot`""
+    & $script:GitExe clone --branch $WhisperRef --depth 1 https://github.com/ggml-org/whisper.cpp.git $EngineRoot
   } else {
     Write-Step "Reusing whisper.cpp checkout: $EngineRoot"
   }
+  Verify-WhisperCheckout
 
   New-Item -ItemType Directory -Force -Path (Join-Path $EngineRoot "models") | Out-Null
   if (-not (Test-Path $ModelPath)) {
+    # Download to a temporary location and verify before activating, so an
+    # interrupted or tampered download can never replace a known-good model
+    # or linger as a partial artifact at the final path.
+    $tmpModel = "$ModelPath.tmp"
+    if (Test-Path $tmpModel) {
+      Remove-Item -Force -LiteralPath $tmpModel
+    }
     Write-Step "Downloading $ModelFile"
-    Invoke-WebRequest -Uri $ModelUrl -OutFile $ModelPath
+    Invoke-WebRequest -Uri $ModelUrl -OutFile $tmpModel
+    if (Test-ModelDigest $tmpModel) {
+      Move-Item -Force -LiteralPath $tmpModel -Destination $ModelPath
+      Write-Step "Model verified and installed: $ModelPath"
+    } else {
+      Remove-Item -Force -LiteralPath $tmpModel
+      throw "Downloaded model failed SHA-256 verification; nothing was installed."
+    }
   } else {
     Write-Step "Model already present: $ModelPath"
+    Verify-Model $ModelPath
   }
 
   if (-not ((Test-Path $WhisperCli) -or (Test-Path $AltWhisperCli))) {
