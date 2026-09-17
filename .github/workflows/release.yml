@@ -174,7 +174,7 @@ jobs:
           includeUpdaterJson: true
           tagName: ${{ startsWith(github.ref, 'refs/tags/') && github.ref_name || format('v{0}', steps.version.outputs.version) }}
           releaseName: ${{ startsWith(github.ref, 'refs/tags/') && format('VibeVoice {0}', github.ref_name) || format('VibeVoice v{0}', steps.version.outputs.version) }}
-          releaseBody: 'VibeVoice 0.2.7 stabilization: renderer reliability, SemVer-safe updates, redacted diagnostics, window capability hardening, and native resize cursors.'
+          releaseBody: 'VibeVoice 0.2.7: renderer reliability, SemVer-safe updates, redacted diagnostics, window capability hardening, native resize cursors, transcription timeout/cancel, recording lifecycle correctness, runtime privacy hardening, and verified installer integrity.'
           generateReleaseNotes: true
           releaseDraft: false
           prerelease: false
