@@ -2,6 +2,8 @@ use atomicwrites::{AllowOverwrite, AtomicFile};
 use chrono::{DateTime, Duration as ChronoDuration, Utc};
 use serde::{Deserialize, Serialize};
 #[cfg(unix)]
+use std::os::unix::fs::PermissionsExt;
+#[cfg(unix)]
 use std::os::unix::process::CommandExt;
 #[cfg(target_os = "windows")]
 use std::os::windows::process::CommandExt;
@@ -26,6 +28,7 @@ use tauri::{
 };
 use tauri_plugin_clipboard_manager::ClipboardExt;
 use tauri_plugin_global_shortcut::{Code, GlobalShortcutExt, Modifiers, Shortcut, ShortcutState};
+use tauri_plugin_opener::OpenerExt;
 use uuid::Uuid;
 
 #[cfg(any(target_os = "windows", target_os = "macos"))]
@@ -519,9 +522,8 @@ fn begin_recording(app: AppHandle, data: tauri::State<'_, AppData>) -> Result<()
 fn prepare_recording_session(app: &AppHandle) -> Result<RecordingSession, String> {
     let settings = load_settings(app)?;
     ensure_engine_ready(&settings)?;
-    let tmp = temp_workspace();
-    fs::create_dir_all(&tmp).map_err(|error| error.to_string())?;
-    let stem = format!("recording-{}", Uuid::new_v4());
+    let tmp = prepare_temp_workspace()?;
+    let stem = new_recording_stem();
     let audio_path = tmp.join(format!("{stem}.wav"));
     let output_prefix = tmp.join(stem);
     let session = start_audio_capture(audio_path, output_prefix)?;
@@ -776,7 +778,12 @@ fn clear_history(
 ) -> Result<(), String> {
     authorize_window(&window, &["main"])?;
     with_history_lock(&data.history, || {
-        write_history(&history_path(&app)?, &Vec::<HistoryItem>::new())
+        let path = history_path(&app)?;
+        // `write_history` atomically clears both the active history and its
+        // backup, then corrupt recovery copies are removed. Errors propagate
+        // with actionable context instead of silently reporting success.
+        write_history(&path, &[])?;
+        remove_corrupt_history_copies(&path)
     })
 }
 
@@ -997,34 +1004,61 @@ fn open_release_page(url: Option<String>, window: WebviewWindow) -> Result<(), S
         return Err("Release URL is outside the VibeVoice repository.".to_string());
     }
 
-    let mut command = if cfg!(target_os = "windows") {
-        let mut command = Command::new("cmd");
-        configure_command(&mut command);
-        command.args(["/C", "start", "", &url]);
-        command
-    } else if cfg!(target_os = "macos") {
-        let mut command = Command::new("open");
-        configure_command(&mut command);
-        command.arg(&url);
-        command
-    } else {
-        let mut command = Command::new("xdg-open");
-        configure_command(&mut command);
-        command.arg(&url);
-        command
-    };
-
-    command
-        .status()
-        .map(|_| ())
+    // Safe native opener: no shell, no cmd.exe /C, no argument splitting.
+    // The URL has already passed strict allow-list validation below, and the
+    // opener capability additionally restricts navigation to the releases tree.
+    window
+        .app_handle()
+        .opener()
+        .open_url(&url, None::<&str>)
         .map_err(|error| format!("Could not open release page: {error}"))
 }
 
 fn is_allowed_release_url(url: &str) -> bool {
-    url == RELEASES_URL
-        || url
-            .strip_prefix(RELEASES_URL)
-            .is_some_and(|suffix| suffix.starts_with("/tag/v") || suffix.starts_with("/download/"))
+    if url == RELEASES_URL {
+        return true;
+    }
+    let Some(suffix) = url.strip_prefix(RELEASES_URL) else {
+        return false;
+    };
+    // Only the canonical tag/download contracts are allowed. Anything else
+    // (issues, pulls, spoofed suffixes like `releases.evil`) is rejected here
+    // because it does not carry one of these exact prefixes.
+    let rest = if let Some(rest) = suffix.strip_prefix("/tag/v") {
+        // Tag names are a single path segment (e.g. `0.2.7`).
+        if rest.contains('/') {
+            return false;
+        }
+        rest
+    } else if let Some(rest) = suffix.strip_prefix("/download/") {
+        rest
+    } else {
+        return false;
+    };
+    if rest.is_empty() {
+        return false;
+    }
+    // Strict allow-list: ASCII alphanumerics plus `._-~/`. This implicitly
+    // rejects `& | ; $ ` ' " \ space CR LF TAB ? # < > ( ) * ! % + = : , @`
+    // and any non-ASCII bytes, closing shell-metacharacter, query (`?...`),
+    // and fragment (`#...`) tricks without enumerating them one by one.
+    if !rest.bytes().all(|byte| {
+        byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b'-' | b'~' | b'/')
+    }) {
+        return false;
+    }
+    // Reject traversal-like and degenerate paths explicitly: empty segments
+    // (`//`), current/parent segments (`.` / `..`), and leading/trailing `/`
+    // (which would indicate an empty segment after the prefix split).
+    if rest.starts_with('/') || rest.ends_with('/') {
+        return false;
+    }
+    for segment in rest.split('/') {
+        if segment.is_empty() || segment == "." || segment == ".." {
+            return false;
+        }
+    }
+    true
 }
 
 fn load_settings(app: &AppHandle) -> Result<Settings, String> {
@@ -1217,6 +1251,40 @@ fn preserve_corrupt_history(path: &Path) -> Result<PathBuf, String> {
     fs::copy(path, &preserved)
         .map(|_| preserved)
         .map_err(|error| format!("Could not preserve corrupt history: {error}"))
+}
+
+/// Returns true only for the exact `history.corrupt-*.json` recovery
+/// contract: same directory as `history.json`, regular files whose name
+/// starts with `history.corrupt-` and ends with `.json`. Unrelated files
+/// (different prefix/suffix, subdirectories, symlinks to elsewhere) never
+/// match.
+fn is_corrupt_history_copy(file_name: &str) -> bool {
+    file_name.starts_with("history.corrupt-") && file_name.ends_with(".json")
+}
+
+fn remove_corrupt_history_copies(path: &Path) -> Result<(), String> {
+    let parent = path.parent().unwrap_or_else(|| Path::new("."));
+    let entries =
+        fs::read_dir(parent).map_err(|error| format!("Could not list history dir: {error}"))?;
+    for entry in entries {
+        let entry = entry.map_err(|error| format!("Could not read history dir: {error}"))?;
+        let file_type = entry
+            .file_type()
+            .map_err(|error| format!("Could not inspect history entry: {error}"))?;
+        if !file_type.is_file() {
+            continue;
+        }
+        let name = entry.file_name().to_string_lossy().to_string();
+        if is_corrupt_history_copy(&name) {
+            fs::remove_file(entry.path()).map_err(|error| {
+                format!(
+                    "Could not remove corrupt history copy {}: {error}",
+                    entry.path().display()
+                )
+            })?;
+        }
+    }
+    Ok(())
 }
 
 fn read_history_with_recovery(path: &Path) -> Result<Vec<HistoryItem>, String> {
@@ -1744,9 +1812,197 @@ fn temp_workspace() -> PathBuf {
     std::env::temp_dir().join("vibevoice")
 }
 
+/// App-private temp location with restrictive Unix permissions (0700).
+/// Failures carry actionable context; callers at startup log and continue so
+/// cleanup problems never block recovery.
+fn prepare_temp_workspace() -> Result<PathBuf, String> {
+    let path = temp_workspace();
+    fs::create_dir_all(&path).map_err(|error| {
+        format!(
+            "Could not create temp workspace {}: {error}",
+            path.display()
+        )
+    })?;
+    #[cfg(unix)]
+    {
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o700)).map_err(|error| {
+            format!(
+                "Could not restrict temp workspace {}: {error}",
+                path.display()
+            )
+        })?;
+    }
+    Ok(path)
+}
+
 fn cleanup_recording_artifacts(session: &RecordingSession) {
     let _ = fs::remove_file(&session.audio_path);
     let _ = fs::remove_file(session.output_prefix.with_extension("txt"));
+}
+
+/// Design (#47): per-process ownership + conservative stale-age reconciliation.
+///
+/// New recordings are named `recording-<pid>-<uuid>.wav` (plus a `.txt`
+/// companion with the same stem). Legacy `recording-<uuid>.wav` files are
+/// still recognized for backward compatibility.
+///
+/// Startup cleanup (`cleanup_stale_recording_artifacts`) guarantees one
+/// instance can never delete another live instance's active recording:
+/// - strict filename allow-list: only `recording-*` with `.wav`/`.txt` and a
+///   parseable pid/uuid (or legacy uuid) is ever considered; malformed and
+///   unrelated files are ignored;
+/// - only regular files are considered (directories/symlinks skipped);
+/// - a file whose embedded pid is alive (or equals our own pid and is still
+///   fresh) is always preserved;
+/// - a file whose owner pid is dead is an abnormal-termination artifact and
+///   is removed;
+/// - legacy files without a pid carry no ownership signal, so they are
+///   removed only when older than `STALE_RECORDING_AGE` (24h), which keeps
+///   recent/live files safe while eventually cleaning crashes;
+/// - cleanup errors are returned with actionable context; the startup caller
+///   logs them and continues so the app always recovers.
+const STALE_RECORDING_AGE: Duration = Duration::from_secs(24 * 60 * 60);
+
+fn new_recording_stem() -> String {
+    format!("recording-{}-{}", std::process::id(), Uuid::new_v4())
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RecordingOwnership {
+    Owned { pid: u32 },
+    Legacy,
+}
+
+fn parse_recording_filename(file_name: &str) -> Option<(RecordingOwnership, String)> {
+    let stem = file_name.strip_prefix("recording-")?;
+    // Extension must be exactly `wav` or `txt`; anything else is unrelated.
+    let (base, extension) = stem.rsplit_once('.')?;
+    if !matches!(extension, "wav" | "txt") {
+        return None;
+    }
+    // New format: `<pid>-<uuid>`. Legacy format: `<uuid>`.
+    if let Some((pid_part, uuid_part)) = base.split_once('-') {
+        if let Ok(pid) = pid_part.parse::<u32>() {
+            if uuid_part.parse::<Uuid>().is_ok() {
+                return Some((RecordingOwnership::Owned { pid }, extension.to_string()));
+            }
+        }
+    }
+    // Fall back to legacy: the whole base must be a UUID. This rejects
+    // malformed names like `recording-...tmp`, `recording-.wav`, or
+    // `recording-abc.wav` without touching them.
+    if base.parse::<Uuid>().is_ok() {
+        return Some((RecordingOwnership::Legacy, extension.to_string()));
+    }
+    None
+}
+
+fn is_pid_alive(pid: u32) -> bool {
+    if pid == std::process::id() {
+        return true;
+    }
+    #[cfg(unix)]
+    {
+        // Signal 0 performs error checking without delivering a signal:
+        // success (or EPERM) means the process exists; ESRCH means it is gone.
+        let result = unsafe { libc::kill(pid as i32, 0) };
+        if result == 0 {
+            return true;
+        }
+        io::Error::last_os_error().raw_os_error() != Some(libc::ESRCH)
+    }
+    #[cfg(not(unix))]
+    {
+        // Conservative fallback: without a reliable liveness probe, assume
+        // alive so startup cleanup never deletes a potentially live file.
+        // Dead-pid artifacts on these platforms are cleaned via the
+        // stale-age path once they grow old.
+        let _ = pid;
+        true
+    }
+}
+
+fn file_age(metadata: &fs::Metadata) -> Option<Duration> {
+    metadata.modified().ok()?.elapsed().ok()
+}
+
+fn should_remove_stale_recording(
+    file_name: &str,
+    metadata: &fs::Metadata,
+    current_pid: u32,
+) -> bool {
+    if !metadata.is_file() {
+        return false;
+    }
+    let Some((ownership, _)) = parse_recording_filename(file_name) else {
+        return false;
+    };
+    match ownership {
+        RecordingOwnership::Owned { pid } => {
+            if pid == current_pid {
+                // Own pid at startup: no recording is live yet for this
+                // process, but a reused pid could theoretically collide, so
+                // only remove when stale. Fresh own-pid files are preserved.
+                return file_age(metadata).is_some_and(|age| age >= STALE_RECORDING_AGE);
+            }
+            #[cfg(unix)]
+            {
+                // Another instance's file: never touch it while its owner lives.
+                if is_pid_alive(pid) {
+                    return false;
+                }
+                // Dead owner => abnormal-termination artifact; safe to reclaim.
+                true
+            }
+            #[cfg(not(unix))]
+            {
+                // No reliable liveness probe here: fall back to the same
+                // conservative stale-age rule as legacy files, so fresh live
+                // files are preserved while crashed artifacts are eventually
+                // reclaimed. `is_pid_alive` is still consulted where possible.
+                let _ = is_pid_alive(pid);
+                return file_age(metadata).is_some_and(|age| age >= STALE_RECORDING_AGE);
+            }
+        }
+        RecordingOwnership::Legacy => {
+            // No ownership signal: conservative stale-age reconciliation only.
+            file_age(metadata).is_some_and(|age| age >= STALE_RECORDING_AGE)
+        }
+    }
+}
+
+fn cleanup_recording_outputs_in(directory: &Path) -> Result<(), String> {
+    cleanup_recording_outputs_in_with_pid(directory, std::process::id())
+}
+
+fn cleanup_recording_outputs_in_with_pid(directory: &Path, current_pid: u32) -> Result<(), String> {
+    let entries = fs::read_dir(directory).map_err(|error| {
+        format!(
+            "Could not list temp workspace {}: {error}",
+            directory.display()
+        )
+    })?;
+    for entry in entries {
+        let entry =
+            entry.map_err(|error| format!("Could not read temp workspace entry: {error}"))?;
+        let file_name = entry.file_name().to_string_lossy().to_string();
+        let metadata = entry
+            .metadata()
+            .map_err(|error| format!("Could not inspect {}: {error}", entry.path().display()))?;
+        if should_remove_stale_recording(&file_name, &metadata, current_pid) {
+            fs::remove_file(entry.path()).map_err(|error| {
+                format!(
+                    "Could not remove stale recording {}: {error}",
+                    entry.path().display()
+                )
+            })?;
+        }
+    }
+    Ok(())
+}
+
+fn cleanup_stale_recording_artifacts() -> Result<(), String> {
+    cleanup_recording_outputs_in(&prepare_temp_workspace()?)
 }
 
 #[cfg(any(target_os = "windows", target_os = "macos"))]
@@ -2083,18 +2339,47 @@ fn replace_case_insensitive(input: &str, needle: &str, replacement: &str) -> Str
     if needle.is_empty() {
         return input.to_string();
     }
-    let lower_input = input.to_lowercase();
-    let lower_needle = needle.to_lowercase();
-    let mut output = String::new();
-    let mut index = 0;
-    while let Some(found) = lower_input[index..].find(&lower_needle) {
-        let start = index + found;
-        let end = start + needle.len();
-        output.push_str(&input[index..start]);
-        output.push_str(replacement);
-        index = end;
+    // Unicode-safe matching: never derive byte offsets from a transformed
+    // (`to_lowercase`) copy. Instead fold to `char`s and carry the original
+    // UTF-8 byte range for every folded char, so all slicing uses verified
+    // boundaries from `char_indices`. This keeps `İ` (which expands to two
+    // lowercase chars), combining marks, and other non-ASCII sequences
+    // panic-free and deterministic (left-to-right, non-overlapping).
+    let lower_needle: Vec<char> = needle.chars().flat_map(char::to_lowercase).collect();
+    if lower_needle.is_empty() {
+        return input.to_string();
     }
-    output.push_str(&input[index..]);
+    let mut lower_input = Vec::new();
+    let mut ranges: Vec<(usize, usize)> = Vec::new();
+    for (start, character) in input.char_indices() {
+        let end = start + character.len_utf8();
+        for lower in character.to_lowercase() {
+            lower_input.push(lower);
+            ranges.push((start, end));
+        }
+    }
+    let mut output = String::new();
+    let mut lower_index = 0;
+    let mut input_index = 0;
+    while lower_index + lower_needle.len() <= lower_input.len() {
+        if lower_input[lower_index..].starts_with(&lower_needle) {
+            let start = ranges[lower_index].0;
+            let end = ranges[lower_index + lower_needle.len() - 1].1;
+            // `start`/`end` come from `char_indices`, so they are always
+            // valid UTF-8 boundaries, and `start >= input_index` holds
+            // because both advance monotonically.
+            output.push_str(&input[input_index..start]);
+            output.push_str(replacement);
+            input_index = end;
+            lower_index += lower_needle.len();
+            while lower_index < ranges.len() && ranges[lower_index].1 <= input_index {
+                lower_index += 1;
+            }
+        } else {
+            lower_index += 1;
+        }
+    }
+    output.push_str(&input[input_index..]);
     output
 }
 
@@ -2685,6 +2970,7 @@ pub fn run() {
     let app = tauri::Builder::default()
         .plugin(tauri_plugin_global_shortcut::Builder::new().build())
         .plugin(tauri_plugin_clipboard_manager::init())
+        .plugin(tauri_plugin_opener::init())
         .plugin(tauri_plugin_process::init())
         .plugin(tauri_plugin_updater::Builder::new().build())
         .manage(AppData {
@@ -2720,6 +3006,12 @@ pub fn run() {
             show_main_window
         ])
         .setup(|app| {
+            // Best-effort reclaim of abnormal-termination artifacts. Failures
+            // are logged (never logged with audio/transcript content) and do
+            // not block startup, so the app always recovers safely.
+            if let Err(error) = cleanup_stale_recording_artifacts() {
+                eprintln!("Could not clean stale recording artifacts: {error}");
+            }
             setup_tray(app.handle())?;
             let hotkey = load_settings(app.handle())
                 .map(|settings| settings.hotkey)
@@ -3444,6 +3736,357 @@ mod tests {
             .unwrap()
             .is_some());
         let _ = fs::remove_dir_all(root);
+    }
+
+    // ---- WP2 #52: release URL validation ----
+
+    #[test]
+    fn release_url_accepts_canonical_release_tag_and_download_urls() {
+        assert!(is_allowed_release_url(RELEASES_URL));
+        assert!(is_allowed_release_url(
+            "https://github.com/Zburgers/vibevoice/releases/tag/v0.2.7"
+        ));
+        assert!(is_allowed_release_url(
+            "https://github.com/Zburgers/vibevoice/releases/download/v0.2.7/VibeVoice_0.2.7_x64.AppImage"
+        ));
+    }
+
+    #[test]
+    fn release_url_rejects_shell_metacharacters_and_injection_tricks() {
+        for evil in [
+            "https://github.com/Zburgers/vibevoice/releases/tag/v0.2.7 && rm -rf /",
+            "https://github.com/Zburgers/vibevoice/releases/tag/v0.2.7&calc.exe",
+            "https://github.com/Zburgers/vibevoice/releases/tag/v0.2.7|cat /etc/passwd",
+            "https://github.com/Zburgers/vibevoice/releases/tag/v0.2.7;id",
+            "https://github.com/Zburgers/vibevoice/releases/tag/v0.2.7`id`",
+            "https://github.com/Zburgers/vibevoice/releases/tag/v0.2.7$(id)",
+            "https://github.com/Zburgers/vibevoice/releases/tag/'v0.2.7'",
+            "https://github.com/Zburgers/vibevoice/releases/tag/\"v0.2.7\"",
+            "https://github.com/Zburgers/vibevoice/releases/tag/v0.2.7\r\nEvil: 1",
+            "https://github.com/Zburgers/vibevoice/releases/tag/v0.2.7\nx",
+        ] {
+            assert!(!is_allowed_release_url(evil), "must reject {evil:?}");
+        }
+    }
+
+    #[test]
+    fn release_url_rejects_query_fragment_malformed_and_traversal() {
+        for bad in [
+            "https://github.com/Zburgers/vibevoice/releases/tag/v0.2.7?next=evil",
+            "https://github.com/Zburgers/vibevoice/releases/tag/v0.2.7#evil",
+            "https://github.com/Zburgers/vibevoice/releases/download/v0.2.7/file?x=1#y",
+            "https://github.com/Zburgers/vibevoice/releases.evil.example/tag/v0.2.7",
+            "https://github.com/Zburgers/vibevoice/issues",
+            "https://github.com/Zburgers/vibevoice/releases/",
+            "https://github.com/Zburgers/vibevoice/releases/tag/",
+            "https://github.com/Zburgers/vibevoice/releases/tag/v",
+            "https://github.com/Zburgers/vibevoice/releases/tag/v0.2.7/../evil",
+            "https://github.com/Zburgers/vibevoice/releases/download/../evil",
+            "https://github.com/Zburgers/vibevoice/releases/tag/v0.2.7//evil",
+            "https://github.com/Zburgers/vibevoice/releases/download//evil",
+            "https://github.com/Zburgers/vibevoice/releases/tag/v0.2.7/",
+            "not a url",
+            "",
+        ] {
+            assert!(!is_allowed_release_url(bad), "must reject {bad:?}");
+        }
+    }
+
+    // ---- WP2 #53: Unicode-safe dictionary replacement ----
+
+    #[test]
+    fn dictionary_handles_dotted_capital_i_without_panic() {
+        // U+0130 lowercases to two chars (`i` + combining dot); the old
+        // byte-offset implementation sliced mid-character and panicked.
+        assert_eq!(replace_case_insensitive("İstanbul", "i", "X"), "Xstanbul");
+        assert_eq!(replace_case_insensitive("I", "İ", "X"), "I");
+    }
+
+    #[test]
+    fn dictionary_handles_combining_characters() {
+        // Combining marks must never split UTF-8 boundaries or panic. Matching
+        // is simple case-folding without Unicode normalization, so identical
+        // normal forms match and cross-form inputs are safely left alone.
+        let decomposed = "cafe\u{301}";
+        assert_eq!(
+            replace_case_insensitive(decomposed, "CAFE\u{301}", "coffee"),
+            "coffee"
+        );
+        assert_eq!(
+            replace_case_insensitive(decomposed, "café", "coffee"),
+            decomposed
+        );
+        assert_eq!(
+            replace_case_insensitive("café", "CAFE\u{301}", "coffee"),
+            "café"
+        );
+    }
+
+    #[test]
+    fn dictionary_handles_non_ascii_needle_and_replacement() {
+        assert_eq!(
+            replace_case_insensitive("CAFÉ AU LAIT", "café", "coffee"),
+            "coffee AU LAIT"
+        );
+        assert_eq!(
+            replace_case_insensitive("hello world", "world", "wörld ✓"),
+            "hello wörld ✓"
+        );
+        assert_eq!(
+            replace_case_insensitive("naïve NAÏVE", "naïve", "simple"),
+            "simple simple"
+        );
+    }
+
+    #[test]
+    fn dictionary_handles_ascii_no_match_and_overlapping_rules() {
+        assert_eq!(
+            replace_case_insensitive("hello world", "xyz", "Q"),
+            "hello world"
+        );
+        // Deterministic left-to-right, non-overlapping application.
+        assert_eq!(replace_case_insensitive("aaa", "aa", "b"), "ba");
+        assert_eq!(
+            replace_case_insensitive("next js and NEXT JS", "next js", "Next.js"),
+            "Next.js and Next.js"
+        );
+        assert_eq!(replace_case_insensitive("", "a", "b"), "");
+        assert_eq!(replace_case_insensitive("abc", "", "b"), "abc");
+    }
+
+    #[test]
+    fn dictionary_applies_rules_deterministically_in_order() {
+        let rules = vec![
+            DictionaryRule {
+                id: "1".to_string(),
+                spoken: "github actions".to_string(),
+                replacement: "GitHub Actions".to_string(),
+                enabled: true,
+            },
+            DictionaryRule {
+                id: "2".to_string(),
+                spoken: "github".to_string(),
+                replacement: "GitHub".to_string(),
+                enabled: true,
+            },
+        ];
+        assert_eq!(
+            apply_dictionary("use github actions today", &rules),
+            "use GitHub Actions today"
+        );
+    }
+
+    // ---- WP2 #54: corrupt-history cleanup contract ----
+
+    #[test]
+    fn clear_history_helper_removes_only_corrupt_copies() {
+        let root = std::env::temp_dir().join(format!("vibevoice-history-wp2-{}", Uuid::new_v4()));
+        fs::create_dir_all(&root).unwrap();
+        let path = root.join("history.json");
+        fs::write(&path, b"[]").unwrap();
+        fs::write(root.join("history.json.bak"), b"[]").unwrap();
+        fs::write(root.join("history.corrupt-2026-01-01-abc.json"), b"stale").unwrap();
+        fs::write(root.join("history.corrupt-xyz.json"), b"stale").unwrap();
+        fs::write(root.join("history.keep.json"), b"keep").unwrap();
+        fs::write(root.join("notes.txt"), b"keep").unwrap();
+
+        remove_corrupt_history_copies(&path).unwrap();
+
+        assert!(!root.join("history.corrupt-2026-01-01-abc.json").exists());
+        assert!(!root.join("history.corrupt-xyz.json").exists());
+        assert!(root.join("history.json").exists());
+        assert!(root.join("history.json.bak").exists());
+        assert!(root.join("history.keep.json").exists());
+        assert!(root.join("notes.txt").exists());
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn corrupt_history_matcher_requires_exact_contract() {
+        assert!(is_corrupt_history_copy("history.corrupt-abc.json"));
+        assert!(!is_corrupt_history_copy("history.keep.json"));
+        assert!(!is_corrupt_history_copy("history.json"));
+        assert!(!is_corrupt_history_copy("history.corrupt-abc.json.bak"));
+        assert!(!is_corrupt_history_copy("history.corrupt-abc.txt"));
+        assert!(!is_corrupt_history_copy("other.corrupt-abc.json"));
+    }
+
+    #[test]
+    fn corrupt_history_cleanup_reports_missing_directory_actionably() {
+        let missing = std::env::temp_dir().join(format!("vibevoice-missing-{}", Uuid::new_v4()));
+        let path = missing.join("history.json");
+        let error = remove_corrupt_history_copies(&path).unwrap_err();
+        assert!(error.contains("Could not list history dir"));
+    }
+
+    // ---- WP2 #47: safe stale-recording cleanup ----
+
+    fn wp2_write(dir: &Path, name: &str) -> PathBuf {
+        let path = dir.join(name);
+        fs::write(&path, b"fixture").unwrap();
+        path
+    }
+
+    fn wp2_set_old(path: &Path) {
+        let old = std::time::SystemTime::now() - STALE_RECORDING_AGE - Duration::from_secs(60);
+        let file = fs::File::options().write(true).open(path).unwrap();
+        file.set_modified(old).unwrap();
+    }
+
+    fn wp2_dead_pid() -> u32 {
+        // A pid that cannot exist on any supported platform probe path.
+        4_000_000_000_u32.wrapping_sub(17)
+    }
+
+    #[test]
+    fn stale_owned_recording_is_removed_with_companion() {
+        let dir = std::env::temp_dir().join(format!("vibevoice-wp2-{}", Uuid::new_v4()));
+        fs::create_dir_all(&dir).unwrap();
+        let stem = format!("recording-{}-{}", wp2_dead_pid(), Uuid::new_v4());
+        let wav = wp2_write(&dir, &format!("{stem}.wav"));
+        let txt = wp2_write(&dir, &format!("{stem}.txt"));
+        wp2_set_old(&wav);
+        wp2_set_old(&txt);
+
+        cleanup_recording_outputs_in_with_pid(&dir, 123_456).unwrap();
+
+        assert!(!wav.exists());
+        assert!(!txt.exists());
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn live_and_recent_files_are_preserved() {
+        let dir = std::env::temp_dir().join(format!("vibevoice-wp2-{}", Uuid::new_v4()));
+        fs::create_dir_all(&dir).unwrap();
+        let current = std::process::id();
+        let own = wp2_write(&dir, &format!("recording-{current}-{}.wav", Uuid::new_v4()));
+        // Another live session: spawn a sleeper and borrow its pid.
+        let mut child = Command::new("sleep")
+            .arg("30")
+            .spawn()
+            .expect("sleep fixture");
+        let live_pid = child.id();
+        assert!(is_pid_alive(live_pid));
+        let live = wp2_write(
+            &dir,
+            &format!("recording-{live_pid}-{}.wav", Uuid::new_v4()),
+        );
+        // Legacy but fresh: conservative age rule must preserve it.
+        let legacy = wp2_write(&dir, &format!("recording-{}.wav", Uuid::new_v4()));
+
+        cleanup_recording_outputs_in_with_pid(&dir, current).unwrap();
+
+        assert!(own.exists(), "own fresh file preserved");
+        assert!(live.exists(), "other live instance preserved");
+        assert!(legacy.exists(), "fresh legacy file preserved");
+        let _ = child.kill();
+        let _ = child.wait();
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn legacy_stale_file_is_eventually_cleaned() {
+        let dir = std::env::temp_dir().join(format!("vibevoice-wp2-{}", Uuid::new_v4()));
+        fs::create_dir_all(&dir).unwrap();
+        let stale = wp2_write(&dir, &format!("recording-{}.wav", Uuid::new_v4()));
+        wp2_set_old(&stale);
+
+        cleanup_recording_outputs_in_with_pid(&dir, std::process::id()).unwrap();
+
+        assert!(!stale.exists());
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn malformed_and_unrelated_files_are_ignored() {
+        let dir = std::env::temp_dir().join(format!("vibevoice-wp2-{}", Uuid::new_v4()));
+        fs::create_dir_all(&dir).unwrap();
+        let names = [
+            "recording-.wav",
+            "recording-abc.wav",
+            "recording-123.wav",
+            "recording-1-not-a-uuid.wav",
+            "recording-9999999999-zzz.txt",
+            "recording-old.tmp",
+            "keep.txt",
+            "audio.wav",
+            "recording-123.mp3",
+        ];
+        for name in names {
+            wp2_write(&dir, name);
+        }
+        fs::create_dir_all(dir.join("recording-123-abc.wav")).unwrap();
+
+        cleanup_recording_outputs_in(&dir).unwrap();
+
+        for name in names {
+            assert!(dir.join(name).exists(), "ignored {name}");
+        }
+        assert!(dir.join("recording-123-abc.wav").is_dir());
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn stale_cleanup_error_is_actionable() {
+        let file = std::env::temp_dir().join(format!("vibevoice-wp2-file-{}", Uuid::new_v4()));
+        fs::write(&file, b"x").unwrap();
+        let error = cleanup_recording_outputs_in(&file).unwrap_err();
+        assert!(error.contains("Could not list temp workspace"));
+        let _ = fs::remove_file(file);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn dead_owner_recording_is_reclaimed_without_waiting_for_age() {
+        let dir = std::env::temp_dir().join(format!("vibevoice-wp2-{}", Uuid::new_v4()));
+        fs::create_dir_all(&dir).unwrap();
+        let stem = format!("recording-{}-{}", wp2_dead_pid(), Uuid::new_v4());
+        let wav = wp2_write(&dir, &format!("{stem}.wav"));
+
+        cleanup_recording_outputs_in_with_pid(&dir, 123_456).unwrap();
+
+        assert!(
+            !wav.exists(),
+            "dead-owner artifact reclaimed promptly on unix"
+        );
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn startup_after_crash_cleans_stale_but_keeps_workspace_usable() {
+        let dir = std::env::temp_dir().join(format!("vibevoice-wp2-{}", Uuid::new_v4()));
+        fs::create_dir_all(&dir).unwrap();
+        let stale_stem = format!("recording-{}-{}", wp2_dead_pid(), Uuid::new_v4());
+        let stale_wav = wp2_write(&dir, &format!("{stale_stem}.wav"));
+        let stale_txt = wp2_write(&dir, &format!("{stale_stem}.txt"));
+        wp2_set_old(&stale_wav);
+        wp2_set_old(&stale_txt);
+        let current = std::process::id();
+        let live = wp2_write(&dir, &format!("recording-{current}-{}.wav", Uuid::new_v4()));
+
+        cleanup_recording_outputs_in_with_pid(&dir, current).unwrap();
+
+        assert!(!stale_wav.exists());
+        assert!(!stale_txt.exists());
+        assert!(live.exists());
+        // Workspace still usable for a fresh recording after recovery.
+        let fresh = dir.join(format!("{}.wav", new_recording_stem()));
+        fs::write(&fresh, b"new").unwrap();
+        assert!(fresh.exists());
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn temp_workspace_is_app_private_on_unix() {
+        let path = prepare_temp_workspace().unwrap();
+        assert!(path.exists());
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::MetadataExt;
+            let mode = fs::metadata(&path).unwrap().mode() & 0o777;
+            assert_eq!(mode, 0o700);
+        }
     }
 
     fn history_item(final_transcript: &str, created_at: DateTime<Utc>) -> HistoryItem {
