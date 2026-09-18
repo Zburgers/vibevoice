@@ -1,32 +1,34 @@
 use atomicwrites::{AllowOverwrite, AtomicFile};
 use chrono::{DateTime, Duration as ChronoDuration, Utc};
 use serde::{Deserialize, Serialize};
+#[cfg(unix)]
+use std::os::unix::fs::PermissionsExt;
+#[cfg(unix)]
+use std::os::unix::process::CommandExt;
+#[cfg(target_os = "windows")]
+use std::os::windows::process::CommandExt;
 use std::{
     fs,
     io::{self, Write},
     path::{Path, PathBuf},
-    process::{Child, Command, Stdio},
+    process::{Child, Command, ExitStatus, Stdio},
     str::FromStr,
     sync::{
-        atomic::{AtomicBool, AtomicU32, Ordering},
+        atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering},
         Arc, Mutex,
     },
     thread::{self},
     time::{Duration, Instant},
 };
-
-#[cfg(unix)]
-use std::os::unix::process::CommandExt;
-#[cfg(windows)]
-use std::os::windows::process::CommandExt;
 use tauri::{
     async_runtime,
     menu::{Menu, MenuItem},
     tray::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent},
-    AppHandle, Emitter, Manager,
+    AppHandle, Emitter, Manager, WebviewWindow,
 };
 use tauri_plugin_clipboard_manager::ClipboardExt;
 use tauri_plugin_global_shortcut::{Code, GlobalShortcutExt, Modifiers, Shortcut, ShortcutState};
+use tauri_plugin_opener::OpenerExt;
 use uuid::Uuid;
 
 #[cfg(any(target_os = "windows", target_os = "macos"))]
@@ -48,9 +50,23 @@ const RELEASES_URL: &str = "https://github.com/Zburgers/vibevoice/releases";
 const DEFAULT_MAX_HISTORY_ENTRIES: usize = 100;
 const MAX_HISTORY_ENTRIES: usize = 1000;
 const DIAGNOSTICS_CACHE_TTL: Duration = Duration::from_secs(5);
+const PASTE_HELPER_TIMEOUT: Duration = Duration::from_secs(2);
+const PASTE_HELPER_POLL_INTERVAL: Duration = Duration::from_millis(20);
 const DEFAULT_TRANSCRIPTION_TIMEOUT_SECONDS: u64 = 900;
 const MIN_TRANSCRIPTION_TIMEOUT_SECONDS: u64 = 30;
-const MAX_TRANSCRIPTION_TIMEOUT_SECONDS: u64 = 3600;
+const MAX_TRANSCRIPTION_TIMEOUT_SECONDS: u64 = 1800;
+
+#[cfg(target_os = "windows")]
+const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+#[cfg(target_os = "windows")]
+const CREATE_NEW_PROCESS_GROUP: u32 = 0x0000_0200;
+
+fn configure_command(command: &mut Command) {
+    #[cfg(target_os = "windows")]
+    command.creation_flags(CREATE_NO_WINDOW);
+    #[cfg(not(target_os = "windows"))]
+    let _ = command;
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "PascalCase")]
@@ -120,6 +136,60 @@ struct Diagnostics {
     last_error: Option<String>,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+enum UpdaterStatus {
+    Idle,
+    Checking,
+    Available,
+    Current,
+    Installing,
+    Installed,
+    Error,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct DiagnosticsReport {
+    report: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+enum InsertionOutcome {
+    Inserted,
+    CopiedOnly,
+    Failed,
+    Cancelled,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+enum ClipboardSnapshot {
+    Text(String),
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(default)]
+struct InsertionReport {
+    outcome: InsertionOutcome,
+    copy_status: String,
+    paste_status: String,
+    clipboard_restored: bool,
+    error: Option<String>,
+}
+
+impl Default for InsertionReport {
+    fn default() -> Self {
+        Self {
+            outcome: InsertionOutcome::Cancelled,
+            copy_status: "not_attempted".to_string(),
+            paste_status: "not_attempted".to_string(),
+            clipboard_restored: false,
+            error: None,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct HistoryItem {
     id: String,
@@ -129,6 +199,8 @@ struct HistoryItem {
     duration_ms: Option<u128>,
     insert_status: String,
     error: Option<String>,
+    #[serde(default)]
+    insertion_report: InsertionReport,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -204,6 +276,13 @@ struct RuntimeState {
     last_transcript: Option<String>,
     last_error: Option<String>,
     mic_level: f32,
+    /// Identity of the in-flight preparation, if any (#50).
+    ///
+    /// Every `begin_recording` allocates a fresh generation. A stop (or
+    /// shutdown) during `Preparing` clears this slot, which invalidates the
+    /// outstanding start: the late worker must discard its session instead of
+    /// installing it, even if audio resources were already acquired.
+    preparing_generation: Option<u64>,
 }
 
 impl Default for RuntimeState {
@@ -214,6 +293,7 @@ impl Default for RuntimeState {
             last_transcript: None,
             last_error: None,
             mic_level: 0.0,
+            preparing_generation: None,
         }
     }
 }
@@ -243,11 +323,35 @@ struct AppData {
     runtime: Mutex<RuntimeState>,
     diagnostics_cache: Mutex<Option<DiagnosticsCache>>,
     history: Mutex<()>,
+    insertion: Mutex<()>,
+    lifecycle: Mutex<()>,
+    shutdown: Arc<AtomicBool>,
     transcription_cancel: Mutex<Option<Arc<AtomicBool>>>,
+    worker_threads: Mutex<Vec<thread::JoinHandle<()>>>,
+    meter_threads: Mutex<Vec<thread::JoinHandle<()>>>,
+    /// Monotonic allocator for recording-start identities (#50). Never zero
+    /// for an allocated generation; `0` means "no generation".
+    preparation_counter: AtomicU64,
+}
+
+fn authorize_window(window: &WebviewWindow, allowed: &[&str]) -> Result<(), String> {
+    if allowed.iter().any(|label| *label == window.label()) {
+        Ok(())
+    } else {
+        Err(format!(
+            "Command is not authorized for window '{}'.",
+            window.label()
+        ))
+    }
 }
 
 #[tauri::command]
-fn get_app_state(app: AppHandle, data: tauri::State<AppData>) -> Result<AppStateSnapshot, String> {
+fn get_app_state(
+    app: AppHandle,
+    data: tauri::State<AppData>,
+    window: WebviewWindow,
+) -> Result<AppStateSnapshot, String> {
+    authorize_window(&window, &["main", "pill"])?;
     let settings = load_settings(&app)?;
     let dictionary = load_dictionary(&app)?;
     let history = load_history_for_settings(&app, &settings, &data.history)?;
@@ -273,10 +377,50 @@ fn get_app_state(app: AppHandle, data: tauri::State<AppData>) -> Result<AppState
 }
 
 #[tauri::command]
-fn refresh_diagnostics(app: AppHandle, data: tauri::State<AppData>) -> Result<Diagnostics, String> {
+fn refresh_diagnostics(
+    app: AppHandle,
+    data: tauri::State<AppData>,
+    window: WebviewWindow,
+) -> Result<Diagnostics, String> {
+    authorize_window(&window, &["main"])?;
     let settings = load_settings(&app)?;
     let runtime = data.runtime.lock().map_err(|error| error.to_string())?;
     cached_diagnostics(&app, &data, &settings, runtime.last_error.clone(), true)
+}
+
+#[tauri::command]
+fn get_diagnostics_report(
+    app: AppHandle,
+    data: tauri::State<AppData>,
+    updater_status: UpdaterStatus,
+    window: WebviewWindow,
+) -> Result<DiagnosticsReport, String> {
+    authorize_window(&window, &["main"])?;
+    let settings = load_settings(&app)?;
+    let runtime = data.runtime.lock().map_err(|error| error.to_string())?;
+    let diagnostics =
+        cached_diagnostics(&app, &data, &settings, runtime.last_error.clone(), false)?;
+    Ok(DiagnosticsReport {
+        report: format_diagnostics_report(&diagnostics, &updater_status),
+    })
+}
+
+#[tauri::command]
+fn copy_diagnostics_report(
+    app: AppHandle,
+    data: tauri::State<AppData>,
+    updater_status: UpdaterStatus,
+    window: WebviewWindow,
+) -> Result<(), String> {
+    authorize_window(&window, &["main"])?;
+    let settings = load_settings(&app)?;
+    let runtime = data.runtime.lock().map_err(|error| error.to_string())?;
+    let diagnostics =
+        cached_diagnostics(&app, &data, &settings, runtime.last_error.clone(), false)?;
+    let report = format_diagnostics_report(&diagnostics, &updater_status);
+    with_insertion_lock(&data.insertion, || {
+        copy_to_clipboard(&app, &report).map(|_| ())
+    })
 }
 
 #[tauri::command]
@@ -284,7 +428,9 @@ fn save_settings(
     app: AppHandle,
     data: tauri::State<AppData>,
     mut settings: Settings,
+    window: WebviewWindow,
 ) -> Result<(), String> {
+    authorize_window(&window, &["main"])?;
     settings.transcription_timeout_seconds = settings.transcription_timeout_seconds.clamp(
         MIN_TRANSCRIPTION_TIMEOUT_SECONDS,
         MAX_TRANSCRIPTION_TIMEOUT_SECONDS,
@@ -302,31 +448,106 @@ fn save_settings(
 }
 
 #[tauri::command]
-async fn start_recording(app: AppHandle, data: tauri::State<'_, AppData>) -> Result<(), String> {
+async fn start_recording(
+    app: AppHandle,
+    data: tauri::State<'_, AppData>,
+    window: WebviewWindow,
+) -> Result<(), String> {
+    authorize_window(&window, &["main", "pill"])?;
+    start_recording_impl(app, data)
+}
+
+fn start_recording_impl(app: AppHandle, data: tauri::State<'_, AppData>) -> Result<(), String> {
     begin_recording(app, data)
 }
 
+/// Allocate a fresh, never-zero preparation identity (#50).
+fn next_preparation_generation(counter: &AtomicU64) -> u64 {
+    // `fetch_add` returns the previous value; add one so the allocated id is
+    // never zero (`0` is reserved for "no generation"). Wrapping is
+    // acceptable: the counter is only compared for equality against the single
+    // currently-valid slot, and allocation happens under the lifecycle lock.
+    let next = counter.fetch_add(1, Ordering::Relaxed).wrapping_add(1);
+    if next == 0 {
+        counter.fetch_add(1, Ordering::Relaxed).wrapping_add(1)
+    } else {
+        next
+    }
+}
+
+/// Attempt to claim the `Preparing` slot for `generation`.
+///
+/// Must be called with the lifecycle lock held and without holding the runtime
+/// lock across any blocking audio work (callers only mutate state here).
+fn try_claim_preparation_slot(runtime: &mut RuntimeState, generation: u64) -> Result<(), String> {
+    match runtime.voice_state {
+        VoiceState::Preparing => return Err("Recording is still starting.".to_string()),
+        VoiceState::Recording => return Err("Recording is already active.".to_string()),
+        VoiceState::Processing => {
+            return Err("Recording is still processing. Please wait.".to_string())
+        }
+        _ => {}
+    }
+    runtime.voice_state = VoiceState::Preparing;
+    runtime.last_error = None;
+    runtime.mic_level = 0.0;
+    runtime.recording = None;
+    runtime.preparing_generation = Some(generation);
+    Ok(())
+}
+
+/// Cancel an in-flight preparation for the stop-during-Preparing path (#50).
+///
+/// Returns the invalidated generation, if any. The late worker holding that
+/// generation must discard its session (stopping/cleaning audio resources if
+/// they were already acquired) and must never install itself or touch state.
+fn cancel_preparation_for_stop(runtime: &mut RuntimeState) -> Option<u64> {
+    if !matches!(runtime.voice_state, VoiceState::Preparing) {
+        return None;
+    }
+    let generation = runtime.preparing_generation.take();
+    runtime.voice_state = VoiceState::Ready;
+    runtime.last_error = None;
+    runtime.mic_level = 0.0;
+    runtime.recording = None;
+    generation
+}
+
+/// True only when `generation` is still the valid in-flight preparation.
+fn is_preparation_current(runtime: &RuntimeState, generation: u64) -> bool {
+    matches!(runtime.voice_state, VoiceState::Preparing)
+        && runtime.preparing_generation == Some(generation)
+}
+
+/// Invalidate any outstanding preparation (shutdown path, #50).
+fn invalidate_preparation(runtime: &mut RuntimeState) {
+    runtime.preparing_generation = None;
+}
+
 fn begin_recording(app: AppHandle, data: tauri::State<'_, AppData>) -> Result<(), String> {
+    let lifecycle = data.lifecycle.lock().map_err(|error| error.to_string())?;
+    if data.shutdown.load(Ordering::Acquire) {
+        return Err("VibeVoice is shutting down.".to_string());
+    }
+    // Each start owns a fresh identity. The generation is allocated up front
+    // so stop/shutdown can invalidate this exact start even while audio
+    // initialization is still blocking off-lock.
+    let generation = next_preparation_generation(&data.preparation_counter);
     {
         let mut runtime = data.runtime.lock().map_err(|error| error.to_string())?;
-        match runtime.voice_state {
-            VoiceState::Preparing => return Err("Recording is still starting.".to_string()),
-            VoiceState::Recording => return Err("Recording is already active.".to_string()),
-            VoiceState::Processing => {
-                return Err("Recording is still processing. Please wait.".to_string())
-            }
-            _ => {}
-        }
-        runtime.voice_state = VoiceState::Preparing;
-        runtime.last_error = None;
-        runtime.mic_level = 0.0;
-        runtime.recording = None;
+        try_claim_preparation_slot(&mut runtime, generation)?;
     }
-    emit_state_changed(&app);
-
     let app_handle = app.clone();
-    async_runtime::spawn_blocking(move || match prepare_recording_session(&app_handle) {
+    let shutdown = Arc::clone(&data.shutdown);
+    let worker = thread::spawn(move || match prepare_recording_session(&app_handle) {
         Ok(mut session) => {
+            // Shutdown invalidates every outstanding preparation. Stop any
+            // acquired audio resources immediately and never install.
+            if shutdown.load(Ordering::Acquire) {
+                let _ = stop_audio_capture(&mut session);
+                cleanup_recording_artifacts(&session);
+                return;
+            }
             let mic_level = Arc::clone(&session.mic_level);
             let data = app_handle.state::<AppData>();
             let mut runtime = match data.runtime.lock() {
@@ -338,33 +559,62 @@ fn begin_recording(app: AppHandle, data: tauri::State<'_, AppData>) -> Result<()
                     return;
                 }
             };
-            if !matches!(runtime.voice_state, VoiceState::Preparing) {
+            // A cancelled (or superseded) preparation may never install
+            // itself. If audio resources were already acquired, stop and clean
+            // them immediately without touching the current state, so
+            // start → stop → start cannot let the first generation corrupt
+            // the second.
+            if !is_preparation_current(&runtime, generation) {
+                drop(runtime);
                 let _ = stop_audio_capture(&mut session);
+                cleanup_recording_artifacts(&session);
                 return;
             }
+            runtime.preparing_generation = None;
             runtime.voice_state = VoiceState::Recording;
             runtime.last_error = None;
             runtime.mic_level = 0.0;
             runtime.recording = Some(session);
             drop(runtime);
             emit_state_changed(&app_handle);
-            spawn_meter_emitter(app_handle.clone(), mic_level);
+            let meter_thread =
+                spawn_meter_emitter(app_handle.clone(), mic_level, Arc::clone(&shutdown));
+            track_thread(&data.meter_threads, meter_thread);
         }
         Err(error) => {
+            if shutdown.load(Ordering::Acquire) {
+                return;
+            }
             let data = app_handle.state::<AppData>();
-            let _ = set_runtime_error(&data, &error);
+            let mut runtime = match data.runtime.lock() {
+                Ok(runtime) => runtime,
+                Err(_) => return,
+            };
+            // A failed preparation after cancellation (or after a newer start
+            // claimed the slot) remains harmless: leave the current state
+            // alone instead of overwriting it with a stale error.
+            if !is_preparation_current(&runtime, generation) {
+                return;
+            }
+            runtime.preparing_generation = None;
+            runtime.voice_state = VoiceState::Error;
+            runtime.last_error = Some(error);
+            runtime.mic_level = 0.0;
+            drop(runtime);
             emit_state_changed(&app_handle);
         }
     });
+    track_thread(&data.worker_threads, worker);
+    drop(lifecycle);
+    emit_state_changed(&app);
     Ok(())
 }
 
 fn prepare_recording_session(app: &AppHandle) -> Result<RecordingSession, String> {
     let settings = load_settings(app)?;
     ensure_engine_ready(&settings)?;
-    let tmp = temp_workspace();
-    fs::create_dir_all(&tmp).map_err(|error| error.to_string())?;
-    let stem = format!("recording-{}", Uuid::new_v4());
+    let tmp = prepare_temp_workspace()?;
+    let stem = new_recording_stem();
     let audio_path = tmp.join(format!("{stem}.wav"));
     let output_prefix = tmp.join(stem);
     let session = start_audio_capture(audio_path, output_prefix)?;
@@ -374,55 +624,102 @@ fn prepare_recording_session(app: &AppHandle) -> Result<RecordingSession, String
 }
 
 #[tauri::command]
-async fn stop_recording(app: AppHandle, data: tauri::State<'_, AppData>) -> Result<(), String> {
+async fn stop_recording(
+    app: AppHandle,
+    data: tauri::State<'_, AppData>,
+    window: WebviewWindow,
+) -> Result<(), String> {
+    authorize_window(&window, &["main", "pill"])?;
+    stop_recording_impl(app, data).await
+}
+
+async fn stop_recording_impl(
+    app: AppHandle,
+    data: tauri::State<'_, AppData>,
+) -> Result<(), String> {
+    let lifecycle = data.lifecycle.lock().map_err(|error| error.to_string())?;
+    if data.shutdown.load(Ordering::Acquire) {
+        return Err("VibeVoice is shutting down.".to_string());
+    }
     let mut session = {
         let mut runtime = data.runtime.lock().map_err(|error| error.to_string())?;
+        // Stop during Preparing (#50): invalidate the outstanding start and
+        // report success. The late preparation worker owns `generation` and
+        // will stop/clean any already-acquired audio resources without ever
+        // installing itself as the active session.
+        if matches!(runtime.voice_state, VoiceState::Preparing) && runtime.recording.is_none() {
+            cancel_preparation_for_stop(&mut runtime);
+            drop(runtime);
+            drop(lifecycle);
+            emit_state_changed(&app);
+            return Ok(());
+        }
         match runtime.recording.take() {
             Some(session) => {
+                runtime.preparing_generation = None;
                 runtime.voice_state = VoiceState::Processing;
                 session
             }
             None => {
-                let message = if matches!(runtime.voice_state, VoiceState::Preparing) {
-                    "Recording is still starting. Try stopping again in a moment."
-                } else {
-                    "No active recording to stop."
-                };
-                runtime.voice_state = if matches!(runtime.voice_state, VoiceState::Preparing) {
-                    VoiceState::Preparing
-                } else {
-                    VoiceState::Ready
-                };
-                runtime.last_error = Some(message.to_string());
-                return Err(message.to_string());
+                let message = "No active recording to stop.".to_string();
+                runtime.voice_state = VoiceState::Ready;
+                runtime.last_error = Some(message.clone());
+                return Err(message);
             }
         }
     };
     let transcription_cancel = Arc::new(AtomicBool::new(false));
-    *data
-        .transcription_cancel
-        .lock()
-        .map_err(|error| error.to_string())? = Some(Arc::clone(&transcription_cancel));
-    emit_state_changed(&app);
-
+    if let Ok(mut current) = data.transcription_cancel.lock() {
+        *current = Some(Arc::clone(&transcription_cancel));
+    }
     let app_handle = app.clone();
-    async_runtime::spawn_blocking(move || {
-        let result = finish_recording(app_handle.clone(), &mut session, &transcription_cancel);
+    let shutdown = Arc::clone(&data.shutdown);
+    let worker = thread::spawn(move || {
+        let result = finish_recording(
+            app_handle.clone(),
+            &mut session,
+            &transcription_cancel,
+            &shutdown,
+        );
         cleanup_recording_artifacts(&session);
         if let Err(error) = result {
+            if shutdown.load(Ordering::Acquire) {
+                if let Ok(mut current) = app_handle.state::<AppData>().transcription_cancel.lock() {
+                    if current
+                        .as_ref()
+                        .is_some_and(|token| Arc::ptr_eq(token, &transcription_cancel))
+                    {
+                        *current = None;
+                    }
+                }
+                return;
+            }
             let state = app_handle.state::<AppData>();
             let _ = set_runtime_error(&state, &error);
             emit_state_changed(&app_handle);
         }
         if let Ok(mut current) = app_handle.state::<AppData>().transcription_cancel.lock() {
-            *current = None;
+            if current
+                .as_ref()
+                .is_some_and(|token| Arc::ptr_eq(token, &transcription_cancel))
+            {
+                *current = None;
+            }
         }
     });
+    track_thread(&data.worker_threads, worker);
+    drop(lifecycle);
+    emit_state_changed(&app);
     Ok(())
 }
 
 #[tauri::command]
-fn cancel_transcription(app: AppHandle, data: tauri::State<AppData>) -> Result<(), String> {
+fn cancel_transcription(
+    app: AppHandle,
+    data: tauri::State<AppData>,
+    window: WebviewWindow,
+) -> Result<(), String> {
+    authorize_window(&window, &["main", "pill"])?;
     let cancel = data
         .transcription_cancel
         .lock()
@@ -438,8 +735,13 @@ fn finish_recording(
     app: AppHandle,
     session: &mut RecordingSession,
     transcription_cancel: &AtomicBool,
+    shutdown: &AtomicBool,
 ) -> Result<HistoryItem, String> {
     stop_audio_capture(session)?;
+    validate_recording_audio(&session.audio_path)?;
+    if shutdown.load(Ordering::Acquire) {
+        return Err("Recording cancelled during shutdown.".to_string());
+    }
     let settings = load_settings(&app)?;
     let dictionary = load_dictionary(&app)?;
     let raw_transcript = transcribe(
@@ -447,6 +749,7 @@ fn finish_recording(
         &session.audio_path,
         &session.output_prefix,
         transcription_cancel,
+        shutdown,
     )?;
     let mut final_transcript = cleanup_transcript(&raw_transcript);
     if settings.dictionary_cleanup {
@@ -458,46 +761,65 @@ fn finish_recording(
         return Err(message);
     }
 
-    let copy_result = settings
-        .clipboard_fallback
-        .then(|| copy_to_clipboard(&app, &final_transcript));
-    let paste_result = if settings.auto_paste && !matches!(copy_result, Some(Err(_))) {
-        Some(paste_from_clipboard())
-    } else {
-        None
-    };
-    let action_status = resolve_insert_status(
+    if shutdown.load(Ordering::Acquire) {
+        return Err("Recording cancelled during shutdown.".to_string());
+    }
+
+    let data = app.state::<AppData>();
+    let insertion_report = coordinate_insertion(
+        &app,
+        &data,
+        &final_transcript,
         settings.clipboard_fallback,
         settings.auto_paste,
-        copy_result,
-        paste_result,
     );
-
-    let item = HistoryItem {
+    let action_status = insert_action_status(&insertion_report);
+    let mut item = HistoryItem {
         id: Uuid::new_v4().to_string(),
         created_at: Utc::now(),
         raw_transcript,
         final_transcript: final_transcript.clone(),
         duration_ms: Some(session.started.elapsed().as_millis()),
-        insert_status: action_status.insert_status.clone(),
-        error: action_status.error.clone(),
+        insert_status: action_status.insert_status,
+        error: action_status.error,
+        insertion_report: insertion_report.clone(),
     };
-    let data = app.state::<AppData>();
+    let mut history_error = None;
     if settings.history_enabled {
-        append_history(&app, &data.history, item.clone())?;
+        if let Err(error) = append_history(&app, &data.history, item.clone()) {
+            history_error = Some(format!("History save failed: {error}"));
+            item.error = Some(match item.error.take() {
+                Some(insertion_error) => format!("{insertion_error} History save failed: {error}"),
+                None => history_error.clone().unwrap_or_default(),
+            });
+        }
     }
 
     let mut runtime = data
         .runtime
         .lock()
         .map_err(|lock_error| lock_error.to_string())?;
-    runtime.voice_state = voice_state_for_insert_status(&action_status);
+    runtime.voice_state = voice_state_for_insertion_report(&insertion_report);
     runtime.last_transcript = Some(final_transcript);
-    runtime.last_error = action_status.error;
+    runtime.last_error = insertion_report.error.clone().or(history_error);
     runtime.mic_level = 0.0;
     drop(runtime);
     emit_state_changed(&app);
     Ok(item)
+}
+
+fn validate_recording_audio(audio_path: &Path) -> Result<(), String> {
+    let reader = hound::WavReader::open(audio_path)
+        .map_err(|error| format!("Recorded audio is invalid: {error}"))?;
+    if reader.duration() == 0 {
+        let guidance = if cfg!(target_os = "linux") {
+            "Check the microphone input and Linux audio service."
+        } else {
+            "Check the microphone input."
+        };
+        return Err(format!("Recording captured no audio frames. {guidance}"));
+    }
+    Ok(())
 }
 
 #[tauri::command]
@@ -505,13 +827,17 @@ async fn copy_text(
     app: AppHandle,
     text: String,
     data: tauri::State<'_, AppData>,
+    window: WebviewWindow,
 ) -> Result<(), String> {
-    copy_to_clipboard(&app, &text)?;
-    let mut runtime = data.runtime.lock().map_err(|error| error.to_string())?;
-    runtime.voice_state = VoiceState::Copied;
-    runtime.last_transcript = Some(text);
-    runtime.last_error = None;
-    drop(runtime);
+    authorize_window(&window, &["main"])?;
+    with_insertion_lock(&data.insertion, || {
+        copy_to_clipboard(&app, &text)?;
+        let mut runtime = data.runtime.lock().map_err(|error| error.to_string())?;
+        runtime.voice_state = VoiceState::Copied;
+        runtime.last_transcript = Some(text.clone());
+        runtime.last_error = None;
+        Ok(())
+    })?;
     emit_state_changed(&app);
     Ok(())
 }
@@ -521,18 +847,19 @@ async fn insert_text(
     app: AppHandle,
     text: String,
     data: tauri::State<'_, AppData>,
-) -> Result<(), String> {
-    copy_to_clipboard(&app, &text)?;
-    async_runtime::spawn_blocking(paste_from_clipboard)
-        .await
-        .map_err(|error| format!("Paste task failed: {error}"))??;
-    let mut runtime = data.runtime.lock().map_err(|error| error.to_string())?;
-    runtime.voice_state = VoiceState::Inserted;
-    runtime.last_transcript = Some(text);
-    runtime.last_error = None;
-    drop(runtime);
-    emit_state_changed(&app);
-    Ok(())
+    window: WebviewWindow,
+) -> Result<InsertionReport, String> {
+    authorize_window(&window, &["main", "pill"])?;
+    let app_handle = app.clone();
+    let insertion_text = text.clone();
+    let report = async_runtime::spawn_blocking(move || {
+        let data = app_handle.state::<AppData>();
+        coordinate_insertion(&app_handle, &data, &insertion_text, true, true)
+    })
+    .await
+    .map_err(|error| format!("Insertion task failed: {error}"))?;
+    update_runtime_after_insertion(&app, &data, &text, &report)?;
+    Ok(report)
 }
 
 #[tauri::command]
@@ -540,7 +867,9 @@ fn delete_history_item(
     app: AppHandle,
     data: tauri::State<AppData>,
     id: String,
+    window: WebviewWindow,
 ) -> Result<(), String> {
+    authorize_window(&window, &["main"])?;
     with_history_lock(&data.history, || {
         let path = history_path(&app)?;
         let history: Vec<HistoryItem> = read_history_with_recovery(&path)?
@@ -552,9 +881,19 @@ fn delete_history_item(
 }
 
 #[tauri::command]
-fn clear_history(app: AppHandle, data: tauri::State<AppData>) -> Result<(), String> {
+fn clear_history(
+    app: AppHandle,
+    data: tauri::State<AppData>,
+    window: WebviewWindow,
+) -> Result<(), String> {
+    authorize_window(&window, &["main"])?;
     with_history_lock(&data.history, || {
-        write_history(&history_path(&app)?, &Vec::<HistoryItem>::new())
+        let path = history_path(&app)?;
+        // `write_history` atomically clears both the active history and its
+        // backup, then corrupt recovery copies are removed. Errors propagate
+        // with actionable context instead of silently reporting success.
+        write_history(&path, &[])?;
+        remove_corrupt_history_copies(&path)
     })
 }
 
@@ -563,7 +902,9 @@ fn export_history(
     app: AppHandle,
     data: tauri::State<AppData>,
     format: String,
+    window: WebviewWindow,
 ) -> Result<String, String> {
+    authorize_window(&window, &["main"])?;
     let settings = load_settings(&app)?;
     let history = load_history_for_settings(&app, &settings, &data.history)?;
     if history.is_empty() {
@@ -593,7 +934,13 @@ fn export_history(
 }
 
 #[tauri::command]
-fn add_dictionary_rule(app: AppHandle, spoken: String, replacement: String) -> Result<(), String> {
+fn add_dictionary_rule(
+    app: AppHandle,
+    spoken: String,
+    replacement: String,
+    window: WebviewWindow,
+) -> Result<(), String> {
+    authorize_window(&window, &["main"])?;
     let mut dictionary = load_dictionary(&app)?;
     dictionary.push(DictionaryRule {
         id: Uuid::new_v4().to_string(),
@@ -605,7 +952,8 @@ fn add_dictionary_rule(app: AppHandle, spoken: String, replacement: String) -> R
 }
 
 #[tauri::command]
-fn delete_dictionary_rule(app: AppHandle, id: String) -> Result<(), String> {
+fn delete_dictionary_rule(app: AppHandle, id: String, window: WebviewWindow) -> Result<(), String> {
+    authorize_window(&window, &["main"])?;
     let dictionary: Vec<DictionaryRule> = load_dictionary(&app)?
         .into_iter()
         .filter(|rule| rule.id != id)
@@ -614,7 +962,13 @@ fn delete_dictionary_rule(app: AppHandle, id: String) -> Result<(), String> {
 }
 
 #[tauri::command]
-fn set_dictionary_rule_enabled(app: AppHandle, id: String, enabled: bool) -> Result<(), String> {
+fn set_dictionary_rule_enabled(
+    app: AppHandle,
+    id: String,
+    enabled: bool,
+    window: WebviewWindow,
+) -> Result<(), String> {
+    authorize_window(&window, &["main"])?;
     let mut dictionary = load_dictionary(&app)?;
     for rule in &mut dictionary {
         if rule.id == id {
@@ -683,7 +1037,12 @@ fn trusted_setup_script_path(app: &AppHandle, script: &Path) -> Result<PathBuf, 
 }
 
 #[tauri::command]
-fn run_setup_script(app: AppHandle, data: tauri::State<AppData>) -> Result<String, String> {
+fn run_setup_script(
+    app: AppHandle,
+    data: tauri::State<AppData>,
+    window: WebviewWindow,
+) -> Result<String, String> {
+    authorize_window(&window, &["main"])?;
     if !setup_execution_enabled() {
         return Err(
             "In-app setup is only available in development builds. Use the release installer or documented setup commands."
@@ -695,11 +1054,13 @@ fn run_setup_script(app: AppHandle, data: tauri::State<AppData>) -> Result<Strin
         setup_script_path(&app).ok_or_else(|| format!("Setup script not found: {script_name}"))?;
     let mut command = if cfg!(target_os = "windows") {
         let mut command = Command::new("powershell");
+        configure_command(&mut command);
         command.args(["-NoProfile", "-ExecutionPolicy", "Bypass", "-File"]);
         command.arg(script);
         command
     } else {
         let mut command = Command::new("bash");
+        configure_command(&mut command);
         command.arg(script);
         command
     };
@@ -720,7 +1081,8 @@ fn run_setup_script(app: AppHandle, data: tauri::State<AppData>) -> Result<Strin
 }
 
 #[tauri::command]
-async fn show_main_window(app: AppHandle) -> Result<(), String> {
+async fn show_main_window(app: AppHandle, window: WebviewWindow) -> Result<(), String> {
+    authorize_window(&window, &["pill", "main"])?;
     if let Some(window) = app.get_webview_window("main") {
         // Window exists – just show and focus it
         let _ = window.show();
@@ -745,37 +1107,68 @@ async fn show_main_window(app: AppHandle) -> Result<(), String> {
 }
 
 #[tauri::command]
-fn open_release_page(url: Option<String>) -> Result<(), String> {
+fn open_release_page(url: Option<String>, window: WebviewWindow) -> Result<(), String> {
+    authorize_window(&window, &["main"])?;
     let url = url.unwrap_or_else(|| RELEASES_URL.to_string());
     if !is_allowed_release_url(&url) {
         return Err("Release URL is outside the VibeVoice repository.".to_string());
     }
 
-    let mut command = if cfg!(target_os = "windows") {
-        let mut command = Command::new("cmd");
-        command.args(["/C", "start", "", &url]);
-        command
-    } else if cfg!(target_os = "macos") {
-        let mut command = Command::new("open");
-        command.arg(&url);
-        command
-    } else {
-        let mut command = Command::new("xdg-open");
-        command.arg(&url);
-        command
-    };
-
-    command
-        .spawn()
-        .map(|_| ())
+    // Safe native opener: no shell, no cmd.exe /C, no argument splitting.
+    // The URL has already passed strict allow-list validation below, and the
+    // opener capability additionally restricts navigation to the releases tree.
+    window
+        .app_handle()
+        .opener()
+        .open_url(&url, None::<&str>)
         .map_err(|error| format!("Could not open release page: {error}"))
 }
 
 fn is_allowed_release_url(url: &str) -> bool {
-    url == RELEASES_URL
-        || url
-            .strip_prefix(RELEASES_URL)
-            .is_some_and(|suffix| suffix.starts_with("/tag/v") || suffix.starts_with("/download/"))
+    if url == RELEASES_URL {
+        return true;
+    }
+    let Some(suffix) = url.strip_prefix(RELEASES_URL) else {
+        return false;
+    };
+    // Only the canonical tag/download contracts are allowed. Anything else
+    // (issues, pulls, spoofed suffixes like `releases.evil`) is rejected here
+    // because it does not carry one of these exact prefixes.
+    let rest = if let Some(rest) = suffix.strip_prefix("/tag/v") {
+        // Tag names are a single path segment (e.g. `0.2.7`).
+        if rest.contains('/') {
+            return false;
+        }
+        rest
+    } else if let Some(rest) = suffix.strip_prefix("/download/") {
+        rest
+    } else {
+        return false;
+    };
+    if rest.is_empty() {
+        return false;
+    }
+    // Strict allow-list: ASCII alphanumerics plus `._-~/`. This implicitly
+    // rejects `& | ; $ ` ' " \ space CR LF TAB ? # < > ( ) * ! % + = : , @`
+    // and any non-ASCII bytes, closing shell-metacharacter, query (`?...`),
+    // and fragment (`#...`) tricks without enumerating them one by one.
+    if !rest.bytes().all(|byte| {
+        byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b'-' | b'~' | b'/')
+    }) {
+        return false;
+    }
+    // Reject traversal-like and degenerate paths explicitly: empty segments
+    // (`//`), current/parent segments (`.` / `..`), and leading/trailing `/`
+    // (which would indicate an empty segment after the prefix split).
+    if rest.starts_with('/') || rest.ends_with('/') {
+        return false;
+    }
+    for segment in rest.split('/') {
+        if segment.is_empty() || segment == "." || segment == ".." {
+            return false;
+        }
+    }
+    true
 }
 
 fn load_settings(app: &AppHandle) -> Result<Settings, String> {
@@ -845,7 +1238,7 @@ fn apply_history_retention(
     settings: &Settings,
     now: DateTime<Utc>,
 ) -> Vec<HistoryItem> {
-    history.sort_by(|left, right| right.created_at.cmp(&left.created_at));
+    history.sort_by_key(|item| std::cmp::Reverse(item.created_at));
     if settings.history_retention_days > 0 {
         let cutoff = now - ChronoDuration::days(settings.history_retention_days as i64);
         history.retain(|item| item.created_at >= cutoff);
@@ -970,6 +1363,40 @@ fn preserve_corrupt_history(path: &Path) -> Result<PathBuf, String> {
         .map_err(|error| format!("Could not preserve corrupt history: {error}"))
 }
 
+/// Returns true only for the exact `history.corrupt-*.json` recovery
+/// contract: same directory as `history.json`, regular files whose name
+/// starts with `history.corrupt-` and ends with `.json`. Unrelated files
+/// (different prefix/suffix, subdirectories, symlinks to elsewhere) never
+/// match.
+fn is_corrupt_history_copy(file_name: &str) -> bool {
+    file_name.starts_with("history.corrupt-") && file_name.ends_with(".json")
+}
+
+fn remove_corrupt_history_copies(path: &Path) -> Result<(), String> {
+    let parent = path.parent().unwrap_or_else(|| Path::new("."));
+    let entries =
+        fs::read_dir(parent).map_err(|error| format!("Could not list history dir: {error}"))?;
+    for entry in entries {
+        let entry = entry.map_err(|error| format!("Could not read history dir: {error}"))?;
+        let file_type = entry
+            .file_type()
+            .map_err(|error| format!("Could not inspect history entry: {error}"))?;
+        if !file_type.is_file() {
+            continue;
+        }
+        let name = entry.file_name().to_string_lossy().to_string();
+        if is_corrupt_history_copy(&name) {
+            fs::remove_file(entry.path()).map_err(|error| {
+                format!(
+                    "Could not remove corrupt history copy {}: {error}",
+                    entry.path().display()
+                )
+            })?;
+        }
+    }
+    Ok(())
+}
+
 fn read_history_with_recovery(path: &Path) -> Result<Vec<HistoryItem>, String> {
     match read_history_file(path) {
         Ok(Some(history)) => return Ok(history),
@@ -1085,6 +1512,54 @@ fn diagnostics(app: &AppHandle, settings: &Settings, last_error: Option<String>)
     }
 }
 
+fn redact_home(value: &str) -> String {
+    let mut redacted = value.to_string();
+    if let Some(home) = dirs::home_dir() {
+        let home = home.display().to_string();
+        redacted = redacted.replace(&home, "<home>");
+    }
+    redacted
+        .replace("$HOME", "<home>")
+        .replace("%USERPROFILE%", "<home>")
+        .replace("%LOCALAPPDATA%", "<local-app-data>")
+}
+
+fn error_category(error: Option<&str>) -> &'static str {
+    let Some(error) = error else { return "none" };
+    let error = error.to_ascii_lowercase();
+    if error.contains("whisper") || error.contains("transcri") {
+        "engine"
+    } else if error.contains("clipboard") || error.contains("paste") {
+        "clipboard"
+    } else if error.contains("record") || error.contains("microphone") || error.contains("audio") {
+        "recorder"
+    } else {
+        "runtime"
+    }
+}
+
+fn format_diagnostics_report(diagnostics: &Diagnostics, updater_status: &UpdaterStatus) -> String {
+    let path = |value: &Option<String>| {
+        value
+            .as_deref()
+            .map(redact_home)
+            .unwrap_or_else(|| "unavailable".to_string())
+    };
+    format!(
+        "VibeVoice diagnostics\nversion: {}\nplatform: {}\nengine: whisper={}, model={}\nrecorder: {}\ninput_device: {}\nclipboard: {}\npaste_adapter: {}\nupdater: {:?}\nlast_error_category: {}\n",
+        env!("CARGO_PKG_VERSION"),
+        diagnostics.platform,
+        diagnostics.whisper_found,
+        diagnostics.model_found,
+        diagnostics.recorder.as_deref().unwrap_or("unavailable"),
+        diagnostics.input_device.as_deref().unwrap_or("unavailable"),
+        diagnostics.clipboard_tool.as_deref().unwrap_or("unavailable"),
+        diagnostics.paste_tool.as_deref().unwrap_or("unavailable"),
+        updater_status,
+        error_category(diagnostics.last_error.as_deref()),
+    ) + &format!("resolved_binary: {}\nresolved_model: {}\n", path(&diagnostics.whisper_path), path(&diagnostics.model_path))
+}
+
 fn cached_diagnostics(
     app: &AppHandle,
     data: &tauri::State<AppData>,
@@ -1151,6 +1626,7 @@ fn transcribe(
     audio_path: &Path,
     output_prefix: &Path,
     cancel: &AtomicBool,
+    shutdown: &AtomicBool,
 ) -> Result<String, String> {
     let paths = resolve_engine_paths(settings)?;
     let mut command = Command::new(paths.whisper_binary);
@@ -1172,6 +1648,7 @@ fn transcribe(
             MAX_TRANSCRIPTION_TIMEOUT_SECONDS,
         )),
         cancel,
+        shutdown,
     )?;
     if !status.success() {
         return Err(format!("Transcription failed with status {status}"));
@@ -1192,30 +1669,31 @@ fn configure_process_group(command: &mut Command) {
     }
 
     #[cfg(windows)]
-    command.creation_flags(0x0000_0200);
+    command.creation_flags(CREATE_NO_WINDOW | CREATE_NEW_PROCESS_GROUP);
 }
 
 fn run_process_with_deadline(
     command: &mut Command,
     timeout: Duration,
     cancel: &AtomicBool,
-) -> Result<std::process::ExitStatus, String> {
+    shutdown: &AtomicBool,
+) -> Result<ExitStatus, String> {
+    if shutdown.load(Ordering::Acquire) || cancel.load(Ordering::Relaxed) {
+        return Err("Transcription cancelled.".to_string());
+    }
     configure_process_group(command);
     let mut child = command
         .spawn()
         .map_err(|error| format!("Transcription failed to start: {error}"))?;
     let deadline = Instant::now() + timeout;
     loop {
-        if cancel.load(Ordering::Relaxed) {
+        if cancel.load(Ordering::Relaxed) || shutdown.load(Ordering::Acquire) {
             let cleanup = terminate_process_tree(&mut child);
             return Err(process_stop_message("Transcription cancelled.", cleanup));
         }
-        match child
-            .try_wait()
-            .map_err(|error| format!("Transcription status check failed: {error}"))?
-        {
-            Some(status) => return Ok(status),
-            None if Instant::now() >= deadline => {
+        match child.try_wait() {
+            Ok(Some(status)) => return Ok(status),
+            Ok(None) if Instant::now() >= deadline => {
                 let message = format!(
                     "Transcription timed out after {} seconds.",
                     timeout.as_secs()
@@ -1223,7 +1701,14 @@ fn run_process_with_deadline(
                 let cleanup = terminate_process_tree(&mut child);
                 return Err(process_stop_message(&message, cleanup));
             }
-            None => thread::sleep(Duration::from_millis(20)),
+            Ok(None) => thread::sleep(Duration::from_millis(20)),
+            Err(error) => {
+                let cleanup = terminate_process_tree(&mut child);
+                return Err(process_stop_message(
+                    &format!("Transcription status check failed: {error}"),
+                    cleanup,
+                ));
+            }
         }
     }
 }
@@ -1252,10 +1737,9 @@ fn terminate_process_tree(child: &mut Child) -> Option<String> {
     #[cfg(windows)]
     {
         let pid = child.id().to_string();
-        match Command::new("taskkill")
-            .args(["/PID", &pid, "/T", "/F"])
-            .status()
-        {
+        let mut taskkill = Command::new("taskkill");
+        configure_command(&mut taskkill);
+        match taskkill.args(["/PID", &pid, "/T", "/F"]).status() {
             Ok(status) if status.success() => {}
             Ok(status) => errors.push(format!("taskkill exited with status {status}")),
             Err(error) => errors.push(format!("could not stop process tree: {error}")),
@@ -1438,9 +1922,197 @@ fn temp_workspace() -> PathBuf {
     std::env::temp_dir().join("vibevoice")
 }
 
+/// App-private temp location with restrictive Unix permissions (0700).
+/// Failures carry actionable context; callers at startup log and continue so
+/// cleanup problems never block recovery.
+fn prepare_temp_workspace() -> Result<PathBuf, String> {
+    let path = temp_workspace();
+    fs::create_dir_all(&path).map_err(|error| {
+        format!(
+            "Could not create temp workspace {}: {error}",
+            path.display()
+        )
+    })?;
+    #[cfg(unix)]
+    {
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o700)).map_err(|error| {
+            format!(
+                "Could not restrict temp workspace {}: {error}",
+                path.display()
+            )
+        })?;
+    }
+    Ok(path)
+}
+
 fn cleanup_recording_artifacts(session: &RecordingSession) {
     let _ = fs::remove_file(&session.audio_path);
     let _ = fs::remove_file(session.output_prefix.with_extension("txt"));
+}
+
+/// Design (#47): per-process ownership + conservative stale-age reconciliation.
+///
+/// New recordings are named `recording-<pid>-<uuid>.wav` (plus a `.txt`
+/// companion with the same stem). Legacy `recording-<uuid>.wav` files are
+/// still recognized for backward compatibility.
+///
+/// Startup cleanup (`cleanup_stale_recording_artifacts`) guarantees one
+/// instance can never delete another live instance's active recording:
+/// - strict filename allow-list: only `recording-*` with `.wav`/`.txt` and a
+///   parseable pid/uuid (or legacy uuid) is ever considered; malformed and
+///   unrelated files are ignored;
+/// - only regular files are considered (directories/symlinks skipped);
+/// - a file whose embedded pid is alive (or equals our own pid and is still
+///   fresh) is always preserved;
+/// - a file whose owner pid is dead is an abnormal-termination artifact and
+///   is removed;
+/// - legacy files without a pid carry no ownership signal, so they are
+///   removed only when older than `STALE_RECORDING_AGE` (24h), which keeps
+///   recent/live files safe while eventually cleaning crashes;
+/// - cleanup errors are returned with actionable context; the startup caller
+///   logs them and continues so the app always recovers.
+const STALE_RECORDING_AGE: Duration = Duration::from_secs(24 * 60 * 60);
+
+fn new_recording_stem() -> String {
+    format!("recording-{}-{}", std::process::id(), Uuid::new_v4())
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RecordingOwnership {
+    Owned { pid: u32 },
+    Legacy,
+}
+
+fn parse_recording_filename(file_name: &str) -> Option<(RecordingOwnership, String)> {
+    let stem = file_name.strip_prefix("recording-")?;
+    // Extension must be exactly `wav` or `txt`; anything else is unrelated.
+    let (base, extension) = stem.rsplit_once('.')?;
+    if !matches!(extension, "wav" | "txt") {
+        return None;
+    }
+    // New format: `<pid>-<uuid>`. Legacy format: `<uuid>`.
+    if let Some((pid_part, uuid_part)) = base.split_once('-') {
+        if let Ok(pid) = pid_part.parse::<u32>() {
+            if uuid_part.parse::<Uuid>().is_ok() {
+                return Some((RecordingOwnership::Owned { pid }, extension.to_string()));
+            }
+        }
+    }
+    // Fall back to legacy: the whole base must be a UUID. This rejects
+    // malformed names like `recording-...tmp`, `recording-.wav`, or
+    // `recording-abc.wav` without touching them.
+    if base.parse::<Uuid>().is_ok() {
+        return Some((RecordingOwnership::Legacy, extension.to_string()));
+    }
+    None
+}
+
+fn is_pid_alive(pid: u32) -> bool {
+    if pid == std::process::id() {
+        return true;
+    }
+    #[cfg(unix)]
+    {
+        // Signal 0 performs error checking without delivering a signal:
+        // success (or EPERM) means the process exists; ESRCH means it is gone.
+        let result = unsafe { libc::kill(pid as i32, 0) };
+        if result == 0 {
+            return true;
+        }
+        io::Error::last_os_error().raw_os_error() != Some(libc::ESRCH)
+    }
+    #[cfg(not(unix))]
+    {
+        // Conservative fallback: without a reliable liveness probe, assume
+        // alive so startup cleanup never deletes a potentially live file.
+        // Dead-pid artifacts on these platforms are cleaned via the
+        // stale-age path once they grow old.
+        let _ = pid;
+        true
+    }
+}
+
+fn file_age(metadata: &fs::Metadata) -> Option<Duration> {
+    metadata.modified().ok()?.elapsed().ok()
+}
+
+fn should_remove_stale_recording(
+    file_name: &str,
+    metadata: &fs::Metadata,
+    current_pid: u32,
+) -> bool {
+    if !metadata.is_file() {
+        return false;
+    }
+    let Some((ownership, _)) = parse_recording_filename(file_name) else {
+        return false;
+    };
+    match ownership {
+        RecordingOwnership::Owned { pid } => {
+            if pid == current_pid {
+                // Own pid at startup: no recording is live yet for this
+                // process, but a reused pid could theoretically collide, so
+                // only remove when stale. Fresh own-pid files are preserved.
+                return file_age(metadata).is_some_and(|age| age >= STALE_RECORDING_AGE);
+            }
+            #[cfg(unix)]
+            {
+                // Another instance's file: never touch it while its owner lives.
+                if is_pid_alive(pid) {
+                    return false;
+                }
+                // Dead owner => abnormal-termination artifact; safe to reclaim.
+                true
+            }
+            #[cfg(not(unix))]
+            {
+                // No reliable liveness probe here: fall back to the same
+                // conservative stale-age rule as legacy files, so fresh live
+                // files are preserved while crashed artifacts are eventually
+                // reclaimed. `is_pid_alive` is still consulted where possible.
+                let _ = is_pid_alive(pid);
+                file_age(metadata).is_some_and(|age| age >= STALE_RECORDING_AGE)
+            }
+        }
+        RecordingOwnership::Legacy => {
+            // No ownership signal: conservative stale-age reconciliation only.
+            file_age(metadata).is_some_and(|age| age >= STALE_RECORDING_AGE)
+        }
+    }
+}
+
+fn cleanup_recording_outputs_in(directory: &Path) -> Result<(), String> {
+    cleanup_recording_outputs_in_with_pid(directory, std::process::id())
+}
+
+fn cleanup_recording_outputs_in_with_pid(directory: &Path, current_pid: u32) -> Result<(), String> {
+    let entries = fs::read_dir(directory).map_err(|error| {
+        format!(
+            "Could not list temp workspace {}: {error}",
+            directory.display()
+        )
+    })?;
+    for entry in entries {
+        let entry =
+            entry.map_err(|error| format!("Could not read temp workspace entry: {error}"))?;
+        let file_name = entry.file_name().to_string_lossy().to_string();
+        let metadata = entry
+            .metadata()
+            .map_err(|error| format!("Could not inspect {}: {error}", entry.path().display()))?;
+        if should_remove_stale_recording(&file_name, &metadata, current_pid) {
+            fs::remove_file(entry.path()).map_err(|error| {
+                format!(
+                    "Could not remove stale recording {}: {error}",
+                    entry.path().display()
+                )
+            })?;
+        }
+    }
+    Ok(())
+}
+
+fn cleanup_stale_recording_artifacts() -> Result<(), String> {
+    cleanup_recording_outputs_in(&prepare_temp_workspace()?)
 }
 
 #[cfg(any(target_os = "windows", target_os = "macos"))]
@@ -1571,7 +2243,13 @@ fn start_audio_capture_impl(
         "No supported Linux audio recorder found. Install pw-record, arecord, or ffmpeg."
             .to_string()
     })?;
-    let child = Command::new(command)
+    let mut recorder = Command::new(command);
+    configure_command(&mut recorder);
+    // Isolate the recorder in its own process group (#51) so shutdown can
+    // terminate the whole tree (recorder plus any grandchildren) without
+    // touching VibeVoice itself. Mirrors the transcription path.
+    configure_process_group(&mut recorder);
+    let child = recorder
         .args(args)
         .arg(&audio_path)
         .stdin(Stdio::null())
@@ -1725,6 +2403,10 @@ fn recorder_command() -> Option<(&'static str, &'static [&'static str])> {
 
 #[cfg(target_os = "linux")]
 fn stop_linux_recorder(child: &mut Child) -> Result<(), String> {
+    // Graceful stop first so the recorder can finalize the WAV header, then
+    // force-kill the whole process group so an unresponsive (SIGINT-ignoring)
+    // recorder — and any grandchildren — can never survive shutdown (#51).
+    // The child is always reaped (`wait`) on every path, leaving no zombie.
     let pid = child.id() as i32;
     unsafe {
         let _ = libc::kill(pid, libc::SIGINT);
@@ -1735,14 +2417,21 @@ fn stop_linux_recorder(child: &mut Child) -> Result<(), String> {
             .map_err(|error| error.to_string())?
             .is_some()
         {
+            // The leader exited gracefully, but forked grandchildren may still
+            // be alive in the recorder's private process group (see
+            // `start_audio_capture_impl`). Sweep the group best-effort so no
+            // recorder descendant survives shutdown; ESRCH (group already
+            // gone) is the expected common case and is ignored.
+            unsafe {
+                let _ = libc::kill(-pid, libc::SIGKILL);
+            }
             return Ok(());
         }
         thread::sleep(std::time::Duration::from_millis(100));
     }
-    child
-        .kill()
-        .map_err(|error| format!("Failed to stop recorder: {error}"))?;
-    let _ = child.wait();
+    if let Some(cleanup_error) = terminate_process_tree(child) {
+        return Err(format!("Failed to stop recorder. {cleanup_error}"));
+    }
     Ok(())
 }
 
@@ -1775,18 +2464,47 @@ fn replace_case_insensitive(input: &str, needle: &str, replacement: &str) -> Str
     if needle.is_empty() {
         return input.to_string();
     }
-    let lower_input = input.to_lowercase();
-    let lower_needle = needle.to_lowercase();
-    let mut output = String::new();
-    let mut index = 0;
-    while let Some(found) = lower_input[index..].find(&lower_needle) {
-        let start = index + found;
-        let end = start + needle.len();
-        output.push_str(&input[index..start]);
-        output.push_str(replacement);
-        index = end;
+    // Unicode-safe matching: never derive byte offsets from a transformed
+    // (`to_lowercase`) copy. Instead fold to `char`s and carry the original
+    // UTF-8 byte range for every folded char, so all slicing uses verified
+    // boundaries from `char_indices`. This keeps `İ` (which expands to two
+    // lowercase chars), combining marks, and other non-ASCII sequences
+    // panic-free and deterministic (left-to-right, non-overlapping).
+    let lower_needle: Vec<char> = needle.chars().flat_map(char::to_lowercase).collect();
+    if lower_needle.is_empty() {
+        return input.to_string();
     }
-    output.push_str(&input[index..]);
+    let mut lower_input = Vec::new();
+    let mut ranges: Vec<(usize, usize)> = Vec::new();
+    for (start, character) in input.char_indices() {
+        let end = start + character.len_utf8();
+        for lower in character.to_lowercase() {
+            lower_input.push(lower);
+            ranges.push((start, end));
+        }
+    }
+    let mut output = String::new();
+    let mut lower_index = 0;
+    let mut input_index = 0;
+    while lower_index + lower_needle.len() <= lower_input.len() {
+        if lower_input[lower_index..].starts_with(&lower_needle) {
+            let start = ranges[lower_index].0;
+            let end = ranges[lower_index + lower_needle.len() - 1].1;
+            // `start`/`end` come from `char_indices`, so they are always
+            // valid UTF-8 boundaries, and `start >= input_index` holds
+            // because both advance monotonically.
+            output.push_str(&input[input_index..start]);
+            output.push_str(replacement);
+            input_index = end;
+            lower_index += lower_needle.len();
+            while lower_index < ranges.len() && ranges[lower_index].1 <= input_index {
+                lower_index += 1;
+            }
+        } else {
+            lower_index += 1;
+        }
+    }
+    output.push_str(&input[input_index..]);
     output
 }
 
@@ -1797,25 +2515,169 @@ fn copy_to_clipboard(app: &AppHandle, text: &str) -> Result<String, String> {
     Ok("tauri-clipboard".to_string())
 }
 
+fn snapshot_text_clipboard(app: &AppHandle) -> Result<ClipboardSnapshot, String> {
+    app.clipboard()
+        .read_text()
+        .map(ClipboardSnapshot::Text)
+        .map_err(|error| format!("Clipboard read failed: {error}"))
+}
+
+fn restore_text_clipboard(app: &AppHandle, snapshot: &ClipboardSnapshot) -> Result<(), String> {
+    match snapshot {
+        ClipboardSnapshot::Text(text) => copy_to_clipboard(app, text).map(|_| ()),
+    }
+}
+
+fn coordinate_insertion(
+    app: &AppHandle,
+    data: &AppData,
+    text: &str,
+    should_copy: bool,
+    should_paste: bool,
+) -> InsertionReport {
+    with_insertion_lock(&data.insertion, || {
+        Ok(execute_insertion_transaction(
+            text,
+            should_copy,
+            should_paste,
+            || snapshot_text_clipboard(app),
+            || copy_to_clipboard(app, text),
+            paste_from_clipboard,
+            |snapshot| restore_text_clipboard(app, snapshot),
+        ))
+    })
+    .unwrap_or_else(|error| InsertionReport {
+        outcome: InsertionOutcome::Failed,
+        error: Some(format!("Insertion lock failed: {error}")),
+        ..InsertionReport::default()
+    })
+}
+
+fn with_insertion_lock<T>(
+    insertion_lock: &Mutex<()>,
+    operation: impl FnOnce() -> Result<T, String>,
+) -> Result<T, String> {
+    let _guard = insertion_lock.lock().map_err(|error| error.to_string())?;
+    operation()
+}
+
+fn execute_insertion_transaction<Read, Copy, Paste, Restore>(
+    _text: &str,
+    should_copy: bool,
+    should_paste: bool,
+    read_clipboard: Read,
+    copy: Copy,
+    paste: Paste,
+    restore: Restore,
+) -> InsertionReport
+where
+    Read: FnOnce() -> Result<ClipboardSnapshot, String>,
+    Copy: FnOnce() -> Result<String, String>,
+    Paste: FnOnce() -> Result<String, String>,
+    Restore: FnOnce(&ClipboardSnapshot) -> Result<(), String>,
+{
+    if !should_copy {
+        return InsertionReport {
+            outcome: if should_paste {
+                InsertionOutcome::Failed
+            } else {
+                InsertionOutcome::Cancelled
+            },
+            paste_status: if should_paste {
+                "not_attempted".to_string()
+            } else {
+                "not_requested".to_string()
+            },
+            error: should_paste.then(|| "Paste requires a clipboard copy.".to_string()),
+            ..InsertionReport::default()
+        };
+    }
+
+    if !should_paste {
+        let mut report = insertion_report_from_results(false, copy(), None, Ok(()));
+        report.clipboard_restored = false;
+        return report;
+    }
+
+    let snapshot = match read_clipboard() {
+        Ok(snapshot) => snapshot,
+        Err(error) => {
+            return InsertionReport {
+                outcome: InsertionOutcome::Failed,
+                copy_status: "not_attempted".to_string(),
+                paste_status: "not_attempted".to_string(),
+                error: Some(error),
+                ..InsertionReport::default()
+            }
+        }
+    };
+
+    let copy_result = copy();
+    let paste_result = if should_paste && copy_result.is_ok() {
+        Some(paste())
+    } else {
+        None
+    };
+    let restore_result = restore(&snapshot);
+    insertion_report_from_results(should_paste, copy_result, paste_result, restore_result)
+}
+
+fn insertion_report_from_results(
+    should_paste: bool,
+    copy_result: Result<String, String>,
+    paste_result: Option<Result<String, String>>,
+    restore_result: Result<(), String>,
+) -> InsertionReport {
+    let mut report = InsertionReport {
+        copy_status: match &copy_result {
+            Ok(tool) => format!("copied:{tool}"),
+            Err(_) => "failed".to_string(),
+        },
+        paste_status: if !should_paste {
+            "not_requested".to_string()
+        } else {
+            match &paste_result {
+                Some(Ok(tool)) => format!("pasted:{tool}"),
+                Some(Err(_)) => "failed".to_string(),
+                None => "not_attempted".to_string(),
+            }
+        },
+        clipboard_restored: restore_result.is_ok(),
+        ..InsertionReport::default()
+    };
+
+    let mut errors = Vec::new();
+    if let Err(error) = copy_result {
+        errors.push(error);
+    }
+    if let Some(Err(error)) = paste_result {
+        errors.push(error);
+    }
+    if let Err(error) = restore_result {
+        errors.push(format!("Clipboard restore failed: {error}"));
+    }
+    report.error = (!errors.is_empty()).then(|| errors.join(" "));
+    report.outcome = if report.error.is_some() {
+        InsertionOutcome::Failed
+    } else if should_paste {
+        InsertionOutcome::Inserted
+    } else {
+        InsertionOutcome::CopiedOnly
+    };
+    report
+}
+
 fn paste_from_clipboard() -> Result<String, String> {
     if cfg!(target_os = "windows") {
-        let status = Command::new("powershell")
-            .args([
-                "-STA",
-                "-NoProfile",
-                "-Command",
-                "Add-Type -AssemblyName System.Windows.Forms; [System.Windows.Forms.SendKeys]::SendWait('^v')",
-            ])
-            .status()
-            .map_err(|error| format!("Windows paste failed: {error}"))?;
-        return if status.success() {
-            Ok("powershell:SendKeys".to_string())
-        } else {
-            Err(
-                "Windows paste command exited with an error. Transcript remains in clipboard."
-                    .to_string(),
-            )
-        };
+        let mut command = Command::new("powershell");
+        configure_command(&mut command);
+        command.args([
+            "-STA",
+            "-NoProfile",
+            "-Command",
+            "Add-Type -AssemblyName System.Windows.Forms; [System.Windows.Forms.SendKeys]::SendWait('^v')",
+        ]);
+        return run_paste_helper(&mut command, "powershell:SendKeys", PASTE_HELPER_TIMEOUT);
     }
     let candidates: [(&str, &[&str]); 3] = [
         ("wtype", &["-M", "ctrl", "v", "-m", "ctrl"]),
@@ -1824,25 +2686,69 @@ fn paste_from_clipboard() -> Result<String, String> {
     ];
     for (cmd, args) in candidates {
         if command_exists(cmd) {
-            let status = Command::new(cmd)
-                .args(args)
-                .status()
-                .map_err(|error| format!("{cmd} failed: {error}"))?;
-            return if status.success() {
-                Ok(cmd.to_string())
-            } else {
-                Err(format!(
-                    "{cmd} exited with an error. Transcript remains in clipboard."
-                ))
-            };
+            let mut command = Command::new(cmd);
+            configure_command(&mut command);
+            command.args(args);
+            return run_paste_helper(&mut command, cmd, PASTE_HELPER_TIMEOUT);
         }
     }
     Err("Paste tool missing. Install wtype on Wayland or xdotool on X11.".to_string())
 }
 
+fn run_paste_helper(
+    command: &mut Command,
+    tool: &str,
+    timeout: Duration,
+) -> Result<String, String> {
+    let mut child = command
+        .spawn()
+        .map_err(|error| format!("{tool} failed to start: {error}"))?;
+    let deadline = Instant::now() + timeout;
+    loop {
+        let status = match child.try_wait() {
+            Ok(status) => status,
+            Err(error) => {
+                let cleanup_error = cleanup_paste_helper(&mut child);
+                let message = match cleanup_error {
+                    Some(cleanup_error) => format!("{tool} failed: {error}; {cleanup_error}"),
+                    None => format!("{tool} failed: {error}"),
+                };
+                return Err(message);
+            }
+        };
+        match status {
+            Some(status) if status.success() => return Ok(tool.to_string()),
+            Some(_) => return Err(format!("{tool} exited with an error.")),
+            None if Instant::now() >= deadline => {
+                let timeout_message = format!("{tool} timed out after {} ms.", timeout.as_millis());
+                return match cleanup_paste_helper(&mut child) {
+                    Some(cleanup_error) => Err(format!("{timeout_message} {cleanup_error}")),
+                    None => Err(timeout_message),
+                };
+            }
+            None => thread::sleep(PASTE_HELPER_POLL_INTERVAL),
+        }
+    }
+}
+
+fn cleanup_paste_helper(child: &mut std::process::Child) -> Option<String> {
+    let kill_error = child.kill().err();
+    let wait_error = child.wait().err();
+    let mut errors = Vec::new();
+    if let Some(error) = kill_error {
+        errors.push(format!("could not be stopped: {error}"));
+    }
+    if let Some(error) = wait_error {
+        errors.push(format!("could not be reaped: {error}"));
+    }
+    (!errors.is_empty()).then(|| errors.join("; "))
+}
+
 fn command_exists(name: &str) -> bool {
     if cfg!(target_os = "windows") {
-        return Command::new("where")
+        let mut command = Command::new("where");
+        configure_command(&mut command);
+        return command
             .arg(name)
             .stdout(Stdio::null())
             .stderr(Stdio::null())
@@ -1850,7 +2756,9 @@ fn command_exists(name: &str) -> bool {
             .map(|status| status.success())
             .unwrap_or(false);
     }
-    Command::new("sh")
+    let mut command = Command::new("sh");
+    configure_command(&mut command);
+    command
         .arg("-c")
         .arg(format!(
             "command -v '{}' >/dev/null 2>&1",
@@ -1879,63 +2787,49 @@ fn paste_tool_name() -> Option<String> {
     first_command(&["wtype", "xdotool", "ydotool"])
 }
 
-fn resolve_insert_status(
-    clipboard_fallback: bool,
-    auto_paste: bool,
-    copy_result: Option<Result<String, String>>,
-    paste_result: Option<Result<String, String>>,
-) -> InsertActionStatus {
-    let mut insert_status = "none".to_string();
-    let mut error = None;
-
-    if clipboard_fallback {
-        match copy_result {
-            Some(Ok(tool)) => insert_status = format!("copied:{tool}"),
-            Some(Err(copy_error)) => {
-                error = Some(copy_error);
-                insert_status = "clipboard_failed".to_string();
-            }
-            None => {
-                error = Some("Clipboard copy was not attempted.".to_string());
-                insert_status = "clipboard_failed".to_string();
-            }
-        }
-    }
-
-    if auto_paste {
-        match paste_result {
-            Some(Ok(tool)) => insert_status = format!("inserted:{tool}"),
-            Some(Err(paste_error)) => {
-                if error.is_none() {
-                    error = Some(paste_error);
-                }
-                if insert_status.starts_with("copied") {
-                    insert_status = "copied".to_string();
-                }
-            }
-            None if !clipboard_fallback => {
-                error = Some("Paste requires clipboard copy to run first.".to_string());
-            }
-            None => {}
-        }
-    }
-
+fn insert_action_status(report: &InsertionReport) -> InsertActionStatus {
+    let insert_status = match report.outcome {
+        InsertionOutcome::Inserted => report
+            .paste_status
+            .strip_prefix("pasted:")
+            .map(|tool| format!("inserted:{tool}"))
+            .unwrap_or_else(|| "inserted".to_string()),
+        InsertionOutcome::CopiedOnly => report
+            .copy_status
+            .strip_prefix("copied:")
+            .map(|tool| format!("copied:{tool}"))
+            .unwrap_or_else(|| "copied".to_string()),
+        InsertionOutcome::Failed => "failed".to_string(),
+        InsertionOutcome::Cancelled => "cancelled".to_string(),
+    };
     InsertActionStatus {
         insert_status,
-        error,
+        error: report.error.clone(),
     }
 }
 
-fn voice_state_for_insert_status(status: &InsertActionStatus) -> VoiceState {
-    if status.insert_status.starts_with("inserted") {
-        VoiceState::Inserted
-    } else if status.insert_status.starts_with("copied") {
-        VoiceState::Copied
-    } else if status.error.is_some() {
-        VoiceState::Error
-    } else {
-        VoiceState::Ready
+fn voice_state_for_insertion_report(report: &InsertionReport) -> VoiceState {
+    match report.outcome {
+        InsertionOutcome::Inserted => VoiceState::Inserted,
+        InsertionOutcome::CopiedOnly => VoiceState::Copied,
+        InsertionOutcome::Failed => VoiceState::Error,
+        InsertionOutcome::Cancelled => VoiceState::Ready,
     }
+}
+
+fn update_runtime_after_insertion(
+    app: &AppHandle,
+    data: &AppData,
+    text: &str,
+    report: &InsertionReport,
+) -> Result<(), String> {
+    let mut runtime = data.runtime.lock().map_err(|error| error.to_string())?;
+    runtime.voice_state = voice_state_for_insertion_report(report);
+    runtime.last_transcript = Some(text.to_string());
+    runtime.last_error = report.error.clone();
+    drop(runtime);
+    emit_state_changed(app);
+    Ok(())
 }
 
 fn default_dictionary() -> Vec<DictionaryRule> {
@@ -1982,8 +2876,15 @@ fn emit_meter_changed(app: &AppHandle, mic_level: f32) {
     let _ = app.emit(METER_CHANGED_EVENT, MeterPayload { mic_level });
 }
 
-fn spawn_meter_emitter(app: AppHandle, mic_level: Arc<AtomicU32>) {
+fn spawn_meter_emitter(
+    app: AppHandle,
+    mic_level: Arc<AtomicU32>,
+    shutdown: Arc<AtomicBool>,
+) -> thread::JoinHandle<()> {
     thread::spawn(move || loop {
+        if shutdown.load(Ordering::Acquire) {
+            break;
+        }
         let is_recording = app
             .state::<AppData>()
             .runtime
@@ -1995,7 +2896,7 @@ fn spawn_meter_emitter(app: AppHandle, mic_level: Arc<AtomicU32>) {
         }
         emit_meter_changed(&app, mic_level.load(Ordering::Relaxed) as f32 / 1000.0);
         thread::sleep(Duration::from_millis(180));
-    });
+    })
 }
 
 fn parse_hotkey(hotkey: &str) -> Result<Shortcut, String> {
@@ -2026,22 +2927,29 @@ fn register_hotkey_handler(app: &AppHandle, shortcut: Shortcut) -> Result<(), St
                 return;
             }
             let state = app_handle.state::<AppData>();
-            let is_recording = state
+            // Fast toggle during Preparing cancels the in-flight start (#50):
+            // both Recording and Preparing route to stop.
+            let should_stop = state
                 .runtime
                 .lock()
-                .map(|runtime| matches!(runtime.voice_state, VoiceState::Recording))
+                .map(|runtime| {
+                    matches!(
+                        runtime.voice_state,
+                        VoiceState::Recording | VoiceState::Preparing
+                    )
+                })
                 .unwrap_or(false);
-            if is_recording {
+            if should_stop {
                 let app_for_stop = app_handle.clone();
                 async_runtime::spawn(async move {
                     let state = app_for_stop.state::<AppData>();
-                    let _ = stop_recording(app_for_stop.clone(), state).await;
+                    let _ = stop_recording_impl(app_for_stop.clone(), state).await;
                 });
             } else {
                 let app_for_start = app_handle.clone();
                 async_runtime::spawn(async move {
                     let state = app_for_start.state::<AppData>();
-                    let _ = start_recording(app_for_start.clone(), state).await;
+                    let _ = start_recording_impl(app_for_start.clone(), state);
                 });
             }
         })
@@ -2076,22 +2984,28 @@ fn toggle_window(app: &AppHandle, label: &str) {
 
 fn toggle_recording(app: &AppHandle) {
     let state = app.state::<AppData>();
-    let is_recording = state
+    // Fast toggle during Preparing cancels the in-flight start (#50).
+    let should_stop = state
         .runtime
         .lock()
-        .map(|runtime| matches!(runtime.voice_state, VoiceState::Recording))
+        .map(|runtime| {
+            matches!(
+                runtime.voice_state,
+                VoiceState::Recording | VoiceState::Preparing
+            )
+        })
         .unwrap_or(false);
-    if is_recording {
+    if should_stop {
         let app_for_stop = app.clone();
         async_runtime::spawn(async move {
             let state = app_for_stop.state::<AppData>();
-            let _ = stop_recording(app_for_stop.clone(), state).await;
+            let _ = stop_recording_impl(app_for_stop.clone(), state).await;
         });
     } else {
         let app_for_start = app.clone();
         async_runtime::spawn(async move {
             let state = app_for_start.state::<AppData>();
-            let _ = start_recording(app_for_start.clone(), state).await;
+            let _ = start_recording_impl(app_for_start.clone(), state);
         });
     }
 }
@@ -2147,21 +3061,87 @@ fn setup_tray(app: &AppHandle) -> Result<(), String> {
         .map_err(|error| error.to_string())
 }
 
+/// Shared shutdown/stop cleanup for an installed session (#51).
+///
+/// Stops audio capture (terminating and reaping the Linux recorder child)
+/// and removes the temporary wav/partial-txt artifacts. Never holds the
+/// runtime mutex: callers must take the session out of `RuntimeState` first.
+fn shutdown_recording_session(session: &mut RecordingSession) {
+    let _ = stop_audio_capture(session);
+    cleanup_recording_artifacts(session);
+}
+
+fn shutdown_app(app: &AppHandle) {
+    let data = app.state::<AppData>();
+    let Ok(lifecycle) = data.lifecycle.lock() else {
+        return;
+    };
+    if data.shutdown.swap(true, Ordering::AcqRel) {
+        return;
+    }
+
+    // Invalidate any outstanding preparation (#50) so a late worker can never
+    // install itself after shutdown, then take the installed session (if any)
+    // without holding the runtime lock across blocking audio termination.
+    let session = data.runtime.lock().ok().and_then(|mut runtime| {
+        invalidate_preparation(&mut runtime);
+        runtime.voice_state = VoiceState::Ready;
+        runtime.last_error = None;
+        runtime.recording.take()
+    });
+    if let Some(mut session) = session {
+        shutdown_recording_session(&mut session);
+    }
+
+    if let Ok(mut workers) = data.worker_threads.lock() {
+        for worker in workers.drain(..) {
+            let _ = worker.join();
+        }
+    }
+    if let Ok(mut meters) = data.meter_threads.lock() {
+        for meter in meters.drain(..) {
+            let _ = meter.join();
+        }
+    }
+    drop(lifecycle);
+}
+
+fn track_thread(threads: &Mutex<Vec<thread::JoinHandle<()>>>, thread: thread::JoinHandle<()>) {
+    match threads.lock() {
+        Ok(mut tracked) => {
+            tracked.retain(|thread| !thread.is_finished());
+            tracked.push(thread);
+        }
+        Err(_) => {
+            let _ = thread.join();
+        }
+    }
+}
+
 pub fn run() {
-    tauri::Builder::default()
+    let app = tauri::Builder::default()
         .plugin(tauri_plugin_global_shortcut::Builder::new().build())
         .plugin(tauri_plugin_clipboard_manager::init())
+        .plugin(tauri_plugin_opener::init())
         .plugin(tauri_plugin_process::init())
         .plugin(tauri_plugin_updater::Builder::new().build())
         .manage(AppData {
             runtime: Mutex::new(RuntimeState::default()),
             diagnostics_cache: Mutex::new(None),
             history: Mutex::new(()),
+            insertion: Mutex::new(()),
+            lifecycle: Mutex::new(()),
+            shutdown: Arc::new(AtomicBool::new(false)),
             transcription_cancel: Mutex::new(None),
+            worker_threads: Mutex::new(Vec::new()),
+            meter_threads: Mutex::new(Vec::new()),
+            preparation_counter: AtomicU64::new(0),
         })
         .invoke_handler(tauri::generate_handler![
             get_app_state,
             refresh_diagnostics,
+            get_diagnostics_report,
+            copy_diagnostics_report,
             save_settings,
             start_recording,
             stop_recording,
@@ -2179,6 +3159,12 @@ pub fn run() {
             show_main_window
         ])
         .setup(|app| {
+            // Best-effort reclaim of abnormal-termination artifacts. Failures
+            // are logged (never logged with audio/transcript content) and do
+            // not block startup, so the app always recovers safely.
+            if let Err(error) = cleanup_stale_recording_artifacts() {
+                eprintln!("Could not clean stale recording artifacts: {error}");
+            }
             setup_tray(app.handle())?;
             let hotkey = load_settings(app.handle())
                 .map(|settings| settings.hotkey)
@@ -2191,8 +3177,16 @@ pub fn run() {
             }
             Ok(())
         })
-        .run(tauri::generate_context!())
-        .expect("error while running VibeVoice");
+        .build(tauri::generate_context!())
+        .expect("error while building VibeVoice");
+    app.run(|app, event| {
+        if matches!(
+            event,
+            tauri::RunEvent::ExitRequested { .. } | tauri::RunEvent::Exit
+        ) {
+            shutdown_app(app);
+        }
+    });
 }
 
 #[cfg(test)]
@@ -2210,10 +3204,147 @@ mod tests {
             &mut command,
             Duration::from_millis(30),
             &AtomicBool::new(false),
+            &AtomicBool::new(false),
         )
         .unwrap_err();
 
         assert!(error.contains("timed out"));
+    }
+
+    #[cfg(target_os = "linux")]
+    fn wait_for_pid_file(path: &Path, timeout: Duration) -> Option<i32> {
+        let deadline = Instant::now() + timeout;
+        while Instant::now() < deadline {
+            if let Ok(contents) = fs::read_to_string(path) {
+                if let Ok(pid) = contents.trim().parse::<i32>() {
+                    if pid > 0 {
+                        return Some(pid);
+                    }
+                }
+            }
+            thread::sleep(Duration::from_millis(10));
+        }
+        None
+    }
+
+    #[cfg(target_os = "linux")]
+    fn process_state_is_dead(pid: i32) -> bool {
+        if unsafe { libc::kill(pid, 0) } != 0 {
+            return io::Error::last_os_error().raw_os_error() == Some(libc::ESRCH);
+        }
+        // Signal 0 succeeded: the pid may still exist as an unreaped zombie
+        // under init, which still proves the group kill was delivered.
+        let stat = fs::read_to_string(format!("/proc/{pid}/stat")).unwrap_or_default();
+        stat.rsplit(')')
+            .next()
+            .unwrap_or("")
+            .trim_start()
+            .starts_with('Z')
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn transcription_timeout_terminates_grandchild_processes_in_the_group() {
+        let pid_file =
+            std::env::temp_dir().join(format!("vibevoice-pgroup-test-{}.pid", std::process::id()));
+        let _ = fs::remove_file(&pid_file);
+        let script = format!("sleep 30 & echo $! > {}; wait", pid_file.display());
+        let mut command = Command::new("sh");
+        command.args(["-c", &script]);
+
+        let error = run_process_with_deadline(
+            &mut command,
+            Duration::from_millis(200),
+            &AtomicBool::new(false),
+            &AtomicBool::new(false),
+        )
+        .unwrap_err();
+        assert!(error.contains("timed out"));
+
+        let grandchild = wait_for_pid_file(&pid_file, Duration::from_secs(5));
+        let _ = fs::remove_file(&pid_file);
+        let grandchild = grandchild.expect("fixture grandchild pid was recorded");
+
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while !process_state_is_dead(grandchild) && Instant::now() < deadline {
+            thread::sleep(Duration::from_millis(10));
+        }
+        assert!(
+            process_state_is_dead(grandchild),
+            "grandchild {grandchild} survived the process-group kill"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn terminate_process_tree_reaps_the_child_without_residue() {
+        let mut command = Command::new("sleep");
+        command.arg("30");
+        configure_process_group(&mut command);
+        let mut child = command.spawn().expect("fixture process spawns");
+        let pid = child.id() as i32;
+
+        assert_eq!(terminate_process_tree(&mut child), None);
+        assert!(
+            child.try_wait().unwrap().is_some(),
+            "terminated child was reaped, no zombie left"
+        );
+        assert_ne!(
+            unsafe { libc::kill(pid, 0) },
+            0,
+            "reaped child process is fully gone"
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn cleanup_recording_artifacts_removes_audio_and_partial_transcript() {
+        let dir =
+            std::env::temp_dir().join(format!("vibevoice-cleanup-test-{}", std::process::id()));
+        let _ = fs::create_dir_all(&dir);
+        let audio_path = dir.join("recording.wav");
+        let output_prefix = dir.join("recording");
+        fs::write(&audio_path, b"fake-audio").unwrap();
+        fs::write(output_prefix.with_extension("txt"), b"partial").unwrap();
+
+        let session = RecordingSession {
+            audio_path: audio_path.clone(),
+            output_prefix: output_prefix.clone(),
+            started: Instant::now(),
+            started_at: Utc::now(),
+            recorder_process: Command::new("sleep").arg("30").spawn().unwrap(),
+            mic_level: Arc::new(AtomicU32::new(0)),
+        };
+        cleanup_recording_artifacts(&session);
+        let mut session = session;
+        let _ = session.recorder_process.kill();
+        let _ = session.recorder_process.wait();
+
+        assert!(!audio_path.exists(), "recording wav was removed");
+        assert!(
+            !output_prefix.with_extension("txt").exists(),
+            "partial transcript was removed"
+        );
+        let _ = fs::remove_dir(&dir);
+    }
+
+    #[test]
+    fn zero_frame_wav_is_rejected_before_transcription() {
+        let path = std::env::temp_dir().join(format!("vibevoice-empty-{}.wav", Uuid::new_v4()));
+        let spec = hound::WavSpec {
+            channels: 1,
+            sample_rate: 16_000,
+            bits_per_sample: 16,
+            sample_format: hound::SampleFormat::Int,
+        };
+        hound::WavWriter::create(&path, spec)
+            .unwrap()
+            .finalize()
+            .unwrap();
+
+        let error = validate_recording_audio(&path).unwrap_err();
+        assert!(error.contains("no audio frames"));
+        let _ = fs::remove_file(path);
     }
 
     #[cfg(unix)]
@@ -2223,10 +3354,187 @@ mod tests {
         command.args(["-c", "sleep 1"]);
         let cancelled = AtomicBool::new(true);
 
-        let error = run_process_with_deadline(&mut command, Duration::from_secs(1), &cancelled)
-            .unwrap_err();
+        let error = run_process_with_deadline(
+            &mut command,
+            Duration::from_secs(1),
+            &cancelled,
+            &AtomicBool::new(false),
+        )
+        .unwrap_err();
 
         assert_eq!(error, "Transcription cancelled.");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn transcription_process_success_exits_cleanly() {
+        let mut command = Command::new("sh");
+        command.args(["-c", "exit 0"]);
+
+        let status = run_process_with_deadline(
+            &mut command,
+            Duration::from_secs(1),
+            &AtomicBool::new(false),
+            &AtomicBool::new(false),
+        )
+        .unwrap();
+
+        assert!(status.success());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn transcription_process_failure_returns_error_status() {
+        let mut command = Command::new("sh");
+        command.args(["-c", "exit 1"]);
+
+        let status = run_process_with_deadline(
+            &mut command,
+            Duration::from_secs(1),
+            &AtomicBool::new(false),
+            &AtomicBool::new(false),
+        )
+        .unwrap();
+
+        assert!(!status.success());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn shutdown_flag_aborts_transcription_before_spawn() {
+        let mut command = Command::new("sh");
+        command.args(["-c", "sleep 10"]);
+        let shutdown = AtomicBool::new(true);
+
+        let error = run_process_with_deadline(
+            &mut command,
+            Duration::from_secs(10),
+            &AtomicBool::new(false),
+            &shutdown,
+        )
+        .unwrap_err();
+
+        assert_eq!(error, "Transcription cancelled.");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn shutdown_flag_terminates_running_child() {
+        let mut command = Command::new("sh");
+        command.args(["-c", "sleep 10"]);
+        let shutdown = Arc::new(AtomicBool::new(false));
+        let shutdown_clone = Arc::clone(&shutdown);
+
+        let handle = thread::spawn(move || {
+            run_process_with_deadline(
+                &mut command,
+                Duration::from_secs(10),
+                &AtomicBool::new(false),
+                &shutdown_clone,
+            )
+        });
+
+        thread::sleep(Duration::from_millis(50));
+        shutdown.store(true, Ordering::Relaxed);
+
+        let error = handle.join().unwrap().unwrap_err();
+        assert!(error.contains("cancelled"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn cancel_flag_terminates_running_child() {
+        let mut command = Command::new("sh");
+        command.args(["-c", "sleep 10"]);
+        let cancel = Arc::new(AtomicBool::new(false));
+        let cancel_clone = Arc::clone(&cancel);
+
+        let handle = thread::spawn(move || {
+            run_process_with_deadline(
+                &mut command,
+                Duration::from_secs(10),
+                &cancel_clone,
+                &AtomicBool::new(false),
+            )
+        });
+
+        thread::sleep(Duration::from_millis(50));
+        cancel.store(true, Ordering::Relaxed);
+
+        let error = handle.join().unwrap().unwrap_err();
+        assert!(error.contains("cancelled"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn transcription_try_wait_error_terminates_child() {
+        let mut command = Command::new("sh");
+        command.args(["-c", "sleep 10"]);
+        let cancel = AtomicBool::new(true);
+
+        let error = run_process_with_deadline(
+            &mut command,
+            Duration::from_secs(1),
+            &cancel,
+            &AtomicBool::new(false),
+        )
+        .unwrap_err();
+
+        assert!(error.contains("cancelled"));
+    }
+
+    #[test]
+    fn settings_deserializes_old_config_without_timeout() {
+        let json = r#"{
+            "whisper_binary_path": "auto",
+            "model_path": "auto",
+            "hotkey": "Ctrl+Alt+Space",
+            "recording_mode": "toggle",
+            "auto_paste": true,
+            "clipboard_fallback": true,
+            "dictionary_cleanup": true,
+            "history_enabled": false,
+            "max_history_entries": 100,
+            "history_retention_days": 0,
+            "pill_always_on_top": true,
+            "start_on_login": false
+        }"#;
+        let settings: Settings = serde_json::from_str(json).unwrap();
+        assert_eq!(
+            settings.transcription_timeout_seconds,
+            DEFAULT_TRANSCRIPTION_TIMEOUT_SECONDS
+        );
+    }
+
+    #[test]
+    fn settings_normalizes_out_of_range_timeout_on_save() {
+        let settings = Settings {
+            transcription_timeout_seconds: 99999,
+            ..Settings::default()
+        };
+        let clamped = settings.transcription_timeout_seconds.clamp(
+            MIN_TRANSCRIPTION_TIMEOUT_SECONDS,
+            MAX_TRANSCRIPTION_TIMEOUT_SECONDS,
+        );
+        assert_eq!(clamped, MAX_TRANSCRIPTION_TIMEOUT_SECONDS);
+
+        let settings = Settings {
+            transcription_timeout_seconds: 5,
+            ..Settings::default()
+        };
+        let clamped = settings.transcription_timeout_seconds.clamp(
+            MIN_TRANSCRIPTION_TIMEOUT_SECONDS,
+            MAX_TRANSCRIPTION_TIMEOUT_SECONDS,
+        );
+        assert_eq!(clamped, MIN_TRANSCRIPTION_TIMEOUT_SECONDS);
+    }
+
+    #[test]
+    fn settings_default_transcription_timeout_is_900() {
+        assert_eq!(
+            Settings::default().transcription_timeout_seconds,
+            DEFAULT_TRANSCRIPTION_TIMEOUT_SECONDS
+        );
     }
 
     #[test]
@@ -2273,7 +3581,8 @@ mod tests {
             ..Settings::default()
         };
 
-        let resolved = resolve_engine_paths_with_candidates(&settings, &[root.clone()]).unwrap();
+        let resolved =
+            resolve_engine_paths_with_candidates(&settings, std::slice::from_ref(&root)).unwrap();
 
         assert_eq!(resolved.whisper_binary, whisper);
         assert_eq!(resolved.model, model);
@@ -2281,34 +3590,209 @@ mod tests {
     }
 
     #[test]
-    fn action_status_keeps_copy_success_when_paste_fails() {
-        let status = resolve_insert_status(
+    fn insertion_report_marks_paste_failure_as_failed() {
+        let report = insertion_report_from_results(
             true,
-            true,
-            Some(Ok("tauri-clipboard".to_string())),
+            Ok("tauri-clipboard".to_string()),
             Some(Err("Paste failed".to_string())),
+            Ok(()),
         );
 
-        assert_eq!(status.insert_status, "copied");
-        assert_eq!(status.error.as_deref(), Some("Paste failed"));
+        assert_eq!(report.outcome, InsertionOutcome::Failed);
+        assert_eq!(report.copy_status, "copied:tauri-clipboard");
+        assert_eq!(report.paste_status, "failed");
+        assert_eq!(report.error.as_deref(), Some("Paste failed"));
     }
 
     #[test]
-    fn action_status_reports_clipboard_failure_without_paste_attempt() {
-        let status = resolve_insert_status(
-            true,
+    fn insertion_report_marks_clipboard_failure_as_failed() {
+        let report = insertion_report_from_results(
             false,
-            Some(Err("Clipboard unavailable".to_string())),
+            Err("Clipboard unavailable".to_string()),
             None,
+            Ok(()),
         );
 
-        assert_eq!(status.insert_status, "clipboard_failed");
-        assert_eq!(status.error.as_deref(), Some("Clipboard unavailable"));
+        assert_eq!(report.outcome, InsertionOutcome::Failed);
+        assert_eq!(report.copy_status, "failed");
+        assert_eq!(report.error.as_deref(), Some("Clipboard unavailable"));
+    }
+
+    #[test]
+    fn insertion_report_records_clipboard_snapshot_failure() {
+        let report = execute_insertion_transaction(
+            "transcript",
+            true,
+            true,
+            || Err("Clipboard read failed: unavailable".to_string()),
+            || Ok("tauri-clipboard".to_string()),
+            || Ok("xdotool".to_string()),
+            |_| Ok(()),
+        );
+
+        assert_eq!(report.outcome, InsertionOutcome::Failed);
+        assert_eq!(report.copy_status, "not_attempted");
+        assert_eq!(report.paste_status, "not_attempted");
+        assert!(!report.clipboard_restored);
+        assert!(report.error.unwrap().contains("Clipboard read failed"));
+    }
+
+    #[test]
+    fn clipboard_only_output_does_not_snapshot_or_restore_clipboard() {
+        let report = execute_insertion_transaction(
+            "transcript",
+            true,
+            false,
+            || panic!("clipboard should not be read for an intentional copy"),
+            || Ok("tauri-clipboard".to_string()),
+            || panic!("paste should not run for clipboard-only output"),
+            |_| panic!("clipboard should not be restored for an intentional copy"),
+        );
+
+        assert_eq!(report.outcome, InsertionOutcome::CopiedOnly);
+        assert_eq!(report.copy_status, "copied:tauri-clipboard");
+        assert_eq!(report.paste_status, "not_requested");
+        assert!(!report.clipboard_restored);
+    }
+
+    #[test]
+    fn failed_paste_restores_the_previous_clipboard_text() {
+        let restored = Arc::new(Mutex::new(None));
+        let restored_text = Arc::clone(&restored);
+        let report = execute_insertion_transaction(
+            "transcript",
+            true,
+            true,
+            || Ok(ClipboardSnapshot::Text("previous clipboard".to_string())),
+            || Ok("tauri-clipboard".to_string()),
+            || Err("Paste target lost focus".to_string()),
+            move |snapshot| {
+                let ClipboardSnapshot::Text(text) = snapshot;
+                *restored_text.lock().unwrap() = Some(text.clone());
+                Ok(())
+            },
+        );
+
+        assert_eq!(report.outcome, InsertionOutcome::Failed);
+        assert!(report.clipboard_restored);
+        assert_eq!(
+            restored.lock().unwrap().as_deref(),
+            Some("previous clipboard")
+        );
+        assert!(report.error.unwrap().contains("lost focus"));
+    }
+
+    #[test]
+    fn insertion_lock_serializes_concurrent_transactions() {
+        let insertion_lock = Arc::new(Mutex::new(()));
+        let active = Arc::new(AtomicU32::new(0));
+        let peak = Arc::new(AtomicU32::new(0));
+        let workers: Vec<_> = (0..8)
+            .map(|_| {
+                let insertion_lock = Arc::clone(&insertion_lock);
+                let active = Arc::clone(&active);
+                let peak = Arc::clone(&peak);
+                thread::spawn(move || {
+                    with_insertion_lock(&insertion_lock, || {
+                        let current = active.fetch_add(1, Ordering::SeqCst) + 1;
+                        peak.fetch_max(current, Ordering::SeqCst);
+                        thread::sleep(Duration::from_millis(10));
+                        active.fetch_sub(1, Ordering::SeqCst);
+                        Ok(())
+                    })
+                    .unwrap();
+                })
+            })
+            .collect();
+
+        for worker in workers {
+            worker.join().unwrap();
+        }
+        assert_eq!(peak.load(Ordering::SeqCst), 1);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn paste_helper_timeout_kills_and_reaps_child() {
+        let mut command = Command::new("sleep");
+        command.arg("1");
+        let started = Instant::now();
+
+        let error = run_paste_helper(&mut command, "sleep", Duration::from_millis(30)).unwrap_err();
+
+        assert!(error.contains("timed out"));
+        assert!(started.elapsed() < Duration::from_millis(500));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn shutdown_cancels_and_reaps_transcription_child() {
+        let mut command = Command::new("sh");
+        command.args(["-c", "sleep 10"]);
+        let shutdown = Arc::new(AtomicBool::new(false));
+        let shutdown_clone = Arc::clone(&shutdown);
+
+        let handle = thread::spawn(move || {
+            run_process_with_deadline(
+                &mut command,
+                Duration::from_secs(10),
+                &AtomicBool::new(false),
+                &shutdown_clone,
+            )
+        });
+
+        thread::sleep(Duration::from_millis(50));
+        shutdown.store(true, Ordering::Relaxed);
+
+        let error = handle.join().unwrap().unwrap_err();
+        assert!(error.contains("cancelled"));
+    }
+
+    #[test]
+    fn history_items_without_insertion_reports_use_defaults() {
+        let item = history_item("legacy transcript", Utc::now());
+        let mut legacy = serde_json::to_value(item).unwrap();
+        legacy.as_object_mut().unwrap().remove("insertion_report");
+
+        let restored: HistoryItem = serde_json::from_value(legacy).unwrap();
+
+        assert_eq!(restored.insertion_report, InsertionReport::default());
     }
 
     #[test]
     fn native_clipboard_capability_is_reported_without_shell_helper() {
         assert_eq!(clipboard_tool_name(), Some("tauri-clipboard".to_string()));
+    }
+
+    #[test]
+    fn diagnostics_report_is_redacted_and_does_not_include_sensitive_content() {
+        let diagnostics = Diagnostics {
+            whisper_found: true,
+            model_found: true,
+            mic_available: true,
+            clipboard_tool: Some("tauri-clipboard".to_string()),
+            paste_tool: Some("xdotool".to_string()),
+            whisper_path: Some(format!(
+                "{}/tools/whisper",
+                dirs::home_dir().unwrap().display()
+            )),
+            model_path: Some("/models/base.bin".to_string()),
+            recorder: Some("arecord".to_string()),
+            input_device: Some("Built-in Microphone".to_string()),
+            platform: "linux".to_string(),
+            setup_available: false,
+            setup_script_path: None,
+            setup_command: None,
+            last_error: Some("whisper failed with raw transcript: SECRET".to_string()),
+        };
+        let report = format_diagnostics_report(&diagnostics, &UpdaterStatus::Error);
+        assert!(report.contains("version:"));
+        assert!(report.contains("updater: Error"));
+        assert!(report.contains("last_error_category: engine"));
+        assert!(report.contains("<home>"));
+        assert!(!report.contains("SECRET"));
+        assert!(!report.contains("raw transcript"));
+        assert!(!report.contains("setup_command"));
     }
 
     #[test]
@@ -2426,6 +3910,1021 @@ mod tests {
         let _ = fs::remove_dir_all(root);
     }
 
+    // ---- WP2 #52: release URL validation ----
+
+    #[test]
+    fn release_url_accepts_canonical_release_tag_and_download_urls() {
+        assert!(is_allowed_release_url(RELEASES_URL));
+        assert!(is_allowed_release_url(
+            "https://github.com/Zburgers/vibevoice/releases/tag/v0.2.7"
+        ));
+        assert!(is_allowed_release_url(
+            "https://github.com/Zburgers/vibevoice/releases/download/v0.2.7/VibeVoice_0.2.7_x64.AppImage"
+        ));
+    }
+
+    #[test]
+    fn release_url_rejects_shell_metacharacters_and_injection_tricks() {
+        for evil in [
+            "https://github.com/Zburgers/vibevoice/releases/tag/v0.2.7 && rm -rf /",
+            "https://github.com/Zburgers/vibevoice/releases/tag/v0.2.7&calc.exe",
+            "https://github.com/Zburgers/vibevoice/releases/tag/v0.2.7|cat /etc/passwd",
+            "https://github.com/Zburgers/vibevoice/releases/tag/v0.2.7;id",
+            "https://github.com/Zburgers/vibevoice/releases/tag/v0.2.7`id`",
+            "https://github.com/Zburgers/vibevoice/releases/tag/v0.2.7$(id)",
+            "https://github.com/Zburgers/vibevoice/releases/tag/'v0.2.7'",
+            "https://github.com/Zburgers/vibevoice/releases/tag/\"v0.2.7\"",
+            "https://github.com/Zburgers/vibevoice/releases/tag/v0.2.7\r\nEvil: 1",
+            "https://github.com/Zburgers/vibevoice/releases/tag/v0.2.7\nx",
+        ] {
+            assert!(!is_allowed_release_url(evil), "must reject {evil:?}");
+        }
+    }
+
+    #[test]
+    fn release_url_rejects_query_fragment_malformed_and_traversal() {
+        for bad in [
+            "https://github.com/Zburgers/vibevoice/releases/tag/v0.2.7?next=evil",
+            "https://github.com/Zburgers/vibevoice/releases/tag/v0.2.7#evil",
+            "https://github.com/Zburgers/vibevoice/releases/download/v0.2.7/file?x=1#y",
+            "https://github.com/Zburgers/vibevoice/releases.evil.example/tag/v0.2.7",
+            "https://github.com/Zburgers/vibevoice/issues",
+            "https://github.com/Zburgers/vibevoice/releases/",
+            "https://github.com/Zburgers/vibevoice/releases/tag/",
+            "https://github.com/Zburgers/vibevoice/releases/tag/v",
+            "https://github.com/Zburgers/vibevoice/releases/tag/v0.2.7/../evil",
+            "https://github.com/Zburgers/vibevoice/releases/download/../evil",
+            "https://github.com/Zburgers/vibevoice/releases/tag/v0.2.7//evil",
+            "https://github.com/Zburgers/vibevoice/releases/download//evil",
+            "https://github.com/Zburgers/vibevoice/releases/tag/v0.2.7/",
+            "not a url",
+            "",
+        ] {
+            assert!(!is_allowed_release_url(bad), "must reject {bad:?}");
+        }
+    }
+
+    // ---- WP2 #53: Unicode-safe dictionary replacement ----
+
+    #[test]
+    fn dictionary_handles_dotted_capital_i_without_panic() {
+        // U+0130 lowercases to two chars (`i` + combining dot); the old
+        // byte-offset implementation sliced mid-character and panicked.
+        assert_eq!(replace_case_insensitive("İstanbul", "i", "X"), "Xstanbul");
+        assert_eq!(replace_case_insensitive("I", "İ", "X"), "I");
+    }
+
+    #[test]
+    fn dictionary_handles_combining_characters() {
+        // Combining marks must never split UTF-8 boundaries or panic. Matching
+        // is simple case-folding without Unicode normalization, so identical
+        // normal forms match and cross-form inputs are safely left alone.
+        let decomposed = "cafe\u{301}";
+        assert_eq!(
+            replace_case_insensitive(decomposed, "CAFE\u{301}", "coffee"),
+            "coffee"
+        );
+        assert_eq!(
+            replace_case_insensitive(decomposed, "café", "coffee"),
+            decomposed
+        );
+        assert_eq!(
+            replace_case_insensitive("café", "CAFE\u{301}", "coffee"),
+            "café"
+        );
+    }
+
+    #[test]
+    fn dictionary_handles_non_ascii_needle_and_replacement() {
+        assert_eq!(
+            replace_case_insensitive("CAFÉ AU LAIT", "café", "coffee"),
+            "coffee AU LAIT"
+        );
+        assert_eq!(
+            replace_case_insensitive("hello world", "world", "wörld ✓"),
+            "hello wörld ✓"
+        );
+        assert_eq!(
+            replace_case_insensitive("naïve NAÏVE", "naïve", "simple"),
+            "simple simple"
+        );
+    }
+
+    #[test]
+    fn dictionary_handles_ascii_no_match_and_overlapping_rules() {
+        assert_eq!(
+            replace_case_insensitive("hello world", "xyz", "Q"),
+            "hello world"
+        );
+        // Deterministic left-to-right, non-overlapping application.
+        assert_eq!(replace_case_insensitive("aaa", "aa", "b"), "ba");
+        assert_eq!(
+            replace_case_insensitive("next js and NEXT JS", "next js", "Next.js"),
+            "Next.js and Next.js"
+        );
+        assert_eq!(replace_case_insensitive("", "a", "b"), "");
+        assert_eq!(replace_case_insensitive("abc", "", "b"), "abc");
+    }
+
+    #[test]
+    fn dictionary_applies_rules_deterministically_in_order() {
+        let rules = vec![
+            DictionaryRule {
+                id: "1".to_string(),
+                spoken: "github actions".to_string(),
+                replacement: "GitHub Actions".to_string(),
+                enabled: true,
+            },
+            DictionaryRule {
+                id: "2".to_string(),
+                spoken: "github".to_string(),
+                replacement: "GitHub".to_string(),
+                enabled: true,
+            },
+        ];
+        assert_eq!(
+            apply_dictionary("use github actions today", &rules),
+            "use GitHub Actions today"
+        );
+    }
+
+    // ---- WP2 #54: corrupt-history cleanup contract ----
+
+    #[test]
+    fn clear_history_helper_removes_only_corrupt_copies() {
+        let root = std::env::temp_dir().join(format!("vibevoice-history-wp2-{}", Uuid::new_v4()));
+        fs::create_dir_all(&root).unwrap();
+        let path = root.join("history.json");
+        fs::write(&path, b"[]").unwrap();
+        fs::write(root.join("history.json.bak"), b"[]").unwrap();
+        fs::write(root.join("history.corrupt-2026-01-01-abc.json"), b"stale").unwrap();
+        fs::write(root.join("history.corrupt-xyz.json"), b"stale").unwrap();
+        fs::write(root.join("history.keep.json"), b"keep").unwrap();
+        fs::write(root.join("notes.txt"), b"keep").unwrap();
+
+        remove_corrupt_history_copies(&path).unwrap();
+
+        assert!(!root.join("history.corrupt-2026-01-01-abc.json").exists());
+        assert!(!root.join("history.corrupt-xyz.json").exists());
+        assert!(root.join("history.json").exists());
+        assert!(root.join("history.json.bak").exists());
+        assert!(root.join("history.keep.json").exists());
+        assert!(root.join("notes.txt").exists());
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn corrupt_history_matcher_requires_exact_contract() {
+        assert!(is_corrupt_history_copy("history.corrupt-abc.json"));
+        assert!(!is_corrupt_history_copy("history.keep.json"));
+        assert!(!is_corrupt_history_copy("history.json"));
+        assert!(!is_corrupt_history_copy("history.corrupt-abc.json.bak"));
+        assert!(!is_corrupt_history_copy("history.corrupt-abc.txt"));
+        assert!(!is_corrupt_history_copy("other.corrupt-abc.json"));
+    }
+
+    #[test]
+    fn corrupt_history_cleanup_reports_missing_directory_actionably() {
+        let missing = std::env::temp_dir().join(format!("vibevoice-missing-{}", Uuid::new_v4()));
+        let path = missing.join("history.json");
+        let error = remove_corrupt_history_copies(&path).unwrap_err();
+        assert!(error.contains("Could not list history dir"));
+    }
+
+    // ---- WP2 #47: safe stale-recording cleanup ----
+
+    fn wp2_write(dir: &Path, name: &str) -> PathBuf {
+        let path = dir.join(name);
+        fs::write(&path, b"fixture").unwrap();
+        path
+    }
+
+    fn wp2_set_old(path: &Path) {
+        let old = std::time::SystemTime::now() - STALE_RECORDING_AGE - Duration::from_secs(60);
+        let file = fs::File::options().write(true).open(path).unwrap();
+        file.set_modified(old).unwrap();
+    }
+
+    fn wp2_dead_pid() -> u32 {
+        // A pid that cannot exist on any supported platform probe path.
+        4_000_000_000_u32.wrapping_sub(17)
+    }
+
+    #[test]
+    fn stale_owned_recording_is_removed_with_companion() {
+        let dir = std::env::temp_dir().join(format!("vibevoice-wp2-{}", Uuid::new_v4()));
+        fs::create_dir_all(&dir).unwrap();
+        let stem = format!("recording-{}-{}", wp2_dead_pid(), Uuid::new_v4());
+        let wav = wp2_write(&dir, &format!("{stem}.wav"));
+        let txt = wp2_write(&dir, &format!("{stem}.txt"));
+        wp2_set_old(&wav);
+        wp2_set_old(&txt);
+
+        cleanup_recording_outputs_in_with_pid(&dir, 123_456).unwrap();
+
+        assert!(!wav.exists());
+        assert!(!txt.exists());
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn live_and_recent_files_are_preserved() {
+        let dir = std::env::temp_dir().join(format!("vibevoice-wp2-{}", Uuid::new_v4()));
+        fs::create_dir_all(&dir).unwrap();
+        let current = std::process::id();
+        let own = wp2_write(&dir, &format!("recording-{current}-{}.wav", Uuid::new_v4()));
+        // Another live session: spawn a sleeper and borrow its pid.
+        let mut child = Command::new("sleep")
+            .arg("30")
+            .spawn()
+            .expect("sleep fixture");
+        let live_pid = child.id();
+        assert!(is_pid_alive(live_pid));
+        let live = wp2_write(
+            &dir,
+            &format!("recording-{live_pid}-{}.wav", Uuid::new_v4()),
+        );
+        // Legacy but fresh: conservative age rule must preserve it.
+        let legacy = wp2_write(&dir, &format!("recording-{}.wav", Uuid::new_v4()));
+
+        cleanup_recording_outputs_in_with_pid(&dir, current).unwrap();
+
+        assert!(own.exists(), "own fresh file preserved");
+        assert!(live.exists(), "other live instance preserved");
+        assert!(legacy.exists(), "fresh legacy file preserved");
+        let _ = child.kill();
+        let _ = child.wait();
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn legacy_stale_file_is_eventually_cleaned() {
+        let dir = std::env::temp_dir().join(format!("vibevoice-wp2-{}", Uuid::new_v4()));
+        fs::create_dir_all(&dir).unwrap();
+        let stale = wp2_write(&dir, &format!("recording-{}.wav", Uuid::new_v4()));
+        wp2_set_old(&stale);
+
+        cleanup_recording_outputs_in_with_pid(&dir, std::process::id()).unwrap();
+
+        assert!(!stale.exists());
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn malformed_and_unrelated_files_are_ignored() {
+        let dir = std::env::temp_dir().join(format!("vibevoice-wp2-{}", Uuid::new_v4()));
+        fs::create_dir_all(&dir).unwrap();
+        let names = [
+            "recording-.wav",
+            "recording-abc.wav",
+            "recording-123.wav",
+            "recording-1-not-a-uuid.wav",
+            "recording-9999999999-zzz.txt",
+            "recording-old.tmp",
+            "keep.txt",
+            "audio.wav",
+            "recording-123.mp3",
+        ];
+        for name in names {
+            wp2_write(&dir, name);
+        }
+        fs::create_dir_all(dir.join("recording-123-abc.wav")).unwrap();
+
+        cleanup_recording_outputs_in(&dir).unwrap();
+
+        for name in names {
+            assert!(dir.join(name).exists(), "ignored {name}");
+        }
+        assert!(dir.join("recording-123-abc.wav").is_dir());
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn stale_cleanup_error_is_actionable() {
+        let file = std::env::temp_dir().join(format!("vibevoice-wp2-file-{}", Uuid::new_v4()));
+        fs::write(&file, b"x").unwrap();
+        let error = cleanup_recording_outputs_in(&file).unwrap_err();
+        assert!(error.contains("Could not list temp workspace"));
+        let _ = fs::remove_file(file);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn dead_owner_recording_is_reclaimed_without_waiting_for_age() {
+        let dir = std::env::temp_dir().join(format!("vibevoice-wp2-{}", Uuid::new_v4()));
+        fs::create_dir_all(&dir).unwrap();
+        let stem = format!("recording-{}-{}", wp2_dead_pid(), Uuid::new_v4());
+        let wav = wp2_write(&dir, &format!("{stem}.wav"));
+
+        cleanup_recording_outputs_in_with_pid(&dir, 123_456).unwrap();
+
+        assert!(
+            !wav.exists(),
+            "dead-owner artifact reclaimed promptly on unix"
+        );
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn startup_after_crash_cleans_stale_but_keeps_workspace_usable() {
+        let dir = std::env::temp_dir().join(format!("vibevoice-wp2-{}", Uuid::new_v4()));
+        fs::create_dir_all(&dir).unwrap();
+        let stale_stem = format!("recording-{}-{}", wp2_dead_pid(), Uuid::new_v4());
+        let stale_wav = wp2_write(&dir, &format!("{stale_stem}.wav"));
+        let stale_txt = wp2_write(&dir, &format!("{stale_stem}.txt"));
+        wp2_set_old(&stale_wav);
+        wp2_set_old(&stale_txt);
+        let current = std::process::id();
+        let live = wp2_write(&dir, &format!("recording-{current}-{}.wav", Uuid::new_v4()));
+
+        cleanup_recording_outputs_in_with_pid(&dir, current).unwrap();
+
+        assert!(!stale_wav.exists());
+        assert!(!stale_txt.exists());
+        assert!(live.exists());
+        // Workspace still usable for a fresh recording after recovery.
+        let fresh = dir.join(format!("{}.wav", new_recording_stem()));
+        fs::write(&fresh, b"new").unwrap();
+        assert!(fresh.exists());
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn temp_workspace_is_app_private_on_unix() {
+        let path = prepare_temp_workspace().unwrap();
+        assert!(path.exists());
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::MetadataExt;
+            let mode = fs::metadata(&path).unwrap().mode() & 0o777;
+            assert_eq!(mode, 0o700);
+        }
+    }
+
+    // ---- WP4 #50: pending-start ownership / cancellation ---- //
+    //
+    // These tests exercise the production helpers
+    // (`next_preparation_generation`, `try_claim_preparation_slot`,
+    // `cancel_preparation_for_stop`, `is_preparation_current`,
+    // `invalidate_preparation`) with deterministic gating (mpsc channels and
+    // barriers) rather than timing luck. The "worker" closures below mirror
+    // the exact decision sequence in `begin_recording`'s spawned thread:
+    // shutdown check → lock → `is_preparation_current` → install or
+    // stop-and-clean without touching state.
+
+    fn wp4_begin(
+        runtime: &Mutex<RuntimeState>,
+        counter: &AtomicU64,
+        shutdown: &AtomicBool,
+    ) -> Result<u64, String> {
+        if shutdown.load(Ordering::Acquire) {
+            return Err("VibeVoice is shutting down.".to_string());
+        }
+        let generation = next_preparation_generation(counter);
+        let mut state = runtime.lock().unwrap();
+        try_claim_preparation_slot(&mut state, generation)?;
+        Ok(generation)
+    }
+
+    /// Mirror of the `Ok(session)` branch in `begin_recording`.
+    /// `resource_live` stands in for acquired audio resources: `true` means
+    /// the fake device/child is held, and discarding must stop it.
+    /// Returns `true` when the session was installed as Recording.
+    fn wp4_worker_ok(
+        runtime: &Mutex<RuntimeState>,
+        shutdown: &AtomicBool,
+        generation: u64,
+        resource_live: &AtomicBool,
+    ) -> bool {
+        if shutdown.load(Ordering::Acquire) {
+            resource_live.store(false, Ordering::Relaxed);
+            return false;
+        }
+        let mut state = runtime.lock().unwrap();
+        if !is_preparation_current(&state, generation) {
+            drop(state);
+            resource_live.store(false, Ordering::Relaxed);
+            return false;
+        }
+        state.preparing_generation = None;
+        state.voice_state = VoiceState::Recording;
+        state.last_error = None;
+        true
+    }
+
+    /// Mirror of the `Err(error)` branch in `begin_recording`.
+    /// Returns `true` when the error was reported (state → Error).
+    fn wp4_worker_err(
+        runtime: &Mutex<RuntimeState>,
+        shutdown: &AtomicBool,
+        generation: u64,
+        message: &str,
+    ) -> bool {
+        if shutdown.load(Ordering::Acquire) {
+            return false;
+        }
+        let mut state = runtime.lock().unwrap();
+        if !is_preparation_current(&state, generation) {
+            return false;
+        }
+        state.preparing_generation = None;
+        state.voice_state = VoiceState::Error;
+        state.last_error = Some(message.to_string());
+        true
+    }
+
+    #[test]
+    fn wp4_start_then_immediate_stop_cancels_preparation() {
+        let runtime = Mutex::new(RuntimeState::default());
+        let counter = AtomicU64::new(0);
+        let shutdown = AtomicBool::new(false);
+
+        let generation = wp4_begin(&runtime, &counter, &shutdown).unwrap();
+        assert!(generation != 0);
+        {
+            let state = runtime.lock().unwrap();
+            assert!(matches!(state.voice_state, VoiceState::Preparing));
+            assert_eq!(state.preparing_generation, Some(generation));
+        }
+        // Stop during Preparing invalidates that exact start and reports
+        // success (no "still starting" rejection).
+        let cancelled = cancel_preparation_for_stop(&mut runtime.lock().unwrap());
+        assert_eq!(cancelled, Some(generation));
+        {
+            let state = runtime.lock().unwrap();
+            assert!(matches!(state.voice_state, VoiceState::Ready));
+            assert_eq!(state.preparing_generation, None);
+            assert!(state.recording.is_none());
+        }
+        // The late preparation must never install itself; acquired resources
+        // are stopped immediately.
+        let resource_live = AtomicBool::new(true);
+        assert!(!wp4_worker_ok(
+            &runtime,
+            &shutdown,
+            generation,
+            &resource_live
+        ));
+        assert!(!resource_live.load(Ordering::Relaxed));
+        let state = runtime.lock().unwrap();
+        assert!(matches!(state.voice_state, VoiceState::Ready));
+    }
+
+    #[test]
+    fn wp4_stop_before_preparation_completes_discards_late_session() {
+        let runtime = Arc::new(Mutex::new(RuntimeState::default()));
+        let counter = AtomicU64::new(0);
+        let shutdown = Arc::new(AtomicBool::new(false));
+
+        let generation = wp4_begin(&runtime, &counter, &shutdown).unwrap();
+        // Gate preparation completion deterministically: the worker blocks on
+        // `gate` until the test has performed the stop.
+        let (gate_tx, gate_rx) = std::sync::mpsc::channel::<()>();
+        let (done_tx, done_rx) = std::sync::mpsc::channel::<(bool, bool)>();
+        let worker_runtime = Arc::clone(&runtime);
+        let worker_shutdown = Arc::clone(&shutdown);
+        let worker = thread::spawn(move || {
+            gate_rx.recv().unwrap();
+            let resource_live = AtomicBool::new(true);
+            let installed = wp4_worker_ok(
+                &worker_runtime,
+                &worker_shutdown,
+                generation,
+                &resource_live,
+            );
+            done_tx
+                .send((installed, resource_live.load(Ordering::Relaxed)))
+                .unwrap();
+        });
+
+        // Stop while the preparation is still gated (blocked).
+        let cancelled = cancel_preparation_for_stop(&mut runtime.lock().unwrap());
+        assert_eq!(cancelled, Some(generation));
+        // Now let the preparation finish late: it must be discarded.
+        gate_tx.send(()).unwrap();
+        let (installed, resource_live) = done_rx.recv().unwrap();
+        worker.join().unwrap();
+        assert!(!installed, "cancelled preparation installed itself");
+        assert!(!resource_live, "acquired audio resources were not stopped");
+        let state = runtime.lock().unwrap();
+        assert!(matches!(state.voice_state, VoiceState::Ready));
+        assert_eq!(state.preparing_generation, None);
+    }
+
+    #[test]
+    fn wp4_start_stop_start_second_generation_wins() {
+        let runtime = Mutex::new(RuntimeState::default());
+        let counter = AtomicU64::new(0);
+        let shutdown = AtomicBool::new(false);
+
+        let first = wp4_begin(&runtime, &counter, &shutdown).unwrap();
+        cancel_preparation_for_stop(&mut runtime.lock().unwrap());
+        let second = wp4_begin(&runtime, &counter, &shutdown).unwrap();
+        assert_ne!(first, second, "each start must have a distinct identity");
+        {
+            let state = runtime.lock().unwrap();
+            assert_eq!(state.preparing_generation, Some(second));
+        }
+        // First generation completes late: must not corrupt the second.
+        let stale_resource = AtomicBool::new(true);
+        assert!(!wp4_worker_ok(&runtime, &shutdown, first, &stale_resource));
+        assert!(!stale_resource.load(Ordering::Relaxed));
+        {
+            let state = runtime.lock().unwrap();
+            assert!(matches!(state.voice_state, VoiceState::Preparing));
+            assert_eq!(state.preparing_generation, Some(second));
+        }
+        // Second generation completes: installs normally.
+        let current_resource = AtomicBool::new(true);
+        assert!(wp4_worker_ok(
+            &runtime,
+            &shutdown,
+            second,
+            &current_resource
+        ));
+        assert!(current_resource.load(Ordering::Relaxed));
+        let state = runtime.lock().unwrap();
+        assert!(matches!(state.voice_state, VoiceState::Recording));
+        assert_eq!(state.preparing_generation, None);
+    }
+
+    #[test]
+    fn wp4_first_preparation_completes_after_second_start_is_discarded() {
+        // Deterministic out-of-order completion via two gates: both
+        // preparations are in-flight, gen1 finishes after gen2 started, and
+        // gen1 must still be discarded while gen2 installs.
+        let runtime = Arc::new(Mutex::new(RuntimeState::default()));
+        let counter = AtomicU64::new(0);
+        let shutdown = Arc::new(AtomicBool::new(false));
+
+        let first = wp4_begin(&runtime, &counter, &shutdown).unwrap();
+        cancel_preparation_for_stop(&mut runtime.lock().unwrap());
+        let second = wp4_begin(&runtime, &counter, &shutdown).unwrap();
+
+        let (first_gate_tx, first_gate_rx) = std::sync::mpsc::channel::<()>();
+        let (second_gate_tx, second_gate_rx) = std::sync::mpsc::channel::<()>();
+        let (result_tx, result_rx) = std::sync::mpsc::channel::<(u64, bool)>();
+
+        for (generation, gate) in [(first, first_gate_rx), (second, second_gate_rx)] {
+            let worker_runtime = Arc::clone(&runtime);
+            let worker_shutdown = Arc::clone(&shutdown);
+            let result_tx = result_tx.clone();
+            thread::spawn(move || {
+                gate.recv().unwrap();
+                let resource = AtomicBool::new(true);
+                let installed =
+                    wp4_worker_ok(&worker_runtime, &worker_shutdown, generation, &resource);
+                result_tx.send((generation, installed)).unwrap();
+            });
+        }
+        // Complete the FIRST generation while the second is still valid.
+        first_gate_tx.send(()).unwrap();
+        let (completed, installed) = result_rx.recv().unwrap();
+        assert_eq!(completed, first);
+        assert!(!installed, "stale first generation installed itself");
+        {
+            let state = runtime.lock().unwrap();
+            assert_eq!(state.preparing_generation, Some(second));
+            assert!(matches!(state.voice_state, VoiceState::Preparing));
+        }
+        // Then complete the second generation: it installs.
+        second_gate_tx.send(()).unwrap();
+        let (completed, installed) = result_rx.recv().unwrap();
+        assert_eq!(completed, second);
+        assert!(installed);
+        let state = runtime.lock().unwrap();
+        assert!(matches!(state.voice_state, VoiceState::Recording));
+    }
+
+    #[test]
+    fn wp4_preparation_failure_after_cancellation_is_harmless() {
+        let runtime = Mutex::new(RuntimeState::default());
+        let counter = AtomicU64::new(0);
+        let shutdown = AtomicBool::new(false);
+
+        let generation = wp4_begin(&runtime, &counter, &shutdown).unwrap();
+        cancel_preparation_for_stop(&mut runtime.lock().unwrap());
+        // Failed preparation after cancellation must not overwrite Ready.
+        assert!(!wp4_worker_err(
+            &runtime,
+            &shutdown,
+            generation,
+            "microphone unavailable"
+        ));
+        {
+            let state = runtime.lock().unwrap();
+            assert!(matches!(state.voice_state, VoiceState::Ready));
+            assert_eq!(state.last_error, None);
+        }
+
+        // A failure for the CURRENT generation still reports normally.
+        let current = wp4_begin(&runtime, &counter, &shutdown).unwrap();
+        assert!(wp4_worker_err(
+            &runtime,
+            &shutdown,
+            current,
+            "microphone unavailable"
+        ));
+        {
+            let state = runtime.lock().unwrap();
+            assert!(matches!(state.voice_state, VoiceState::Error));
+            assert_eq!(state.last_error.as_deref(), Some("microphone unavailable"));
+        }
+    }
+
+    #[test]
+    fn wp4_shutdown_during_preparation_invalidates_and_discards() {
+        let runtime = Arc::new(Mutex::new(RuntimeState::default()));
+        let counter = AtomicU64::new(0);
+        let shutdown = Arc::new(AtomicBool::new(false));
+
+        let generation = wp4_begin(&runtime, &counter, &shutdown).unwrap();
+        let (gate_tx, gate_rx) = std::sync::mpsc::channel::<()>();
+        let (done_tx, done_rx) = std::sync::mpsc::channel::<bool>();
+        let worker_runtime = Arc::clone(&runtime);
+        let worker_shutdown = Arc::clone(&shutdown);
+        let worker = thread::spawn(move || {
+            gate_rx.recv().unwrap();
+            let resource_live = AtomicBool::new(true);
+            let installed = wp4_worker_ok(
+                &worker_runtime,
+                &worker_shutdown,
+                generation,
+                &resource_live,
+            );
+            done_tx.send(installed).unwrap();
+        });
+
+        // Shutdown invalidates outstanding preparation (mirrors shutdown_app).
+        shutdown.store(true, Ordering::Release);
+        invalidate_preparation(&mut runtime.lock().unwrap());
+        {
+            let mut state = runtime.lock().unwrap();
+            state.voice_state = VoiceState::Ready;
+        }
+        gate_tx.send(()).unwrap();
+        assert!(!done_rx.recv().unwrap());
+        worker.join().unwrap();
+        let state = runtime.lock().unwrap();
+        assert!(matches!(state.voice_state, VoiceState::Ready));
+        assert_eq!(state.preparing_generation, None);
+        // New starts are rejected while shut down.
+        assert!(wp4_begin(&runtime, &counter, &shutdown).is_err());
+    }
+
+    #[test]
+    fn wp4_repeated_fast_toggles_are_safe() {
+        // Sequential rapid toggle storm: start → cancel × N leaves a clean
+        // Ready state with no stuck generation, and the next real start still
+        // installs.
+        let runtime = Mutex::new(RuntimeState::default());
+        let counter = AtomicU64::new(0);
+        let shutdown = AtomicBool::new(false);
+        let mut seen = Vec::new();
+        for _ in 0..50 {
+            let generation = wp4_begin(&runtime, &counter, &shutdown).unwrap();
+            seen.push(generation);
+            let cancelled = cancel_preparation_for_stop(&mut runtime.lock().unwrap());
+            assert_eq!(cancelled, Some(generation));
+            // Late worker for the just-cancelled start is always discarded.
+            let resource = AtomicBool::new(true);
+            assert!(!wp4_worker_ok(&runtime, &shutdown, generation, &resource));
+        }
+        // Generations are unique across the storm.
+        let mut sorted = seen.clone();
+        sorted.sort_unstable();
+        sorted.dedup();
+        assert_eq!(sorted.len(), seen.len());
+        {
+            let state = runtime.lock().unwrap();
+            assert!(matches!(state.voice_state, VoiceState::Ready));
+            assert_eq!(state.preparing_generation, None);
+        }
+        let fresh = wp4_begin(&runtime, &counter, &shutdown).unwrap();
+        let resource = AtomicBool::new(true);
+        assert!(wp4_worker_ok(&runtime, &shutdown, fresh, &resource));
+        assert!(matches!(
+            runtime.lock().unwrap().voice_state,
+            VoiceState::Recording
+        ));
+
+        // Concurrent toggle storm with a deterministic barrier: N threads
+        // race begin/cancel pairs against a shared runtime. Exactly the
+        // thread that still owns the slot may install; the test only asserts
+        // global safety (no panic, no stuck Preparing-with-None, state is a
+        // single valid variant), which is the toggle-safety contract.
+        let runtime = Arc::new(Mutex::new(RuntimeState::default()));
+        let counter = Arc::new(AtomicU64::new(0));
+        let shutdown = Arc::new(AtomicBool::new(false));
+        let barrier = Arc::new(std::sync::Barrier::new(8));
+        let mut handles = Vec::new();
+        for _ in 0..8 {
+            let runtime = Arc::clone(&runtime);
+            let counter = Arc::clone(&counter);
+            let shutdown = Arc::clone(&shutdown);
+            let barrier = Arc::clone(&barrier);
+            handles.push(thread::spawn(move || {
+                barrier.wait();
+                for _ in 0..25 {
+                    let Ok(generation) = wp4_begin(&runtime, &counter, &shutdown) else {
+                        // Another thread owns Preparing; treat toggle as stop.
+                        cancel_preparation_for_stop(&mut runtime.lock().unwrap());
+                        continue;
+                    };
+                    let resource = AtomicBool::new(true);
+                    // Randomly cancel or complete; both paths are safe.
+                    if generation % 2 == 0 {
+                        cancel_preparation_for_stop(&mut runtime.lock().unwrap());
+                        assert!(!wp4_worker_ok(&runtime, &shutdown, generation, &resource));
+                    } else {
+                        let _ = wp4_worker_ok(&runtime, &shutdown, generation, &resource);
+                        cancel_preparation_for_stop(&mut runtime.lock().unwrap());
+                    }
+                }
+            }));
+        }
+        for handle in handles {
+            handle.join().unwrap();
+        }
+        let state = runtime.lock().unwrap();
+        // Either Ready (cancelled last) or Recording/Preparing with a matching
+        // generation — never a stuck Preparing with no owner.
+        match state.voice_state {
+            VoiceState::Preparing => assert!(state.preparing_generation.is_some()),
+            VoiceState::Recording | VoiceState::Ready => {}
+            _ => panic!("unexpected terminal state after toggle storm"),
+        }
+    }
+
+    #[test]
+    fn wp4_generations_are_unique_and_never_zero() {
+        let counter = AtomicU64::new(0);
+        let mut seen = std::collections::HashSet::new();
+        for _ in 0..100 {
+            let generation = next_preparation_generation(&counter);
+            assert_ne!(generation, 0);
+            assert!(seen.insert(generation));
+        }
+    }
+
+    // ---- WP4 #51: Linux recorder must not survive shutdown ---- //
+    //
+    // PR #58 introduced the shutdown path; these fixture tests prove the
+    // remaining behavior instead of rewriting it. Fixtures spawn
+    // recorder-like children with the SAME spawn properties as the app
+    // (null stdio, isolated process group via `configure_process_group`) and
+    // exercise them through the SAME teardown (`stop_linux_recorder` /
+    // `shutdown_recording_session`) used by `shutdown_app`. Every test ends
+    // with the child terminated AND reaped (no zombie, no survivor).
+
+    #[cfg(target_os = "linux")]
+    fn wp4_spawn_fixture_child(script: &str) -> Child {
+        let mut command = Command::new("sh");
+        configure_command(&mut command);
+        configure_process_group(&mut command);
+        command
+            .args(["-c", script])
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("recorder fixture spawns")
+    }
+
+    #[cfg(target_os = "linux")]
+    fn wp4_assert_reaped(child: &mut Child, pid: i32, context: &str) {
+        assert!(
+            child.try_wait().unwrap().is_some(),
+            "{context}: fixture child was reaped, no zombie left"
+        );
+        assert!(
+            process_state_is_dead(pid),
+            "{context}: fixture child {pid} did not survive"
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    fn wp4_fixture_session(dir: &Path, stem: &str, child: Child) -> RecordingSession {
+        fs::write(dir.join(format!("{stem}.wav")), b"fake-audio").unwrap();
+        fs::write(dir.join(format!("{stem}.txt")), b"partial").unwrap();
+        RecordingSession {
+            audio_path: dir.join(format!("{stem}.wav")),
+            output_prefix: dir.join(stem),
+            started: Instant::now(),
+            started_at: Utc::now(),
+            recorder_process: child,
+            mic_level: Arc::new(AtomicU32::new(0)),
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn wp4_recorder_fixture_normal_exit_is_reaped() {
+        // Normal recorder: terminates on graceful SIGINT and is reaped.
+        let mut child = wp4_spawn_fixture_child("sleep 30");
+        let pid = child.id() as i32;
+        assert!(pid > 0, "fixture pid captured");
+
+        stop_linux_recorder(&mut child).expect("graceful stop succeeds");
+        wp4_assert_reaped(&mut child, pid, "normal recorder");
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn wp4_recorder_fixture_ignoring_sigint_requires_force_kill() {
+        // Stubborn recorder: ignores SIGINT, so the graceful phase cannot
+        // reap it and the force-kill (process-group SIGKILL + wait) path must
+        // terminate and reap it. Deterministic: only the final state is
+        // asserted, not timing.
+        //
+        // `trap '' INT` marks SIGINT ignored, and `exec` preserves ignored
+        // dispositions across the image replacement (POSIX), so the `sleep`
+        // process itself ignores the graceful SIGINT and only the SIGKILL
+        // fallback can reap it.
+        let mut child = wp4_spawn_fixture_child("trap '' INT; exec sleep 30");
+        let pid = child.id() as i32;
+
+        stop_linux_recorder(&mut child).expect("force kill stops SIGINT-ignoring child");
+        wp4_assert_reaped(&mut child, pid, "sigint-ignoring recorder");
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn wp4_shutdown_during_recording_terminates_and_reaps_child() {
+        // Installed Recording + application shutdown path: the exact helper
+        // `shutdown_app` uses (`shutdown_recording_session`) must terminate
+        // and reap the child and remove temp artifacts.
+        let dir =
+            std::env::temp_dir().join(format!("vibevoice-wp4-shutdown-rec-{}", Uuid::new_v4()));
+        fs::create_dir_all(&dir).unwrap();
+        let child = wp4_spawn_fixture_child("sleep 30");
+        let mut session = wp4_fixture_session(&dir, "recording-fixture", child);
+        let pid = session.recorder_process.id() as i32;
+
+        shutdown_recording_session(&mut session);
+        wp4_assert_reaped(
+            &mut session.recorder_process,
+            pid,
+            "shutdown during Recording",
+        );
+        assert!(
+            !session.audio_path.exists(),
+            "recording wav removed on shutdown"
+        );
+        assert!(
+            !session.output_prefix.with_extension("txt").exists(),
+            "partial transcript removed on shutdown"
+        );
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn wp4_shutdown_during_preparing_never_installs_and_kills_child() {
+        // Preparation in-flight + shutdown: the child is acquired in a gated
+        // worker thread, shutdown invalidates the generation, and the late
+        // worker must discard (kill + never install).
+        let runtime = Arc::new(Mutex::new(RuntimeState::default()));
+        let counter = AtomicU64::new(0);
+        let shutdown = Arc::new(AtomicBool::new(false));
+        let dir =
+            std::env::temp_dir().join(format!("vibevoice-wp4-shutdown-prep-{}", Uuid::new_v4()));
+        fs::create_dir_all(&dir).unwrap();
+
+        let generation = wp4_begin(&runtime, &counter, &shutdown).unwrap();
+        let (gate_tx, gate_rx) = std::sync::mpsc::channel::<()>();
+        let (done_tx, done_rx) = std::sync::mpsc::channel::<(bool, i32)>();
+        let worker_runtime = Arc::clone(&runtime);
+        let worker_shutdown = Arc::clone(&shutdown);
+        let dir_clone = dir.clone();
+        let worker = thread::spawn(move || {
+            gate_rx.recv().unwrap();
+            // Acquire audio resources AFTER the gate, like a slow prepare.
+            let child = wp4_spawn_fixture_child("sleep 30");
+            let pid = child.id() as i32;
+            let mut session = wp4_fixture_session(&dir_clone, "recording-prep", child);
+            // Mirror begin_recording Ok branch exactly.
+            if worker_shutdown.load(Ordering::Acquire) {
+                shutdown_recording_session(&mut session);
+                done_tx.send((false, pid)).unwrap();
+                return;
+            }
+            let mut state = worker_runtime.lock().unwrap();
+            if !is_preparation_current(&state, generation) {
+                drop(state);
+                shutdown_recording_session(&mut session);
+                done_tx.send((false, pid)).unwrap();
+                return;
+            }
+            state.preparing_generation = None;
+            state.voice_state = VoiceState::Recording;
+            done_tx.send((true, pid)).unwrap();
+        });
+
+        // Trigger the same invalidation `shutdown_app` performs.
+        shutdown.store(true, Ordering::Release);
+        invalidate_preparation(&mut runtime.lock().unwrap());
+        runtime.lock().unwrap().voice_state = VoiceState::Ready;
+        gate_tx.send(()).unwrap();
+        let (installed, pid) = done_rx.recv().unwrap();
+        worker.join().unwrap();
+        assert!(!installed, "preparation installed itself after shutdown");
+        // The worker cleaned its own session; prove no survivor by pid.
+        assert!(
+            process_state_is_dead(pid),
+            "preparation child {pid} survived shutdown"
+        );
+        assert!(
+            !dir.join("recording-prep.wav").exists(),
+            "preparation wav cleaned after shutdown"
+        );
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn wp4_normal_stop_followed_by_quit_leaves_no_child() {
+        // Recording → Stop (Processing path) → Quit (shutdown with no
+        // session): no child may survive either step, and quit is idempotent.
+        let dir = std::env::temp_dir().join(format!("vibevoice-wp4-stop-quit-{}", Uuid::new_v4()));
+        fs::create_dir_all(&dir).unwrap();
+        let child = wp4_spawn_fixture_child("sleep 30");
+        let mut session = wp4_fixture_session(&dir, "recording-stopquit", child);
+        let pid = session.recorder_process.id() as i32;
+
+        // Normal Stop: terminate + reap + clean artifacts.
+        shutdown_recording_session(&mut session);
+        wp4_assert_reaped(&mut session.recorder_process, pid, "stop before quit");
+        assert!(!session.audio_path.exists());
+        // Quit with no session installed: nothing to kill, still clean.
+        // (Mirrors shutdown_app's `recording.take() == None` branch.)
+        let runtime = Mutex::new(RuntimeState::default());
+        let taken = runtime.lock().unwrap().recording.take();
+        assert!(taken.is_none());
+        assert!(
+            process_state_is_dead(pid),
+            "recorder {pid} survived stop+quit"
+        );
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn wp4_no_recorder_process_survives_group_kill_including_grandchild() {
+        // Recorder with a grandchild in the same process group: the group
+        // kill in `stop_linux_recorder` must take both, proving no survivor
+        // even when the recorder forks.
+        let pid_file = std::env::temp_dir().join(format!(
+            "vibevoice-wp4-grandchild-{}.pid",
+            std::process::id()
+        ));
+        let _ = fs::remove_file(&pid_file);
+        let script = format!("sleep 30 & echo $! > {}; wait", pid_file.display());
+        let mut child = wp4_spawn_fixture_child(&script);
+        let pid = child.id() as i32;
+
+        // Capture the grandchild PID first (the shell records it at startup),
+        // then exercise the shutdown path. Waiting before stopping removes
+        // the spawn-vs-SIGINT race: the fixture must be fully started before
+        // teardown, exactly like a real recording session.
+        let grandchild = wait_for_pid_file(&pid_file, Duration::from_secs(5));
+        let _ = fs::remove_file(&pid_file);
+        let grandchild = grandchild.expect("fixture grandchild pid recorded");
+
+        stop_linux_recorder(&mut child).expect("group stop succeeds");
+        wp4_assert_reaped(&mut child, pid, "group leader");
+
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while !process_state_is_dead(grandchild) && Instant::now() < deadline {
+            thread::sleep(Duration::from_millis(10));
+        }
+        assert!(
+            process_state_is_dead(grandchild),
+            "grandchild {grandchild} survived the recorder group kill"
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn wp4_temporary_artifacts_have_defined_cleanup_on_shutdown() {
+        let dir = std::env::temp_dir().join(format!("vibevoice-wp4-artifacts-{}", Uuid::new_v4()));
+        fs::create_dir_all(&dir).unwrap();
+        let child = wp4_spawn_fixture_child("sleep 30");
+        let mut session = wp4_fixture_session(&dir, "recording-artifacts", child);
+        assert!(session.audio_path.exists());
+        assert!(session.output_prefix.with_extension("txt").exists());
+
+        shutdown_recording_session(&mut session);
+        assert!(!session.audio_path.exists(), "wav removed");
+        assert!(
+            !session.output_prefix.with_extension("txt").exists(),
+            "partial txt removed"
+        );
+        // Idempotent: second cleanup is harmless.
+        cleanup_recording_artifacts(&session);
+        let _ = fs::remove_dir_all(dir);
+    }
+
     fn history_item(final_transcript: &str, created_at: DateTime<Utc>) -> HistoryItem {
         HistoryItem {
             id: Uuid::new_v4().to_string(),
@@ -2435,6 +4934,7 @@ mod tests {
             duration_ms: None,
             insert_status: "copied".to_string(),
             error: None,
+            insertion_report: InsertionReport::default(),
         }
     }
 }

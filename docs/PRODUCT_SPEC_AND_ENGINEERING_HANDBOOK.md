@@ -1,16 +1,16 @@
 # VibeVoice — Product Specification and Engineering Handbook
 
-**Document version:** 0.2.6  
-**Last updated:** 2026-09-10
+**Document version:** 0.2.7  
+**Last updated:** 2026-09-18
 **Generated or audited by:** Repository Product Specification & Engineering Handbook Agent  
 **Repository:** `Zburgers/vibevoice`  
 **Authoritative branch:** `master`  
-**Verified branch commit:** `316da5b375c73fdc0b6075877edef28cc67715be`
-**Working branch:** `docs/product-handbook-sync-2026-08-04`  
-**Working branch commit:** Document publication commit; inspect Git file history (the commit cannot embed its own SHA)  
-**Production status:** `VERIFIED_RELEASE_PRESENT` — public release documentation and release automation identify VibeVoice `0.2.6`; exact installed/deployed commit is unverified  
-**Verified deployed commit:** `UNVERIFIED`  
-**Deployment verification:** Repository release workflow, signed-updater configuration, and `docs/releases/v0.2.6.md`; no runtime/version endpoint or release-to-commit manifest was available  
+**Verified branch commit:** Reconciled `master`; final merge SHA is recorded in the reconciliation PR and release-engineering report  
+**Working branch:** `chore/reconcile-v0.2.7-mainline`  
+**Working branch commit:** Reconciliation candidate containing the immutable shipped release commit  
+**Production status:** `VERIFIED_RELEASE_PRESENT` — public VibeVoice `v0.2.7` is published from commit `6f198176f00d0b3899ad798aa2b21fb0d315e29a`  
+**Verified deployed commit:** `6f198176f00d0b3899ad798aa2b21fb0d315e29a`  
+**Deployment verification:** Repository release workflow, signed-updater configuration, and `docs/releases/v0.2.7.md`; the tag and release assets were re-read during reconciliation  
 **Document confidence:** High for authoritative-branch implementation; medium for cross-platform runtime behavior; low for installed-user state  
 **Confidentiality:** Public repository documentation
 
@@ -28,6 +28,20 @@ This handbook is a repository-grounded audit of VibeVoice behavior plus proposed
 - Ambiguity is recorded as an open ruling rather than silently resolved.
 - Exact paths and symbols are preferred over broad architectural claims.
 - Historical product documents remain useful evidence of intent but are superseded by this handbook where they conflict with current implementation evidence.
+
+## Reconciliation addendum — 2026-09-18
+
+The current repository truth is the reconciled `master` line, which contains the
+shipped VibeVoice `v0.2.7` implementation from commit
+`6f198176f00d0b3899ad798aa2b21fb0d315e29a`. The public `VibeVoice v0.2.7`
+release and its updater/install assets remain anchored to that immutable tag.
+
+The pre-release observations below that describe `master` as `0.2.6`, disabled
+CSP, shared window capabilities, non-SemVer fallback comparison, or branch-only
+0.2.7 work are historical snapshots. They are superseded by the shipped
+0.2.7 implementation and `docs/releases/v0.2.7.md`; they are retained only as
+audit history. The full engine/model installation lifecycle in issue #41 and
+the broader transactional insertion feature in issue #36 remain open.
 
 ### Status vocabulary
 
@@ -749,7 +763,7 @@ No future feature may convert dictation phrases into arbitrary shell, filesystem
 
 ## C-001 — Complete and release the 0.2.7 stabilization ⚠️ CHANGE
 
-**Current behavior:** `master` remains version `0.2.6`; CSP is disabled, both renderer windows share broad capabilities, fallback version comparison is non-SemVer, diagnostics exposes full local paths, and renderer regression coverage is absent.
+**Historical pre-release behavior (superseded by v0.2.7):** `master` remained version `0.2.6`; CSP was disabled, both renderer windows shared broad capabilities, fallback version comparison was non-SemVer, diagnostics exposed full local paths, and renderer regression coverage was absent.
 
 **Target behavior:** Merge and release the verified subset of PR #35 after its documented manual gates.
 
@@ -1590,13 +1604,9 @@ cargo test --no-default-features
 
 ### Release trigger
 
-`release.yml` publishes when:
-
-- manually dispatched;
-- a `v*` tag is pushed;
-- `master` receives a commit whose message starts with `release: v`.
-
-Pull requests do not execute the publish job because of the job-level condition.
+`release.yml` publishes only when a protected, SemVer-shaped `v*` tag is pushed.
+The tagged commit must also be an ancestor of `origin/master`; pull requests,
+manual dispatches, and ordinary pushes to `master` do not publish.
 
 ### Release secrets
 
@@ -1612,10 +1622,10 @@ No formal rollback runbook is present. Practical rollback is manual installation
 
 ### Deployment drift
 
-- Authoritative branch: version `0.2.6`.
-- Latest documented release: `0.2.6`.
-- Exact release source SHA: unverified.
-- PR #35 version `0.2.7`: branch-only.
+- Authoritative branch: reconciled `v0.2.7` line.
+- Latest documented release: `v0.2.7`.
+- Exact release source SHA: `6f198176f00d0b3899ad798aa2b21fb0d315e29a`.
+- PR #35 and its successors are superseded by the shipped 0.2.7 work packets.
 - Current master head contains post-release documentation workflow cleanup after the release lineage.
 
 ---

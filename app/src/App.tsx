@@ -3,7 +3,7 @@ import type { MouseEvent } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { LogicalSize, PhysicalPosition } from "@tauri-apps/api/dpi";
 import { listen } from "@tauri-apps/api/event";
-import { getCurrentWindow, monitorFromPoint, Window as TauriWindow } from "@tauri-apps/api/window";
+import { CursorIcon, getCurrentWindow, monitorFromPoint, Window as TauriWindow } from "@tauri-apps/api/window";
 import { relaunch } from "@tauri-apps/plugin-process";
 import { check } from "@tauri-apps/plugin-updater";
 import type { Update } from "@tauri-apps/plugin-updater";
@@ -17,13 +17,14 @@ import {
   navItems,
   stateToPhase,
 } from "./types";
-import type { AppState, LibraryMode, MeterPayload, Settings, TabKey, UpdateStatus } from "./types";
+import type { AppState, InsertionReport, LibraryMode, MeterPayload, Settings, TabKey, UpdateStatus } from "./types";
 import { StatusChip } from "./ui";
 import { ControlView } from "./views/ControlView";
 import { DiagnosticsView } from "./views/DiagnosticsView";
 import { LibraryView } from "./views/LibraryView";
 import { SettingsView } from "./views/SettingsView";
 import "./App.css";
+import { compareReleaseVersions, normalizeReleaseVersion } from "./version";
 
 declare global {
   interface Window {
@@ -56,6 +57,8 @@ const RELEASES_URL = "https://github.com/Zburgers/vibevoice/releases";
 const LATEST_RELEASE_API = "https://api.github.com/repos/Zburgers/vibevoice/releases/latest";
 const COLLAPSED_PILL_SIZE = new LogicalSize(68, 68);
 const EXPANDED_PILL_SIZE = new LogicalSize(318, 262);
+const COLLAPSED_PILL_DIMENSIONS = { width: 68, height: 68 };
+const EXPANDED_PILL_DIMENSIONS = { width: 318, height: 262 };
 const resizeHandles: Array<{ direction: ResizeDirection; className: string }> = [
   { direction: "North", className: "is-north" },
   { direction: "South", className: "is-south" },
@@ -75,21 +78,6 @@ const initialUpdateStatus: UpdateStatus = {
   canInstall: false,
 };
 
-function normalizeVersion(version: string) {
-  return version.trim().replace(/^v/i, "");
-}
-
-function compareVersions(left: string, right: string) {
-  const leftParts = normalizeVersion(left).split(/[.-]/).map((part) => Number.parseInt(part, 10) || 0);
-  const rightParts = normalizeVersion(right).split(/[.-]/).map((part) => Number.parseInt(part, 10) || 0);
-  const count = Math.max(leftParts.length, rightParts.length, 3);
-  for (let index = 0; index < count; index += 1) {
-    const diff = (leftParts[index] ?? 0) - (rightParts[index] ?? 0);
-    if (diff !== 0) return diff;
-  }
-  return 0;
-}
-
 function App() {
   const [activeTab, setActiveTab] = useState<TabKey>(initialTab);
   const [libraryMode, setLibraryMode] = useState<LibraryMode>(initialLibraryMode);
@@ -108,6 +96,8 @@ function App() {
   const [pillFlipY, setPillFlipY] = useState(false);
   const settingsRef = useRef(fallbackState.settings);
   const pillExpansionRef = useRef({ flipX: false, flipY: false });
+  const refreshSequence = useRef(0);
+  const pillLayoutRequestRef = useRef(0);
 
   const inTauri = isTauriRuntime();
   const currentWindow = useMemo(() => (inTauri ? getCurrentWindow() : null), [inTauri]);
@@ -137,7 +127,9 @@ function App() {
     if (forceDiagnostics) {
       await invoke("refresh_diagnostics");
     }
+    const sequence = ++refreshSequence.current;
     const next = await invoke<AppState>("get_app_state");
+    if (sequence !== refreshSequence.current) return;
     setState(next);
     setSelectedHistoryId((currentId) => {
       if (currentId && next.history.some((entry) => entry.id === currentId)) return currentId;
@@ -159,12 +151,14 @@ function App() {
       try {
         const update = await check({ timeout: 12000 });
         if (update) {
+          const updateVersion = normalizeReleaseVersion(update.version);
+          if (!updateVersion) throw new Error("Updater returned a malformed release version.");
           setPendingUpdate(update);
           setUpdateStatus({
             state: "available",
-            latestVersion: update.version,
-            releaseUrl: `${RELEASES_URL}/tag/v${normalizeVersion(update.version)}`,
-            message: `Version ${update.version} is ready to install.`,
+            latestVersion: updateVersion,
+            releaseUrl: `${RELEASES_URL}/tag/v${updateVersion}`,
+            message: `Version ${updateVersion} is ready to install.`,
             canInstall: true,
           });
           return;
@@ -186,12 +180,16 @@ function App() {
         html_url?: string;
         name?: string;
       };
-      const latestVersion = normalizeVersion(release.tag_name || release.name || "");
+      const rawLatestVersion = release.tag_name || release.name || "";
+      const latestVersion = normalizeReleaseVersion(rawLatestVersion);
       if (!latestVersion) {
-        throw new Error("Latest release did not include a version.");
+        throw new Error("GitHub returned a malformed release version.");
       }
       const releaseUrl = release.html_url || `${RELEASES_URL}/tag/v${latestVersion}`;
-      const versionDelta = compareVersions(latestVersion, state.app_version);
+      const versionDelta = compareReleaseVersions(latestVersion, state.app_version);
+      if (versionDelta === null) {
+        throw new Error("Installed version is malformed; update comparison is unavailable.");
+      }
       const isNewer = versionDelta > 0;
       setUpdateStatus({
         state: isNewer ? "available" : "current",
@@ -223,12 +221,14 @@ function App() {
 
     let cleanupState: (() => void) | undefined;
     let cleanupMeter: (() => void) | undefined;
+    let disposed = false;
 
     listen("vibevoice-state-changed", () => {
       refresh().catch(() => undefined);
     })
       .then((cleanup) => {
-        cleanupState = cleanup;
+        if (disposed) cleanup();
+        else cleanupState = cleanup;
       })
       .catch((error) => setCommandStatus(errorMessage(error)));
 
@@ -236,11 +236,13 @@ function App() {
       setState((current) => ({ ...current, mic_level: event.payload.mic_level }));
     })
       .then((cleanup) => {
-        cleanupMeter = cleanup;
+        if (disposed) cleanup();
+        else cleanupMeter = cleanup;
       })
       .catch((error) => setCommandStatus(errorMessage(error)));
 
     return () => {
+      disposed = true;
       cleanupState?.();
       cleanupMeter?.();
     };
@@ -256,15 +258,20 @@ function App() {
   useEffect(() => {
     if (!isPillWindow || !currentWindow) return;
     const pillWindow = currentWindow;
-    let cancelled = false;
+    const requestId = pillLayoutRequestRef.current + 1;
+    pillLayoutRequestRef.current = requestId;
+    const isCurrentRequest = () => pillLayoutRequestRef.current === requestId;
 
     async function positionPill() {
       await pillWindow.setAlwaysOnTop(state.settings.pill_always_on_top);
       const previousPosition = await pillWindow.outerPosition();
       const previousSize = await pillWindow.outerSize();
+      if (!isCurrentRequest()) return;
+
       const centerX = previousPosition.x + previousSize.width / 2;
       const centerY = previousPosition.y + previousSize.height / 2;
       const monitor = await monitorFromPoint(centerX, centerY);
+      if (!isCurrentRequest()) return;
 
       if (!monitor) {
         await pillWindow.setSize(expanded ? EXPANDED_PILL_SIZE : COLLAPSED_PILL_SIZE);
@@ -287,21 +294,37 @@ function App() {
         setPillFlipY(flipY);
       }
 
-      await pillWindow.setSize(expanded ? EXPANDED_PILL_SIZE : COLLAPSED_PILL_SIZE);
-      const nextSize = await pillWindow.outerSize();
-      let x = flipX ? previousPosition.x + previousSize.width - nextSize.width : previousPosition.x;
-      let y = flipY ? previousPosition.y + previousSize.height - nextSize.height : previousPosition.y;
-      x = Math.min(Math.max(x, workArea.position.x), Math.max(workArea.position.x, workRight - nextSize.width));
-      y = Math.min(Math.max(y, workArea.position.y), Math.max(workArea.position.y, workBottom - nextSize.height));
+      const logicalSize = expanded ? EXPANDED_PILL_DIMENSIONS : COLLAPSED_PILL_DIMENSIONS;
+      const targetWidth = Math.round(logicalSize.width * monitor.scaleFactor);
+      const targetHeight = Math.round(logicalSize.height * monitor.scaleFactor);
+      const anchorX = flipX ? previousPosition.x + previousSize.width : previousPosition.x;
+      const anchorY = flipY ? previousPosition.y + previousSize.height : previousPosition.y;
+      const clampPosition = (anchor: number, targetSize: number, start: number, end: number, flip: boolean) =>
+        Math.min(Math.max(flip ? anchor - targetSize : anchor, start), Math.max(start, end - targetSize));
+      let x = clampPosition(anchorX, targetWidth, workArea.position.x, workRight, flipX);
+      let y = clampPosition(anchorY, targetHeight, workArea.position.y, workBottom, flipY);
 
-      if (!cancelled) {
-        await pillWindow.setPosition(new PhysicalPosition(Math.round(x), Math.round(y)));
-      }
+      // Move first so enlarging the transparent host window cannot expose an
+      // off-screen panel while the native resize is being applied.
+      await pillWindow.setPosition(new PhysicalPosition(Math.round(x), Math.round(y)));
+      if (!isCurrentRequest()) return;
+      await pillWindow.setSize(expanded ? EXPANDED_PILL_SIZE : COLLAPSED_PILL_SIZE);
+      if (!isCurrentRequest()) return;
+
+      // Native window managers can round logical sizes differently. Reconcile
+      // once with the actual outer rectangle after the resize completes.
+      const actualSize = await pillWindow.outerSize();
+      x = Math.min(Math.max(x, workArea.position.x), Math.max(workArea.position.x, workRight - actualSize.width));
+      y = Math.min(Math.max(y, workArea.position.y), Math.max(workArea.position.y, workBottom - actualSize.height));
+      if (!isCurrentRequest()) return;
+      await pillWindow.setPosition(new PhysicalPosition(Math.round(x), Math.round(y)));
     }
 
     positionPill().catch((error) => setCommandStatus(errorMessage(error)));
     return () => {
-      cancelled = true;
+      if (pillLayoutRequestRef.current === requestId) {
+        pillLayoutRequestRef.current += 1;
+      }
     };
   }, [currentWindow, expanded, isPillWindow, state.settings.pill_always_on_top]);
 
@@ -367,6 +390,14 @@ function App() {
     event.preventDefault();
     event.stopPropagation();
     currentWindow?.startResizeDragging(direction).catch((error) => setCommandStatus(errorMessage(error)));
+  }
+
+  function setResizeCursor(direction: ResizeDirection | null) {
+    if (!currentWindow) return;
+    const cursor: CursorIcon | null = direction
+      ? ({ North: "nResize", South: "sResize", East: "eResize", West: "wResize", NorthEast: "neResize", NorthWest: "nwResize", SouthEast: "seResize", SouthWest: "swResize" } as const)[direction]
+      : null;
+    currentWindow.setCursorIcon(cursor ?? "default").catch(() => undefined);
   }
 
   async function handlePrimaryAction() {
@@ -451,6 +482,21 @@ function App() {
     }
   }
 
+  async function handleCopyDiagnosticsReport() {
+    if (!inTauri) {
+      setCommandStatus("Desktop runtime unavailable in browser preview");
+      return;
+    }
+    try {
+      await invoke("copy_diagnostics_report", {
+        updaterStatus: updateStatus.state,
+      });
+      setCommandStatus("Diagnostics report copied");
+    } catch (error) {
+      setCommandStatus(errorMessage(error));
+    }
+  }
+
   async function handleInstallUpdate() {
     if (!pendingUpdate) {
       await handleOpenReleasePage();
@@ -527,8 +573,14 @@ function App() {
       return;
     }
     try {
-      await invoke("insert_text", { text: value });
-      setCommandStatus("Inserted");
+      const report = await invoke<InsertionReport>("insert_text", { text: value });
+      setCommandStatus(
+        report.outcome === "inserted"
+          ? "Paste helper completed; previous clipboard restored."
+          : report.outcome === "copied_only"
+            ? "Transcript copied."
+            : report.error || "Paste did not complete. Use Copy or retry insertion.",
+      );
       await refresh();
     } catch (error) {
       setCommandStatus(errorMessage(error));
@@ -616,6 +668,8 @@ function App() {
           key={direction}
           className={`window-resize-handle ${className}`}
           onMouseDown={(event) => startWindowResize(direction, event)}
+          onMouseEnter={() => setResizeCursor(direction)}
+          onMouseLeave={() => setResizeCursor(null)}
           aria-hidden="true"
         />
       ))}
@@ -742,6 +796,7 @@ function App() {
               onOpenReleasePage={handleOpenReleasePage}
               onSetup={handleSetup}
               onCopyCommand={() => handleCopyText(state.diagnostics.setup_command)}
+              onCopyReport={handleCopyDiagnosticsReport}
             />
           )}
         </main>

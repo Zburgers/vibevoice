@@ -212,7 +212,7 @@ export function SettingsView({
           <input
             type="number"
             min={30}
-            max={3600}
+            max={1800}
             value={state.settings.transcription_timeout_seconds}
             onChange={(e) => onUpdate({ transcription_timeout_seconds: Number(e.target.value) || 30 })}
           />

@@ -73,7 +73,7 @@ export function ControlView({
         </button>
         <button type="button" className="secondary-action" onClick={onPaste}>
           <RotateCcw size={16} />
-          <span>Paste again</span>
+          <span>Retry insertion</span>
         </button>
         {state.diagnostics.setup_available ? (
           <button type="button" className="secondary-action" onClick={onSetup}>
