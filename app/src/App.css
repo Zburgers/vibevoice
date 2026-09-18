@@ -1217,6 +1217,18 @@ select:focus {
   background: transparent;
 }
 
+.pill-anchor {
+  display: contents;
+}
+
+.floating-shell:not(.is-expanded) .pill-anchor {
+  position: relative;
+  display: block;
+  width: 58px;
+  height: 58px;
+  flex: 0 0 58px;
+}
+
 .floating-shell:not(.is-expanded) {
   align-items: center;
   justify-content: center;
@@ -1249,11 +1261,8 @@ select:focus {
 /* Drag handle when collapsed: sits just above-right of the pill circle, not at the window edge */
 .pill-grip-floating {
   position: absolute;
-  /* Offset so it sits just off the top-right of the 58px pill.
-     The pill is centered in the 68px window, so pill starts at 5px.
-     top-right corner of pill ≈ 5px + 58px - 10px offset = tight to icon */
-  top: 2px;
-  right: 2px;
+  top: -3px;
+  right: -3px;
   z-index: 2;
   width: 22px;
   height: 22px;

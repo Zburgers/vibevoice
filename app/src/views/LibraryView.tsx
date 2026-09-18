@@ -3,6 +3,19 @@ import type { AppState, HistoryItem, LibraryMode, Settings } from "../types";
 import { EmptyState, Field, RuleToggle, Toggle } from "../ui";
 import { formatDuration } from "../types";
 
+function insertionLabel(entry: HistoryItem) {
+  switch (entry.insertion_report.outcome) {
+    case "inserted":
+      return "Inserted";
+    case "copied_only":
+      return "Copied only";
+    case "failed":
+      return "Insertion failed";
+    case "cancelled":
+      return "Cancelled";
+  }
+}
+
 export function LibraryView({
   state,
   selectedHistory,
@@ -87,7 +100,7 @@ export function LibraryView({
                 state.history.map((entry) => (
                   <button key={entry.id} type="button" className={`history-row ${selectedHistory?.id === entry.id ? "is-selected" : ""}`} onClick={() => onSelectHistory(entry.id)}>
                     <span className="history-time">{new Date(entry.created_at).toLocaleString()}</span>
-                    <span className={`history-status tone-${entry.error ? "bad" : "good"}`}>{entry.insert_status}</span>
+                    <span className={`history-status tone-${entry.insertion_report.outcome === "failed" ? "bad" : "good"}`}>{insertionLabel(entry)}</span>
                     <span className="history-text">{entry.final_transcript}</span>
                   </button>
                 ))
@@ -108,7 +121,7 @@ export function LibraryView({
                 </button>
                 <button type="button" className="secondary-action" disabled={!selectedHistory} onClick={() => onReinsert(selectedHistory?.final_transcript)}>
                   <RotateCcw size={16} />
-                  <span>Paste again</span>
+                  <span>Retry insertion</span>
                 </button>
                 <button type="button" className="secondary-action danger" disabled={!selectedHistory} onClick={() => selectedHistory && onDeleteHistory(selectedHistory.id)}>
                   <Trash2 size={16} />

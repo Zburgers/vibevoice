@@ -12,6 +12,7 @@ export function DiagnosticsView({
   onOpenReleasePage,
   onSetup,
   onCopyCommand,
+  onCopyReport,
 }: {
   state: AppState;
   updateStatus: UpdateStatus;
@@ -23,6 +24,7 @@ export function DiagnosticsView({
   onOpenReleasePage: () => void;
   onSetup: () => void;
   onCopyCommand: () => void;
+  onCopyReport: () => void;
 }) {
   const rows: Array<{ label: string; value: string; tone: Tone; mono?: boolean }> = [
     { label: "Whisper binary", value: state.diagnostics.whisper_found ? "Found" : "Missing", tone: state.diagnostics.whisper_found ? "good" : "bad" },
@@ -78,6 +80,20 @@ export function DiagnosticsView({
               <button type="button" className="secondary-action" disabled={!state.diagnostics.setup_command} onClick={onCopyCommand}>
                 <Copy size={16} />
                 <span>Copy command</span>
+              </button>
+            </div>
+          </article>
+
+          <article className="detail-block">
+            <div className="block-head">
+              <span>Support report</span>
+              <span>Redacted</span>
+            </div>
+            <p>Copies engine and desktop status without transcripts or raw errors.</p>
+            <div className="action-row">
+              <button type="button" className="secondary-action" onClick={onCopyReport}>
+                <Copy size={16} />
+                <span>Copy diagnostics report</span>
               </button>
             </div>
           </article>
