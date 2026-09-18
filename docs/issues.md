@@ -1,6 +1,28 @@
 # VibeVoice issue tracker
 
-This file records the repository-side status for the 0.2.7 stabilization work. The items below are integrated in the shipped `v0.2.7` tag and reconciled into `master`.
+This file records repository-side release truth and points to the canonical GitHub backlog. The shipped items below are integrated in the `v0.2.7` tag and reconciled into `master`; open feature work remains tracked in GitHub rather than duplicated here.
+
+## Current open GitHub backlog
+
+Audited 2026-09-19. GitHub issue bodies and acceptance criteria are authoritative; this index is intentionally concise and should be updated when an issue's status changes.
+
+| Issue | Status | Scope |
+| --- | --- | --- |
+| [#10](https://github.com/Zburgers/vibevoice/issues/10) | Open future work | Deterministic cleanup presets and context-aware output profiles |
+| [#11](https://github.com/Zburgers/vibevoice/issues/11) | Open future work | Model selection, benchmarking, and engine-health UI |
+| [#12](https://github.com/Zburgers/vibevoice/issues/12) | Open future work | Recording profiles for context-safe dictation workflows |
+| [#36](https://github.com/Zburgers/vibevoice/issues/36) | Partially delivered | Transactional insertion stabilization shipped in 0.2.7; broader acceptance criteria remain open |
+| [#37](https://github.com/Zburgers/vibevoice/issues/37) | Open future work | Reviewable adaptive developer vocabulary and import/export |
+| [#38](https://github.com/Zburgers/vibevoice/issues/38) | Open future work | Explicit spoken punctuation, layout, and literal-mode commands |
+| [#39](https://github.com/Zburgers/vibevoice/issues/39) | Open future work | Microphone and audio-quality preflight feedback |
+| [#40](https://github.com/Zburgers/vibevoice/issues/40) | Open future work | Latest-transcript correction loop and safe dictionary suggestions |
+| [#41](https://github.com/Zburgers/vibevoice/issues/41) | Partially delivered | Installer-integrity subset shipped in 0.2.7; managed engine/model lifecycle remains open |
+| [#42](https://github.com/Zburgers/vibevoice/issues/42) | Open future work | Accessibility-first recording controls and safe hands-free operation |
+| [#43](https://github.com/Zburgers/vibevoice/issues/43) | Open future work | Bounded voice-command mode with preview and confirmation |
+| [#44](https://github.com/Zburgers/vibevoice/issues/44) | Open future work | Opt-in local privacy-preserving transcription telemetry |
+| [#45](https://github.com/Zburgers/vibevoice/issues/45) | Open cross-repository work | Lightweight VibeVoice and mdview profile demonstration assets |
+
+Completed stabilization issues are intentionally not recreated or duplicated in this backlog; their shipped status and evidence are recorded below and in their GitHub history.
 
 ## 0.2.7 stabilization
 
