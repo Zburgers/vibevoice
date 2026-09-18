@@ -142,4 +142,4 @@ present on the shipped tag and reconciled `master`.
 - #10 post-processing presets: bounded local transformation work with deterministic Rust tests.
 - #12 recording profiles: larger but still safe after #10, because it composes existing settings and cleanup behavior.
 
-These follow-ups should remain separate from the 0.2.7 stabilization PR and should not be started until the release-gate verification is complete unless explicitly requested.
+These follow-ups remain separate from the shipped 0.2.7 stabilization and should not be started as part of reconciliation unless explicitly requested.

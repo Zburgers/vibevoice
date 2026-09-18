@@ -46,8 +46,9 @@ jobs:
         run: |
           set -euo pipefail
           git fetch --no-tags origin master
-          if ! git merge-base --is-ancestor "$GITHUB_SHA" origin/master; then
-            echo "Refusing to publish: $GITHUB_SHA is not contained in origin/master" >&2
+          tag_commit="$(git rev-list -n 1 "$GITHUB_REF")"
+          if ! git merge-base --is-ancestor "$tag_commit" origin/master; then
+            echo "Refusing to publish: $tag_commit is not contained in origin/master" >&2
             exit 1
           fi
 

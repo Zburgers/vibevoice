@@ -1,16 +1,16 @@
 # VibeVoice — Product Specification and Engineering Handbook
 
-**Document version:** 0.2.6  
-**Last updated:** 2026-09-10
+**Document version:** 0.2.7  
+**Last updated:** 2026-09-18
 **Generated or audited by:** Repository Product Specification & Engineering Handbook Agent  
 **Repository:** `Zburgers/vibevoice`  
 **Authoritative branch:** `master`  
-**Verified branch commit:** `316da5b375c73fdc0b6075877edef28cc67715be`
-**Working branch:** `docs/product-handbook-sync-2026-08-04`  
-**Working branch commit:** Document publication commit; inspect Git file history (the commit cannot embed its own SHA)  
-**Production status:** `VERIFIED_RELEASE_PRESENT` — public release documentation and release automation identify VibeVoice `0.2.6`; exact installed/deployed commit is unverified  
-**Verified deployed commit:** `UNVERIFIED`  
-**Deployment verification:** Repository release workflow, signed-updater configuration, and `docs/releases/v0.2.6.md`; no runtime/version endpoint or release-to-commit manifest was available  
+**Verified branch commit:** Reconciled `master`; final merge SHA is recorded in the reconciliation PR and release-engineering report  
+**Working branch:** `chore/reconcile-v0.2.7-mainline`  
+**Working branch commit:** Reconciliation candidate containing the immutable shipped release commit  
+**Production status:** `VERIFIED_RELEASE_PRESENT` — public VibeVoice `v0.2.7` is published from commit `6f198176f00d0b3899ad798aa2b21fb0d315e29a`  
+**Verified deployed commit:** `6f198176f00d0b3899ad798aa2b21fb0d315e29a`  
+**Deployment verification:** Repository release workflow, signed-updater configuration, and `docs/releases/v0.2.7.md`; the tag and release assets were re-read during reconciliation  
 **Document confidence:** High for authoritative-branch implementation; medium for cross-platform runtime behavior; low for installed-user state  
 **Confidentiality:** Public repository documentation
 
