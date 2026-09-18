@@ -1238,7 +1238,7 @@ fn apply_history_retention(
     settings: &Settings,
     now: DateTime<Utc>,
 ) -> Vec<HistoryItem> {
-    history.sort_by(|left, right| right.created_at.cmp(&left.created_at));
+    history.sort_by_key(|item| std::cmp::Reverse(item.created_at));
     if settings.history_retention_days > 0 {
         let cutoff = now - ChronoDuration::days(settings.history_retention_days as i64);
         history.retain(|item| item.created_at >= cutoff);
@@ -2071,7 +2071,7 @@ fn should_remove_stale_recording(
                 // files are preserved while crashed artifacts are eventually
                 // reclaimed. `is_pid_alive` is still consulted where possible.
                 let _ = is_pid_alive(pid);
-                return file_age(metadata).is_some_and(|age| age >= STALE_RECORDING_AGE);
+                file_age(metadata).is_some_and(|age| age >= STALE_RECORDING_AGE)
             }
         }
         RecordingOwnership::Legacy => {
