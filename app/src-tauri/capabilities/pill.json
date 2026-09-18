@@ -4,6 +4,8 @@
   "description": "Minimal permissions for the floating pill window",
   "windows": ["pill"],
   "permissions": [
+    "core:event:allow-listen",
+    "core:event:allow-unlisten",
     "core:window:allow-set-cursor-icon",
     "core:window:allow-set-always-on-top",
     "core:window:allow-set-size",

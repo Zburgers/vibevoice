@@ -10,6 +10,10 @@ describe("packaged capability policy", () => {
     const pill = capability("pill.json");
     expect(main.permissions).not.toContain("core:default");
     expect(pill.permissions).not.toContain("core:default");
+    expect(main.permissions).toContain("core:event:allow-listen");
+    expect(main.permissions).toContain("core:event:allow-unlisten");
+    expect(pill.permissions).toContain("core:event:allow-listen");
+    expect(pill.permissions).toContain("core:event:allow-unlisten");
     expect(main.permissions).toContain("updater:default");
     expect(main.permissions).toContain("process:allow-restart");
     expect(pill.permissions).not.toContain("updater:default");

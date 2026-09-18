@@ -46,41 +46,42 @@ export function PillWindow({
     <main
       className={`floating-shell ${expanded ? "is-expanded" : ""} ${flipX ? "flip-x" : ""} ${flipY ? "flip-y" : ""}`}
     >
-      {!expanded && (
+      <div className="pill-anchor">
+        {!expanded && (
+          <button
+            type="button"
+            className="pill-grip-floating"
+            onMouseDown={onDrag}
+            aria-label="Move pill"
+            title="Move"
+          >
+            <GripVertical size={13} strokeWidth={2.5} />
+          </button>
+        )}
+
         <button
           type="button"
-          className="pill-grip-floating"
-          onMouseDown={onDrag}
-          aria-label="Move pill"
-          title="Move"
+          className={`voice-pill tone-${tone}`}
+          onClick={onToggleExpanded}
+          aria-expanded={expanded}
+          aria-label={`${phaseCopy[phase]}. Open controls.`}
         >
-          <GripVertical size={13} strokeWidth={2.5} />
+          <span className="pill-mark">
+            <img className="pill-icon" src={vibevoiceIcon} alt="" aria-hidden="true" />
+            <span className="pill-dot" />
+          </span>
+          {expanded && (
+            <>
+              <span className="pill-copy">
+                <span className="pill-title">{phaseCopy[phase]}</span>
+                <span className="pill-subtitle">{state.voice_state === "Recording" ? `${recordingSeconds}s` : state.settings.hotkey}</span>
+              </span>
+              <MicVisualizer level={state.mic_level} active={state.voice_state === "Recording"} compact />
+            </>
+          )}
         </button>
-      )}
 
-      <button
-        type="button"
-        className={`voice-pill tone-${tone}`}
-        onClick={onToggleExpanded}
-        aria-expanded={expanded}
-        aria-label={`${phaseCopy[phase]}. Open controls.`}
-      >
-        <span className="pill-mark">
-          <img className="pill-icon" src={vibevoiceIcon} alt="" aria-hidden="true" />
-          <span className="pill-dot" />
-        </span>
         {expanded && (
-          <>
-            <span className="pill-copy">
-              <span className="pill-title">{phaseCopy[phase]}</span>
-              <span className="pill-subtitle">{state.voice_state === "Recording" ? `${recordingSeconds}s` : state.settings.hotkey}</span>
-            </span>
-            <MicVisualizer level={state.mic_level} active={state.voice_state === "Recording"} compact />
-          </>
-        )}
-      </button>
-
-      {expanded && (
         <section className="pill-panel" aria-live="polite">
           <div className="pill-panel-top">
             <button type="button" className="icon-button is-drag" onMouseDown={onDrag} aria-label="Move pill" title="Move">
@@ -108,7 +109,8 @@ export function PillWindow({
             </button>
           </div>
         </section>
-      )}
+        )}
+      </div>
     </main>
   );
 }

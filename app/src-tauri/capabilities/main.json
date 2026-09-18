@@ -4,6 +4,8 @@
   "description": "Audited permissions for the primary VibeVoice window",
   "windows": ["main"],
   "permissions": [
+    "core:event:allow-listen",
+    "core:event:allow-unlisten",
     "core:window:allow-set-cursor-icon",
     "core:window:allow-set-size",
     "core:window:allow-start-resize-dragging",

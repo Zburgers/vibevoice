@@ -738,6 +738,7 @@ fn finish_recording(
     shutdown: &AtomicBool,
 ) -> Result<HistoryItem, String> {
     stop_audio_capture(session)?;
+    validate_recording_audio(&session.audio_path)?;
     if shutdown.load(Ordering::Acquire) {
         return Err("Recording cancelled during shutdown.".to_string());
     }
@@ -805,6 +806,20 @@ fn finish_recording(
     drop(runtime);
     emit_state_changed(&app);
     Ok(item)
+}
+
+fn validate_recording_audio(audio_path: &Path) -> Result<(), String> {
+    let reader = hound::WavReader::open(audio_path)
+        .map_err(|error| format!("Recorded audio is invalid: {error}"))?;
+    if reader.duration() == 0 {
+        let guidance = if cfg!(target_os = "linux") {
+            "Check the microphone input and Linux audio service."
+        } else {
+            "Check the microphone input."
+        };
+        return Err(format!("Recording captured no audio frames. {guidance}"));
+    }
+    Ok(())
 }
 
 #[tauri::command]
@@ -3311,6 +3326,25 @@ mod tests {
             "partial transcript was removed"
         );
         let _ = fs::remove_dir(&dir);
+    }
+
+    #[test]
+    fn zero_frame_wav_is_rejected_before_transcription() {
+        let path = std::env::temp_dir().join(format!("vibevoice-empty-{}.wav", Uuid::new_v4()));
+        let spec = hound::WavSpec {
+            channels: 1,
+            sample_rate: 16_000,
+            bits_per_sample: 16,
+            sample_format: hound::SampleFormat::Int,
+        };
+        hound::WavWriter::create(&path, spec)
+            .unwrap()
+            .finalize()
+            .unwrap();
+
+        let error = validate_recording_audio(&path).unwrap_err();
+        assert!(error.contains("no audio frames"));
+        let _ = fs::remove_file(path);
     }
 
     #[cfg(unix)]
