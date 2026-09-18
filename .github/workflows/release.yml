@@ -2,13 +2,8 @@ name: Release
 
 on:
   push:
-    branches:
-      - master
     tags:
       - "v*"
-  pull_request:
-    branches:
-      - master
 
 permissions:
   contents: read
@@ -16,24 +11,12 @@ permissions:
 jobs:
   publish-tauri:
     name: Build ${{ matrix.name }}
-    # Fail closed: publishing requires a push event on a repository-protected
-    # ref (github.ref_protected), enforced by the v* tag ruleset and master
-    # branch protection. Tags must additionally satisfy a strict v-prefixed
-    # SemVer pattern so only release-style tags (never a bare "v") can reach
-    # the signing job. The `environment: release` gate (deployment limited to
-    # protected refs) provides a second, independently configured boundary:
-    # even a workflow edit that weakened this `if:` could not reach signing
-    # secrets without also passing the environment protection rules.
+    # Fail closed: publishing is tag-driven only. The tag must be protected,
+    # SemVer-shaped, and point at a commit already contained in master.
     if: >-
       github.ref_protected == true &&
       github.event_name == 'push' &&
-      (startsWith(github.ref, 'refs/tags/v') ||
-      (github.ref == 'refs/heads/master' &&
-      startsWith(github.event.head_commit.message, 'release: v')))
-    # Extra tag guard evaluated inside the job. Combined with a protected
-    # tags ruleset (repository configuration), a ref like refs/tags/v that
-    # matches the push trigger but not the SemVer pattern fails the job
-    # instead of silently skipping.
+      startsWith(github.ref, 'refs/tags/v')
     permissions:
       contents: write
     environment: release
@@ -55,6 +38,18 @@ jobs:
     steps:
       - name: Checkout
         uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+        with:
+          fetch-depth: 0
+
+      - name: Verify tagged commit is already on master
+        shell: bash
+        run: |
+          set -euo pipefail
+          git fetch --no-tags origin master
+          if ! git merge-base --is-ancestor "$GITHUB_SHA" origin/master; then
+            echo "Refusing to publish: $GITHUB_SHA is not contained in origin/master" >&2
+            exit 1
+          fi
 
       - name: Install Linux dependencies
         if: runner.os == 'Linux'
@@ -155,7 +150,7 @@ jobs:
 
           # Tag/package consistency: a release tag must equal the app
           # version tag exactly.
-          if [[ "$GITHUB_REF" == refs/tags/* && "$GITHUB_REF_NAME" != "$expected_tag" ]]; then
+          if [[ "$GITHUB_REF_NAME" != "$expected_tag" ]]; then
             echo "Tag '$GITHUB_REF_NAME' does not match app version tag '$expected_tag'" >&2
             exit 1
           fi
@@ -172,9 +167,9 @@ jobs:
           args: ${{ matrix.args }}
           includeRelease: true
           includeUpdaterJson: true
-          tagName: ${{ startsWith(github.ref, 'refs/tags/') && github.ref_name || format('v{0}', steps.version.outputs.version) }}
-          releaseName: ${{ startsWith(github.ref, 'refs/tags/') && format('VibeVoice {0}', github.ref_name) || format('VibeVoice v{0}', steps.version.outputs.version) }}
-          releaseBody: 'VibeVoice 0.2.7: renderer reliability, SemVer-safe updates, redacted diagnostics, window capability hardening, native resize cursors, transcription timeout/cancel, recording lifecycle correctness, runtime privacy hardening, and verified installer integrity.'
+          tagName: ${{ github.ref_name }}
+          releaseName: ${{ format('VibeVoice {0}', github.ref_name) }}
+          releaseBody: 'VibeVoice desktop release built from the tested master commit named by this tag.'
           generateReleaseNotes: true
           releaseDraft: false
           prerelease: false

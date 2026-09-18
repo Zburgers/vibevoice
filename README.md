@@ -71,8 +71,8 @@ Diagnostics checks GitHub Releases and keeps the in-app updater available for al
 
 ## Release Notes
 
-- Latest: [VibeVoice 0.2.6](docs/releases/v0.2.6.md)
-- Previous: [VibeVoice 0.2.5](docs/releases/v0.2.5.md)
+- Latest: [VibeVoice 0.2.7](docs/releases/v0.2.7.md)
+- Previous: [VibeVoice 0.2.6](docs/releases/v0.2.6.md)
 
 ## Development Checks
 
