@@ -4,7 +4,7 @@ import type { MouseEvent } from "react";
 import vibevoiceIcon from "./assets/vibevoice-icon.png";
 import { phaseCopy, phaseTone } from "./types";
 import type { AppState, Phase } from "./types";
-import { MicVisualizer, StatusChip } from "./ui";
+import { MicVisualizer } from "./ui";
 
 export function PillWindow({
   state,
@@ -70,7 +70,7 @@ export function PillWindow({
             <img className="pill-icon" src={vibevoiceIcon} alt="" aria-hidden="true" />
             <span className="pill-dot" />
           </span>
-          {expanded && (
+          {(
             <>
               <span className="pill-copy">
                 <span className="pill-title">{phaseCopy[phase]}</span>
@@ -87,20 +87,20 @@ export function PillWindow({
             <button type="button" className="icon-button is-drag" onMouseDown={onDrag} aria-label="Move pill" title="Move">
               <GripVertical size={15} />
             </button>
-            <StatusChip phase={phase} />
+            <span className="pill-panel-label">Voice controls</span>
             <button type="button" className="icon-button" onClick={onCollapse} aria-label="Collapse" title="Collapse">
               <ChevronDown size={16} />
             </button>
           </div>
 
-          <div className="pill-transcript">{lastText}</div>
+          <div className="pill-transcript-label">Latest transcript</div><div className="pill-transcript" tabIndex={0}>{lastText}</div>
 
           <div className="pill-actions">
             <button type="button" className={`primary-action tone-${tone}`} disabled={primaryDisabled} onClick={onPrimary}>
               <ActionIcon size={16} className={state.voice_state === "Preparing" || state.voice_state === "Processing" ? "spin" : ""} />
               <span>{state.voice_state === "Recording" ? "Stop" : state.voice_state === "Processing" ? "Cancel" : state.voice_state === "Error" ? "Retry" : "Record"}</span>
             </button>
-            <button type="button" className="secondary-action" onClick={onPaste}>
+            <button type="button" className="secondary-action" disabled={!state.last_transcript} onClick={onPaste}>
               <RotateCcw size={15} />
               <span>Paste</span>
             </button>
