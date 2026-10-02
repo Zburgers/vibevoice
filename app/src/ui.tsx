@@ -26,14 +26,17 @@ export function Metric({ icon: Icon, label, value }: { icon: LucideIcon; label: 
   );
 }
 
-export function MicVisualizer({ level, active, compact = false }: { level: number; active: boolean; compact?: boolean }) {
-  const normalized = Math.max(0.04, Math.min(1, level || 0));
+export function MicVisualizer({ bands = [], active, compact = false }: { bands?: readonly number[]; active: boolean; compact?: boolean }) {
+  const bandLevel = (index: number) => {
+    const value = bands[index];
+    return active && Number.isFinite(value) ? Math.max(0, Math.min(1, value)) : 0;
+  };
   return (
     <span className={`mic-visualizer ${active ? "is-active" : ""} ${compact ? "is-compact" : ""}`} aria-hidden="true">
       {Array.from({ length: compact ? 6 : 12 }).map((_, index) => {
-        const wave = active ? Math.abs(Math.sin(index * 0.72 + normalized * 2.8)) : 0.16;
-        const height = Math.round((compact ? 8 : 18) + (active ? Math.max(normalized, wave * normalized) : wave) * (compact ? 16 : 34));
-        return <span key={index} style={{ height: `${height}px` }} />;
+        const energy = compact ? Math.max(bandLevel(index * 2), bandLevel(index * 2 + 1)) : bandLevel(index);
+        const height = Math.round((compact ? 3 : 4) + energy * (compact ? 19 : 34));
+        return <span key={index} style={{ height: `${height}px`, opacity: active ? 0.3 + energy * 0.65 : 0.3 }} />;
       })}
     </span>
   );

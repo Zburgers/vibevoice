@@ -78,8 +78,8 @@ export function ControlView({
         </div>
         <div className={`session-meter ${recording ? "is-recording" : ""}`} aria-hidden="true">
           <img src={vibevoiceIcon} alt="" draggable={false} />
-          <MicVisualizer level={state.mic_level} active={recording} />
-          <span>{recording ? "Microphone active" : "Voice → text"}</span>
+          <MicVisualizer bands={state.mic_bands} active={recording} />
+          <span>{recording ? "Live spectrum · low → high" : "Voice → text"}</span>
         </div>
         <div className="session-shortcut">
           <span><Keyboard size={15} aria-hidden="true" /> Keyboard shortcut</span>

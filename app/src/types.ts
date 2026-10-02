@@ -89,11 +89,13 @@ export type AppState = {
   last_transcript: string | null;
   last_error: string | null;
   mic_level: number;
+  mic_bands: number[];
   recording_started_at: string | null;
 };
 
 export type MeterPayload = {
   mic_level: number;
+  mic_bands: number[];
 };
 
 export type UpdateStatus = {
@@ -143,6 +145,7 @@ export const fallbackState: AppState = {
   last_transcript: null,
   last_error: null,
   mic_level: 0,
+  mic_bands: [],
   recording_started_at: null,
 };
 

@@ -1183,7 +1183,8 @@ select:focus {
   min-width: 92px;
   height: 40px;
   display: inline-flex;
-  align-items: center;
+  align-items: flex-end;
+  justify-content: center;
   gap: 3px;
 }
 
@@ -1192,7 +1193,7 @@ select:focus {
   border-radius: 99px;
   background: currentColor;
   opacity: 0.34;
-  transition: height 120ms ease, opacity 120ms ease, background 120ms ease;
+  transition: height 80ms linear, opacity 80ms linear, background 120ms ease;
 }
 
 .mic-visualizer.is-active span {
