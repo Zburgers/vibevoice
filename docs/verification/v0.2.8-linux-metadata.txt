@@ -1,0 +1,34 @@
+VibeVoice Linux packaging verification - 2026-10-03
+
+Source changes:
+- app/src-tauri/tauri.conf.json
+- app/src-tauri/linux/dev.zburgers.vibevoice.metainfo.xml
+
+Version consistency: package.json, package-lock.json (top-level and root package),
+Cargo.toml, Cargo.lock, and tauri.conf.json all report 0.2.8.
+
+Tauri CLI 2.11.2 generated unsigned RPM and DEB packaging fixtures on Linux.
+Fixtures used the published v0.2.7 ELF executable and current packaging config.
+Updater artifact generation was disabled for the fixture only. The temporary
+pkg-config descriptor referenced an unpacked AppIndicator library, omitting
+build-time dependency requirements. No current-source application build ran.
+The reused binary generated a __TAURI_BUNDLE_TYPE warning, so these fixtures
+are metadata evidence only, not release or updater qualification.
+
+RPM header: name=vibe-voice; version=0.2.8; release=1; arch=x86_64;
+license=LicenseRef-proprietary; URL=https://github.com/Zburgers/vibevoice.
+DEB control: package=vibe-voice; version=0.2.8; section=sound;
+homepage=https://github.com/Zburgers/vibevoice; summary and description present.
+
+Both extracted packages passed desktop-file-validate and
+appstreamcli validate --no-net --pedantic, without diagnostics.
+Desktop entry: /usr/share/applications/VibeVoice.desktop
+Name=VibeVoice; Exec=vibevoice; Icon=vibevoice; Categories=Office;
+AppStream: /usr/share/metainfo/dev.zburgers.vibevoice.metainfo.xml
+launchable=VibeVoice.desktop; stock icon=vibevoice; component ID matches identifier.
+All five installed PNG signatures and dimensions were checked:
+32x32, 64x64, 128x128, 256x256@2, 512x512, each under hicolor/*/apps/vibevoice.png.
+
+AppImage metadata mapping was inspected and parsed by Tauri; no AppImage built.
+Fedora graphical installation/icon display was not tested.
+git diff --check passed. No release, tag, or publication performed. PR preparation is separate.
