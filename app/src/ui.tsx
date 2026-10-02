@@ -9,8 +9,8 @@ import type { Phase } from "./types";
 export function StatusChip({ phase }: { phase: Phase }) {
   const Icon = phaseIcons[phase];
   return (
-    <span className={`status-chip tone-${phaseTone[phase]}`}>
-      <Icon size={14} className={phase === "preparing" || phase === "transcribing" ? "spin" : ""} />
+    <span className={`status-chip tone-${phaseTone[phase]}`} title={phaseCopy[phase]}>
+      <Icon size={14} aria-hidden="true" className={phase === "preparing" || phase === "transcribing" ? "spin" : ""} />
       <span>{phaseCopy[phase]}</span>
     </span>
   );

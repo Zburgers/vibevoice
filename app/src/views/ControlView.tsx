@@ -1,9 +1,20 @@
-import { Activity, Copy, ExternalLink, Keyboard, RotateCcw, ShieldCheck, SlidersHorizontal, Wrench, Zap } from "lucide-react";
+import { Activity, Copy, ExternalLink, Keyboard, Mic, RotateCcw, ShieldCheck, SlidersHorizontal, Wrench, Zap } from "lucide-react";
 import type { LucideIcon } from "lucide-react";
 import vibevoiceIcon from "../assets/vibevoice-icon.png";
-import { actionLabel, phaseCopy, phaseTone } from "../types";
+import { actionLabel, phaseTone } from "../types";
 import type { AppState, Phase } from "../types";
 import { Metric, MicVisualizer, StatusChip } from "../ui";
+import { TranscriptContent } from "../TranscriptContent";
+
+const sessionCopy: Record<Phase, { title: string; detail: string }> = {
+  ready: { title: "Ready when you are.", detail: "Record your voice, then send your words to the focused app." },
+  preparing: { title: "Opening your microphone.", detail: "Your recording will begin in a moment." },
+  recording: { title: "Listening to you.", detail: "Stop recording when you’re finished speaking." },
+  transcribing: { title: "Turning voice into text.", detail: "Transcribing locally on your device." },
+  inserted: { title: "Your words are in.", detail: "Transcript inserted into the focused app. Ready for the next thought." },
+  copied: { title: "Ready to paste.", detail: "Transcript copied to your clipboard." },
+  error: { title: "Let’s try that again.", detail: "Check the error below, then retry your recording." },
+};
 
 export function ControlView({
   state,
@@ -33,9 +44,15 @@ export function ControlView({
   onOpenSettings: () => void;
 }) {
   const tone = phaseTone[phase];
+  const recording = state.voice_state === "Recording";
+  const session = phase === "error" && state.last_transcript
+    ? { title: "Your transcript is ready.", detail: "Sending it failed. Copy your words or retry insertion below." }
+    : sessionCopy[phase];
+  const hasTranscript = Boolean(state.last_transcript);
+  const timer = `${Math.floor(recordingSeconds / 60)}:${String(recordingSeconds % 60).padStart(2, "0")}`;
   return (
     <section className="view control-view">
-      <div className="view-head">
+      <div className="view-head control-head">
         <div>
           <div className="eyebrow">Control</div>
           <h1>Speak into the focused app.</h1>
@@ -44,37 +61,46 @@ export function ControlView({
       </div>
 
       <div className={`control-surface tone-${tone}`}>
-        <div className="record-orb">
-          <img src={vibevoiceIcon} alt="" aria-hidden="true" />
-          <span className="record-ring" />
+        <div className="session-topline">
+          <span className="session-label"><Mic size={14} aria-hidden="true" /> Voice session</span>
+          <span className="session-local">On-device transcription</span>
         </div>
         <div className="record-copy">
-          <span className="record-label">{phaseCopy[phase]}</span>
-          <strong>{state.voice_state === "Recording" ? `${recordingSeconds}s` : state.settings.hotkey}</strong>
-          <MicVisualizer level={state.mic_level} active={state.voice_state === "Recording"} />
+          <h2>{session.title}</h2>
+          <p>{session.detail}</p>
+          <div className="session-action">
+            <button type="button" className={`primary-action large tone-${tone}`} disabled={primaryDisabled} onClick={onPrimary}>
+              <ActionIcon size={18} aria-hidden="true" className={state.voice_state === "Preparing" || state.voice_state === "Processing" ? "spin" : ""} />
+              <span>{actionLabel(state.voice_state)}</span>
+            </button>
+            {recording && <span className="session-timer" aria-label={`Recording duration: ${recordingSeconds} seconds`}>{timer}</span>}
+          </div>
         </div>
-        <button type="button" className={`primary-action large tone-${tone}`} disabled={primaryDisabled} onClick={onPrimary}>
-          <ActionIcon size={19} className={state.voice_state === "Preparing" || state.voice_state === "Processing" ? "spin" : ""} />
-          <span>{actionLabel(state.voice_state)}</span>
-        </button>
+        <div className={`session-meter ${recording ? "is-recording" : ""}`} aria-hidden="true">
+          <img src={vibevoiceIcon} alt="" draggable={false} />
+          <MicVisualizer level={state.mic_level} active={recording} />
+          <span>{recording ? "Microphone active" : "Voice → text"}</span>
+        </div>
+        <div className="session-shortcut">
+          <span><Keyboard size={15} aria-hidden="true" /> Keyboard shortcut</span>
+          <div className="shortcut-keys" role="group" aria-label={state.settings.hotkey}>
+            {state.settings.hotkey.split("+").map((key, index) => (
+              <span className="shortcut-key" key={`${key}-${index}`}>
+                {index > 0 && <span className="shortcut-plus" aria-hidden="true">+</span>}
+                <kbd>{key.trim()}</kbd>
+              </span>
+            ))}
+          </div>
+        </div>
       </div>
 
-      <div className="quick-grid">
+      <div className="quick-grid control-details">
         <Metric icon={Zap} label="Output" value={state.settings.auto_paste ? "Auto paste" : "Clipboard only"} />
         <Metric icon={ShieldCheck} label="Engine" value={state.diagnostics.whisper_found && state.diagnostics.model_found ? "Ready" : "Setup needed"} />
-        <Metric icon={Keyboard} label="Hotkey" value={state.settings.hotkey} />
         <Metric icon={Activity} label="Recorder" value={state.diagnostics.recorder || "Unavailable"} />
       </div>
 
-      <div className="action-row">
-        <button type="button" className="secondary-action" onClick={onCopy}>
-          <Copy size={16} />
-          <span>Copy transcript</span>
-        </button>
-        <button type="button" className="secondary-action" onClick={onPaste}>
-          <RotateCcw size={16} />
-          <span>Retry insertion</span>
-        </button>
+      <div className="action-row control-tools">
         {state.diagnostics.setup_available ? (
           <button type="button" className="secondary-action" onClick={onSetup}>
             <Wrench size={16} />
@@ -92,12 +118,26 @@ export function ControlView({
         </button>
       </div>
 
-      <article className={`transcript-block ${state.last_error ? "has-error" : ""}`}>
-        <div className="block-head">
-          <span>Last transcript</span>
-          <span>{commandStatus}</span>
+      <article className={`transcript-block control-transcript ${state.last_error ? "has-error" : ""}`} aria-labelledby="last-transcript-title">
+        <div className="block-head transcript-heading">
+          <h2 id="last-transcript-title">Last transcript</h2>
+          <div className="action-row">
+            <button type="button" className="ghost-button" disabled={!hasTranscript} onClick={onCopy}>
+              <Copy size={15} aria-hidden="true" />
+              <span>Copy transcript</span>
+            </button>
+            <button type="button" className="ghost-button" disabled={!hasTranscript} onClick={onPaste}>
+              <RotateCcw size={15} aria-hidden="true" />
+              <span>Retry insertion</span>
+            </button>
+          </div>
         </div>
-        <p>{state.last_error || state.last_transcript || "No transcript captured yet."}</p>
+        <div className={`transcript-content ${!hasTranscript && !state.last_error ? "is-empty" : ""}`}>
+          {!hasTranscript && !state.last_error && <Mic size={22} aria-hidden="true" />}
+          <TranscriptContent transcript={state.last_transcript} error={state.last_error} />
+          {!hasTranscript && !state.last_error && <span>Start a recording to see your words here.</span>}
+        </div>
+        <div className="transcript-feedback" role="status">{commandStatus}</div>
       </article>
     </section>
   );
