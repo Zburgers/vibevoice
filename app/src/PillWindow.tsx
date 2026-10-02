@@ -44,6 +44,8 @@ export function PillWindow({
   const tone = phaseTone[phase];
   return (
     <main
+      onContextMenu={(event) => event.preventDefault()}
+      onDragStart={(event) => event.preventDefault()}
       className={`floating-shell ${expanded ? "is-expanded" : ""} ${flipX ? "flip-x" : ""} ${flipY ? "flip-y" : ""}`}
     >
       <div className="pill-anchor">
@@ -67,7 +69,7 @@ export function PillWindow({
           aria-label={`${phaseCopy[phase]}. Open controls.`}
         >
           <span className="pill-mark">
-            <img className="pill-icon" src={vibevoiceIcon} alt="" aria-hidden="true" />
+            <img className="pill-icon" draggable={false} src={vibevoiceIcon} alt="" aria-hidden="true" />
             <span className="pill-dot" />
           </span>
           {(

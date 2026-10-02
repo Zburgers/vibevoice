@@ -1209,6 +1209,8 @@ select:focus {
 
 /* Hallmark · component: voice pill · existing VibeVoice tokens
  * pre-emit critique: P4 H4 E4 S5 R5 V4 */
+.floating-shell, .floating-shell * { user-select: none; -webkit-user-select: none; }
+.pill-icon { -webkit-user-drag: none; }
 .floating-shell { width: 100%; height: 100%; padding: 8px; background: transparent; }
 .pill-anchor { position: relative; width: 100%; height: 100%; border: 1px solid var(--line-strong); border-radius: 32px; background: var(--surface); overflow: clip; }
 .floating-shell.is-expanded .pill-anchor { display: flex; flex-direction: column; border-radius: 24px; }
