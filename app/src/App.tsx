@@ -55,10 +55,10 @@ type ResizeDirection = "East" | "North" | "NorthEast" | "NorthWest" | "South" | 
 
 const RELEASES_URL = "https://github.com/Zburgers/vibevoice/releases";
 const LATEST_RELEASE_API = "https://api.github.com/repos/Zburgers/vibevoice/releases/latest";
-const COLLAPSED_PILL_SIZE = new LogicalSize(68, 68);
-const EXPANDED_PILL_SIZE = new LogicalSize(318, 262);
-const COLLAPSED_PILL_DIMENSIONS = { width: 68, height: 68 };
-const EXPANDED_PILL_DIMENSIONS = { width: 318, height: 262 };
+const COLLAPSED_PILL_SIZE = new LogicalSize(196, 80);
+const EXPANDED_PILL_SIZE = new LogicalSize(340, 280);
+const COLLAPSED_PILL_DIMENSIONS = { width: 196, height: 80 };
+const EXPANDED_PILL_DIMENSIONS = { width: 340, height: 280 };
 const resizeHandles: Array<{ direction: ResizeDirection; className: string }> = [
   { direction: "North", className: "is-north" },
   { direction: "South", className: "is-south" },
@@ -270,7 +270,7 @@ function App() {
 
       const centerX = previousPosition.x + previousSize.width / 2;
       const centerY = previousPosition.y + previousSize.height / 2;
-      const monitor = await monitorFromPoint(centerX, centerY);
+      const monitor = await monitorFromPoint(centerX, centerY).catch(() => null);
       if (!isCurrentRequest()) return;
 
       if (!monitor) {

@@ -5,6 +5,11 @@ import { describe, expect, it } from "vitest";
 const capability = (name: string) => JSON.parse(readFileSync(resolve(process.cwd(), "src-tauri/capabilities", name), "utf8")) as { permissions: string[] };
 
 describe("packaged capability policy", () => {
+  it("keeps the floating host transparent and removes native window chrome", () => {
+    const config = JSON.parse(readFileSync(resolve(process.cwd(), "src-tauri/tauri.conf.json"), "utf8"));
+    const pill = config.app.windows.find((window: { label: string }) => window.label === "pill");
+    expect(pill).toMatchObject({ transparent: true, decorations: false, shadow: false, resizable: false, width: 196, height: 80 });
+  });
   it("splits audited main and pill permissions", () => {
     const main = capability("main.json");
     const pill = capability("pill.json");
@@ -13,6 +18,7 @@ describe("packaged capability policy", () => {
     expect(main.permissions).toContain("core:event:allow-listen");
     expect(main.permissions).toContain("core:event:allow-unlisten");
     expect(pill.permissions).toContain("core:event:allow-listen");
+    expect(pill.permissions).toContain("core:window:allow-monitor-from-point");
     expect(pill.permissions).toContain("core:event:allow-unlisten");
     expect(main.permissions).toContain("updater:default");
     expect(main.permissions).toContain("process:allow-restart");
