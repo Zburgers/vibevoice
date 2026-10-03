@@ -1690,7 +1690,7 @@ body {
   font-size: 0.78rem;
 }
 
-.control-transcript.has-error .transcript-content p {
+.control-transcript.has-error .transcript-content [role="alert"] {
   color: var(--bad);
 }
 
