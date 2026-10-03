@@ -22,7 +22,9 @@ Local-first desktop voice input for developers. VibeVoice records from your micr
 
 ## Quick Start
 
-Install dependencies and run the desktop app:
+Download the installers from [the latest release](https://github.com/Zburgers/vibevoice/releases/latest). Windows packages target x64; Linux packages target x64; the macOS package targets Apple Silicon. In the Windows app, open Settings or Diagnostics to install the verified Whisper engine and verify/repair the default model. Linux/macOS engine setup remains manual; see [installation instructions](docs/INSTALL.md).
+
+For development, install dependencies and run the desktop app:
 
 ```bash
 cd app
@@ -77,8 +79,8 @@ Diagnostics checks GitHub Releases and keeps the in-app updater available for al
 
 ## Release Notes
 
-- Latest: [VibeVoice 0.2.7](docs/releases/v0.2.7.md)
-- Previous: [VibeVoice 0.2.6](docs/releases/v0.2.6.md)
+- Latest: [VibeVoice 0.2.8](docs/releases/v0.2.8.md)
+- Previous: [VibeVoice 0.2.7](docs/releases/v0.2.7.md)
 
 ## Development Checks
 

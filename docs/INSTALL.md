@@ -19,11 +19,15 @@ The model is `ggml-base.en.bin`.
 
 Starting with 0.2.8, open **Settings** or **Diagnostics → Whisper components**.
 Choose **Update Whisper engine** to install the recommended verified Windows
-x64/ARM64 engine without a compiler, then **Verify / repair model** to verify or
+x64 engine without a compiler, then **Verify / repair model** to verify or
 download the default English `base.en` model. Stop recording and transcription
 first. Progress and cancellation are available; earlier engine files are kept.
 The model action selects `base.en` and preserves any custom model file. Engine
 updates preserve the current model selection.
+
+The distributed Windows app and installers are x64. The ARM64 engine package
+exists for native development builds; this release does not distribute or
+certify a native Windows ARM64 app.
 
 Component recommendations are pinned by the app release. Model repair also
 works on other platforms; Linux/macOS engine installation uses the manual setup
