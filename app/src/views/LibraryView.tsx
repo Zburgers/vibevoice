@@ -55,6 +55,7 @@ export function LibraryView({
   onToggleRule: (id: string, enabled: boolean) => void;
   onRemoveRule: (id: string) => void;
 }) {
+  const outputBusy = ["Preparing", "Recording", "Processing"].includes(state.voice_state);
   return (
     <section className="view library-view">
       <div className="view-head">
@@ -115,11 +116,11 @@ export function LibraryView({
               <p>{selectedHistory?.final_transcript || "Select a transcript."}</p>
               <div className="detail-meta">{selectedHistory?.error || "No error recorded"}</div>
               <div className="action-row">
-                <button type="button" className="secondary-action" disabled={!selectedHistory} onClick={() => onCopy(selectedHistory?.final_transcript)}>
+                <button type="button" className="secondary-action" disabled={!selectedHistory || outputBusy} onClick={() => onCopy(selectedHistory?.final_transcript)}>
                   <Copy size={16} />
                   <span>Copy</span>
                 </button>
-                <button type="button" className="secondary-action" disabled={!selectedHistory} onClick={() => onReinsert(selectedHistory?.final_transcript)}>
+                <button type="button" className="secondary-action" disabled={!selectedHistory || outputBusy} onClick={() => onReinsert(selectedHistory?.final_transcript)}>
                   <RotateCcw size={16} />
                   <span>Retry insertion</span>
                 </button>

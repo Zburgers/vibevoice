@@ -32,7 +32,7 @@ describe("pill renderer regressions", () => {
     const onPrimary = vi.fn();
     const view = render(
       <PillWindow
-        state={{ ...fallbackState, voice_state: "Processing" }}
+        state={{ ...fallbackState, voice_state: "Processing", last_transcript: "Previous words" }}
         phase={stateToPhase.Processing}
         expanded={true}
         lastText="Transcribing"
@@ -49,6 +49,7 @@ describe("pill renderer regressions", () => {
     );
     const cancel = screen.getByRole("button", { name: /cancel/i });
     expect(cancel).toBeEnabled();
+    expect(screen.getByRole("button", { name: "Paste" })).toBeDisabled();
     fireEvent.click(cancel);
     expect(onPrimary).toHaveBeenCalledOnce();
     view.unmount();

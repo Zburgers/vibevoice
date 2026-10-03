@@ -19,6 +19,17 @@ function show(state: AppState = fallbackState) {
 }
 
 describe("control workspace actions", () => {
+  it.each(["Preparing", "Recording", "Processing"] as const)("protects the %s session from older transcript actions", (voice_state) => {
+    const callbacks = show({ ...fallbackState, voice_state, last_transcript: "Previous words" });
+    const copy = screen.getByRole("button", { name: "Copy transcript" });
+    const paste = screen.getByRole("button", { name: "Retry insertion" });
+    expect(copy).toBeDisabled();
+    expect(paste).toBeDisabled();
+    fireEvent.click(copy);
+    fireEvent.click(paste);
+    expect(callbacks.onCopy).not.toHaveBeenCalled();
+    expect(callbacks.onPaste).not.toHaveBeenCalled();
+  });
   it("keeps transcription cancellation available during processing", () => {
     const callbacks = show({ ...fallbackState, voice_state: "Processing" });
     fireEvent.click(screen.getByRole("button", { name: "Cancel transcription" }));
@@ -49,7 +60,7 @@ describe("control workspace actions", () => {
       last_transcript: "Keep this transcript.", last_error: "Could not insert into the focused app." });
     expect(screen.getByText("Could not insert into the focused app.")).toBeVisible();
     expect(screen.getByText("Keep this transcript.")).toBeVisible();
-    expect(screen.getByRole("heading", { name: "Your transcript is ready." })).toBeVisible();
+    expect(screen.getByRole("heading", { name: "Your last transcript is available." })).toBeVisible();
     fireEvent.click(screen.getByRole("button", { name: "Copy transcript" }));
     fireEvent.click(screen.getByRole("button", { name: "Retry insertion" }));
     expect(callbacks.onCopy).toHaveBeenCalledOnce();

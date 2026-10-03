@@ -46,9 +46,10 @@ export function ControlView({
   const tone = phaseTone[phase];
   const recording = state.voice_state === "Recording";
   const session = phase === "error" && state.last_transcript
-    ? { title: "Your transcript is ready.", detail: "Sending it failed. Copy your words or retry insertion below." }
+    ? { title: "Your last transcript is available.", detail: "Copy or retry your saved words, and check the error below before recording again." }
     : sessionCopy[phase];
   const hasTranscript = Boolean(state.last_transcript);
+  const outputDisabled = !hasTranscript || ["Preparing", "Recording", "Processing"].includes(state.voice_state);
   const timer = `${Math.floor(recordingSeconds / 60)}:${String(recordingSeconds % 60).padStart(2, "0")}`;
   return (
     <section className="view control-view">
@@ -122,11 +123,11 @@ export function ControlView({
         <div className="block-head transcript-heading">
           <h2 id="last-transcript-title">Last transcript</h2>
           <div className="action-row">
-            <button type="button" className="ghost-button" disabled={!hasTranscript} onClick={onCopy}>
+            <button type="button" className="ghost-button" disabled={outputDisabled} onClick={onCopy}>
               <Copy size={15} aria-hidden="true" />
               <span>Copy transcript</span>
             </button>
-            <button type="button" className="ghost-button" disabled={!hasTranscript} onClick={onPaste}>
+            <button type="button" className="ghost-button" disabled={outputDisabled} onClick={onPaste}>
               <RotateCcw size={15} aria-hidden="true" />
               <span>Retry insertion</span>
             </button>

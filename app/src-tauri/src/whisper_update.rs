@@ -8,7 +8,7 @@ use std::{
     path::{Path, PathBuf},
     sync::{
         atomic::{AtomicBool, Ordering},
-        Arc,
+        Arc, Mutex,
     },
     time::{Duration, Instant},
 };
@@ -47,17 +47,38 @@ pub struct Progress {
     pub message: String,
 }
 
-pub struct UpdateLease(Arc<AtomicBool>);
+pub struct UpdateLease(Option<Arc<AtomicBool>>);
 impl UpdateLease {
     pub fn acquire(busy: Arc<AtomicBool>) -> Result<Self, String> {
         busy.compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
             .map_err(|_| "A Whisper update is already running.".to_string())?;
-        Ok(Self(busy))
+        Ok(Self(Some(busy)))
+    }
+
+    pub fn commit<T>(
+        &mut self,
+        lifecycle: &Mutex<()>,
+        cancel: &AtomicBool,
+        shutdown: &AtomicBool,
+        activate: impl FnOnce() -> Result<T, String>,
+    ) -> Result<T, String> {
+        let _lifecycle = lifecycle.lock().map_err(|e| e.to_string())?;
+        let result = check_cancel(cancel, shutdown).and_then(|_| activate());
+        // Cancel reads busy under this same lock. Close the slot before
+        // releasing it, so an acknowledged cancellation cannot follow commit.
+        self.release();
+        result
+    }
+
+    fn release(&mut self) {
+        if let Some(busy) = self.0.take() {
+            busy.store(false, Ordering::Release);
+        }
     }
 }
 impl Drop for UpdateLease {
     fn drop(&mut self) {
-        self.0.store(false, Ordering::Release);
+        self.release();
     }
 }
 
@@ -693,6 +714,61 @@ mod tests {
         assert!(UpdateLease::acquire(Arc::clone(&busy)).is_err());
         drop(lease);
         assert!(UpdateLease::acquire(busy).is_ok());
+    }
+    #[test]
+    fn component_commit_arbitrates_with_cancel_and_does_not_release_a_new_lease() {
+        let busy = Arc::new(AtomicBool::new(false));
+        let mut lease = UpdateLease::acquire(Arc::clone(&busy)).unwrap();
+        let lifecycle = Arc::new(Mutex::new(()));
+        let cancel_busy = Arc::clone(&busy);
+        let cancel_lifecycle = Arc::clone(&lifecycle);
+        let (started_tx, started_rx) = std::sync::mpsc::channel();
+        let mut cancellation = None;
+        lease
+            .commit(
+                &lifecycle,
+                &AtomicBool::new(false),
+                &AtomicBool::new(false),
+                || {
+                    cancellation = Some(thread::spawn(move || {
+                        started_tx.send(()).unwrap();
+                        let _guard = cancel_lifecycle.lock().unwrap();
+                        cancel_busy.load(Ordering::Acquire)
+                    }));
+                    started_rx.recv().unwrap();
+                    Ok(())
+                },
+            )
+            .unwrap();
+        assert!(
+            !cancellation.unwrap().join().unwrap(),
+            "late cancellation finds no running update"
+        );
+        let _next = UpdateLease::acquire(Arc::clone(&busy)).unwrap();
+        drop(lease);
+        assert!(
+            busy.load(Ordering::Acquire),
+            "completed lease cannot unlock a newer update"
+        );
+    }
+
+    #[test]
+    fn acknowledged_component_cancel_prevents_activation() {
+        let busy = Arc::new(AtomicBool::new(false));
+        let mut lease = UpdateLease::acquire(Arc::clone(&busy)).unwrap();
+        let mut activated = false;
+        let result = lease.commit(
+            &Mutex::new(()),
+            &AtomicBool::new(true),
+            &AtomicBool::new(false),
+            || {
+                activated = true;
+                Ok(())
+            },
+        );
+        assert!(result.unwrap_err().contains("cancelled"));
+        assert!(!activated);
+        assert!(!busy.load(Ordering::Acquire));
     }
     #[test]
     fn archive_traversal_is_rejected_before_writing_outside_staging() {

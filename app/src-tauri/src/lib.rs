@@ -1136,6 +1136,11 @@ async fn copy_text(
     window: WebviewWindow,
 ) -> Result<(), String> {
     authorize_window(&window, &["main"])?;
+    let _lifecycle = data.lifecycle.lock().map_err(|error| error.to_string())?;
+    manual_output_allowed(
+        &*data.runtime.lock().map_err(|error| error.to_string())?,
+        &data.shutdown,
+    )?;
     with_insertion_lock(&data.insertion, || {
         copy_to_clipboard(&app, &text)?;
         let mut runtime = data.runtime.lock().map_err(|error| error.to_string())?;
@@ -1152,7 +1157,6 @@ async fn copy_text(
 async fn insert_text(
     app: AppHandle,
     text: String,
-    data: tauri::State<'_, AppData>,
     window: WebviewWindow,
 ) -> Result<InsertionReport, String> {
     authorize_window(&window, &["main", "pill"])?;
@@ -1160,12 +1164,34 @@ async fn insert_text(
     let insertion_text = text.clone();
     let report = async_runtime::spawn_blocking(move || {
         let data = app_handle.state::<AppData>();
-        coordinate_insertion(&app_handle, &data, &insertion_text, true, true)
+        let _lifecycle = data.lifecycle.lock().map_err(|error| error.to_string())?;
+        manual_output_allowed(
+            &*data.runtime.lock().map_err(|error| error.to_string())?,
+            &data.shutdown,
+        )?;
+        let report = coordinate_insertion(&app_handle, &data, &insertion_text, true, true);
+        update_runtime_after_insertion(&app_handle, &data, &insertion_text, &report)?;
+        Ok::<_, String>(report)
     })
     .await
-    .map_err(|error| format!("Insertion task failed: {error}"))?;
-    update_runtime_after_insertion(&app, &data, &text, &report)?;
+    .map_err(|error| format!("Insertion task failed: {error}"))??;
     Ok(report)
+}
+
+fn manual_output_allowed(runtime: &RuntimeState, shutdown: &AtomicBool) -> Result<(), String> {
+    if shutdown.load(Ordering::Acquire) {
+        return Err("VibeVoice is shutting down.".to_string());
+    }
+    if matches!(
+        runtime.voice_state,
+        VoiceState::Preparing | VoiceState::Recording | VoiceState::Processing
+    ) {
+        return Err(
+            "Finish recording and transcription before copying or inserting a saved transcript."
+                .to_string(),
+        );
+    }
+    Ok(())
 }
 
 #[tauri::command]
@@ -1326,6 +1352,7 @@ async fn update_whisper_component(
         let data = app.state::<AppData>();
         let cancel = &data.component_update_cancel;
         let shutdown = &data.shutdown;
+        let mut lease = lease;
         let notify = |progress: whisper_update::Progress| { let _ = app.emit("vibevoice-whisper-update", progress); };
         let result = (|| {
             let root = app.path().app_local_data_dir().map_err(|e| e.to_string())?.join("whisper-components");
@@ -1345,9 +1372,8 @@ async fn update_whisper_component(
             // Recording and settings changes share this lock and reject the
             // active lease. Activation is one atomic settings write; the old
             // engine/custom model is retained and never overwritten.
-            let _lifecycle = data.lifecycle.lock().map_err(|e| e.to_string())?;
+            lease.commit(&data.lifecycle, cancel, shutdown, || {
             let _settings = data.settings.lock().map_err(|e| e.to_string())?;
-            whisper_update::check_cancel(cancel, shutdown)?;
             components_idle(&*data.runtime.lock().map_err(|e| e.to_string())?)?;
             let mut settings = load_settings(&app)?;
             if component == "model" { settings.model_path = updated_path.display().to_string(); }
@@ -1366,6 +1392,7 @@ async fn update_whisper_component(
                 "base.en model is verified and up to date. The verified model is active.".to_string()
             } else {
                 format!("Whisper {} is installed and active. Your previous engine is preserved.", whisper_update::ENGINE_VERSION)
+            })
             })
         })();
         let (stage, message) = match &result { Ok(message) => ("complete", message.clone()), Err(error) => ("failed", error.clone()) };
@@ -3865,6 +3892,40 @@ pub fn run() {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn manual_output_cannot_replace_an_active_voice_session() {
+        let shutdown = AtomicBool::new(false);
+        for voice_state in [
+            VoiceState::Preparing,
+            VoiceState::Recording,
+            VoiceState::Processing,
+        ] {
+            let runtime = RuntimeState {
+                voice_state,
+                preparing_generation: Some(42),
+                ..RuntimeState::default()
+            };
+            assert!(manual_output_allowed(&runtime, &shutdown).is_err());
+            assert_eq!(runtime.preparing_generation, Some(42));
+            assert!(matches!(
+                runtime.voice_state,
+                VoiceState::Preparing | VoiceState::Recording | VoiceState::Processing
+            ));
+        }
+        for voice_state in [
+            VoiceState::Ready,
+            VoiceState::Copied,
+            VoiceState::Inserted,
+            VoiceState::Error,
+        ] {
+            let runtime = RuntimeState {
+                voice_state,
+                ..RuntimeState::default()
+            };
+            assert!(manual_output_allowed(&runtime, &shutdown).is_ok());
+            assert!(manual_output_allowed(&runtime, &AtomicBool::new(true)).is_err());
+        }
+    }
     #[test]
     fn repeated_stop_preserves_processing_and_blocks_another_start() {
         let mut runtime = RuntimeState {

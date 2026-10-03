@@ -102,7 +102,7 @@ export function PillWindow({
               <ActionIcon size={16} className={state.voice_state === "Preparing" || state.voice_state === "Processing" ? "spin" : ""} />
               <span>{state.voice_state === "Recording" ? "Stop" : state.voice_state === "Processing" ? "Cancel" : state.voice_state === "Error" ? "Retry" : "Record"}</span>
             </button>
-            <button type="button" className="secondary-action" disabled={!state.last_transcript} onClick={onPaste}>
+            <button type="button" className="secondary-action" disabled={!state.last_transcript || ["Preparing", "Recording", "Processing"].includes(state.voice_state)} onClick={onPaste}>
               <RotateCcw size={15} />
               <span>Paste</span>
             </button>
