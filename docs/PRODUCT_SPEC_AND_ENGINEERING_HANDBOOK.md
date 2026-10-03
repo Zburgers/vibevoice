@@ -1625,11 +1625,11 @@ No formal rollback runbook is present. Practical rollback is manual installation
 
 ### Deployment drift
 
-- Authoritative branch: reconciled `v0.2.7` line.
-- Latest documented release: `v0.2.7`.
-- Exact release source SHA: `6f198176f00d0b3899ad798aa2b21fb0d315e29a`.
+- Authoritative branch: `master`, containing the owner-merged 0.2.8 release work from PR #77 (`02a1c58f457a1df701ad94c5afd2935096723cea`).
+- Current release documentation: [0.2.8](releases/v0.2.8.md). The protected `v0.2.8` tag identifies the exact publication source after documentation finalization; the GitHub release and workflow run identify the published assets.
+- Historical 0.2.7 source SHA: `6f198176f00d0b3899ad798aa2b21fb0d315e29a`.
 - PR #35 and its successors are superseded by the shipped 0.2.7 work packets.
-- Current master head contains post-release documentation workflow cleanup after the release lineage.
+- Version-tag publication is separate from merge-to-master CI. A successful merge does not update the latest GitHub release until the protected tag workflow completes.
 
 ---
 
