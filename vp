@@ -1,11 +1,23 @@
 #!/usr/bin/env bash
 set -euo pipefail
+umask 077
 
 WHISPER="$HOME/tools/whisper.cpp/build/bin/whisper-cli"
 MODEL="$HOME/tools/whisper.cpp/models/ggml-base.en.bin"
 
-TMP_DIR="/tmp/voice-prompt"
-mkdir -p "$TMP_DIR"
+TMP_DIR="$(mktemp -d "${TMPDIR:-/tmp}/voice-prompt.XXXXXXXX")"
+REC_PID=""
+cleanup() {
+  if [[ -n "$REC_PID" ]]; then
+    kill "$REC_PID" 2>/dev/null || true
+    wait "$REC_PID" 2>/dev/null || true
+  fi
+  rm -rf -- "$TMP_DIR"
+}
+trap cleanup EXIT
+trap 'exit 130' INT
+trap 'exit 143' TERM
+trap 'exit 129' HUP
 
 AUDIO="$TMP_DIR/prompt.wav"
 OUT="$TMP_DIR/prompt"
@@ -22,6 +34,7 @@ read -r
 
 kill "$REC_PID" 2>/dev/null || true
 wait "$REC_PID" 2>/dev/null || true
+REC_PID=""
 
 echo "Transcribing..."
 
@@ -33,7 +46,7 @@ echo "Transcribing..."
   -nt \
   -np >/dev/null 2>&1
 
-TEXT="$(cat "$OUT.txt" | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')"
+TEXT="$(sed 's/^[[:space:]]*//;s/[[:space:]]*$//' "$OUT.txt")"
 
 echo
 echo "$TEXT"

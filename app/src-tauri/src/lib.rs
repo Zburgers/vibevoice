@@ -1232,10 +1232,7 @@ fn export_history(
         extension
     );
     let path = config_dir(&app)?.join("exports").join(filename);
-    if let Some(parent) = path.parent() {
-        fs::create_dir_all(parent).map_err(|error| error.to_string())?;
-    }
-    fs::write(&path, content).map_err(|error| error.to_string())?;
+    atomic_write(&path, content.as_bytes())?;
     Ok(path.display().to_string())
 }
 
@@ -1703,8 +1700,37 @@ fn config_dir(app: &AppHandle) -> Result<PathBuf, String> {
             .unwrap_or_else(|| PathBuf::from("."))
             .join("vibevoice")
     });
-    fs::create_dir_all(&dir).map_err(|error| error.to_string())?;
+    prepare_private_directory(&dir)?;
     Ok(dir)
+}
+
+fn prepare_private_directory(path: &Path) -> Result<(), String> {
+    let mut builder = fs::DirBuilder::new();
+    builder.recursive(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::DirBuilderExt;
+        builder.mode(0o700);
+    }
+    builder.create(path).map_err(|error| error.to_string())?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
+        // Operate on the opened directory, never a symlink target. The
+        // per-user config/cache parent supplies the namespace boundary.
+        let directory = fs::OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_NOFOLLOW | libc::O_DIRECTORY)
+            .open(path)
+            .map_err(|error| format!("Could not open private directory: {error}"))?;
+        if directory.metadata().map_err(|e| e.to_string())?.uid() != unsafe { libc::geteuid() } {
+            return Err("Private directory belongs to another account.".to_string());
+        }
+        directory
+            .set_permissions(fs::Permissions::from_mode(0o700))
+            .map_err(|error| error.to_string())?;
+    }
+    Ok(())
 }
 
 fn find_repo_file(app: &AppHandle, relative: &str) -> Option<PathBuf> {
@@ -1765,7 +1791,20 @@ fn preserve_corrupt_history(path: &Path) -> Result<PathBuf, String> {
         Utc::now().format("%Y%m%d-%H%M%S%.3f"),
         Uuid::new_v4()
     ));
-    fs::copy(path, &preserved)
+    let mut options = fs::OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    let result = (|| -> io::Result<()> {
+        let mut source = fs::File::open(path)?;
+        let mut destination = options.open(&preserved)?;
+        io::copy(&mut source, &mut destination)?;
+        destination.sync_all()
+    })();
+    result
         .map(|_| preserved)
         .map_err(|error| format!("Could not preserve corrupt history: {error}"))
 }
@@ -1834,13 +1873,23 @@ fn read_history_with_recovery(path: &Path) -> Result<Vec<HistoryItem>, String> {
 
 fn atomic_write(path: &Path, content: &[u8]) -> Result<(), String> {
     if let Some(parent) = path.parent() {
-        fs::create_dir_all(parent).map_err(|error| error.to_string())?;
+        prepare_private_directory(parent)?;
+    }
+    let mut options = fs::OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
     }
     AtomicFile::new(path, AllowOverwrite)
-        .write(|file| {
-            file.write_all(content)?;
-            file.sync_all()
-        })
+        .write_with_options(
+            |file| {
+                file.write_all(content)?;
+                file.sync_all()
+            },
+            options,
+        )
         .map_err(|error| error.to_string())
 }
 
@@ -2298,9 +2347,6 @@ fn candidate_engine_roots() -> Vec<PathBuf> {
                 .join("engines"),
         );
     }
-    if let Ok(current) = std::env::current_dir() {
-        roots.push(current);
-    }
     roots
 }
 
@@ -2362,30 +2408,31 @@ fn executable_name(base: &str) -> String {
     }
 }
 
-fn temp_workspace() -> PathBuf {
-    std::env::temp_dir().join("vibevoice")
+fn temp_workspace() -> Result<PathBuf, String> {
+    #[cfg(unix)]
+    {
+        // Cache roots are per account; a shared /tmp name lets one account
+        // prevent every other account from recording.
+        dirs::cache_dir()
+            .filter(|root| root.is_absolute())
+            .map(|root| root.join("vibevoice").join("recordings"))
+            .ok_or_else(|| "A per-user cache directory is required for recording.".to_string())
+    }
+    #[cfg(not(unix))]
+    Ok(std::env::temp_dir().join("vibevoice"))
 }
 
 /// App-private temp location with restrictive Unix permissions (0700).
 /// Failures carry actionable context; callers at startup log and continue so
 /// cleanup problems never block recovery.
 fn prepare_temp_workspace() -> Result<PathBuf, String> {
-    let path = temp_workspace();
-    fs::create_dir_all(&path).map_err(|error| {
+    let path = temp_workspace()?;
+    prepare_private_directory(&path).map_err(|error| {
         format!(
             "Could not create temp workspace {}: {error}",
             path.display()
         )
     })?;
-    #[cfg(unix)]
-    {
-        fs::set_permissions(&path, fs::Permissions::from_mode(0o700)).map_err(|error| {
-            format!(
-                "Could not restrict temp workspace {}: {error}",
-                path.display()
-            )
-        })?;
-    }
     Ok(path)
 }
 
@@ -2556,6 +2603,21 @@ fn cleanup_recording_outputs_in_with_pid(directory: &Path, current_pid: u32) -> 
 }
 
 fn cleanup_stale_recording_artifacts() -> Result<(), String> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        let legacy = std::env::temp_dir().join("vibevoice");
+        // Reclaim old crash artifacts only inside an already private,
+        // self-owned directory. Never chmod or follow a foreign path.
+        if let Ok(metadata) = fs::symlink_metadata(&legacy) {
+            if metadata.is_dir()
+                && metadata.uid() == unsafe { libc::geteuid() }
+                && metadata.mode() & 0o777 == 0o700
+            {
+                cleanup_recording_outputs_in(&legacy)?;
+            }
+        }
+    }
     cleanup_recording_outputs_in(&prepare_temp_workspace()?)
 }
 
@@ -3969,6 +4031,102 @@ mod tests {
         engine.activate();
     }
 
+    #[test]
+    fn automatic_engine_discovery_ignores_launch_directory() {
+        const CHILD: &str = "VIBEVOICE_TEST_UNTRUSTED_CWD";
+        if std::env::var_os(CHILD).is_some() {
+            let current = std::env::current_dir().unwrap();
+            assert!(!candidate_engine_roots().contains(&current));
+            if let Ok(paths) = resolve_engine_paths(&Settings::default()) {
+                assert!(!paths.whisper_binary.starts_with(&current));
+            }
+            return;
+        }
+        let root = std::env::temp_dir().join(format!("vv-untrusted-{}", Uuid::new_v4()));
+        fs::create_dir_all(root.join("models")).unwrap();
+        fs::write(
+            root.join(executable_name("whisper-cli")),
+            b"planted executable",
+        )
+        .unwrap();
+        fs::write(root.join("models").join(MODEL_FILE_NAME), b"planted model").unwrap();
+        let status = Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "tests::automatic_engine_discovery_ignores_launch_directory",
+            ])
+            .current_dir(&root)
+            .env(CHILD, "1")
+            .status()
+            .unwrap();
+        fs::remove_dir_all(root).unwrap();
+        assert!(status.success());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn private_state_writes_restrict_existing_files_and_recovery_copies() {
+        let root = std::env::temp_dir().join(format!("vv-private-{}", Uuid::new_v4()));
+        fs::create_dir_all(&root).unwrap();
+        fs::set_permissions(&root, fs::Permissions::from_mode(0o755)).unwrap();
+        let path = root.join("history.json");
+        fs::write(&path, b"old private text").unwrap();
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o644)).unwrap();
+        let history = vec![history_item("private transcript", Utc::now())];
+        write_history(&path, &history).unwrap();
+        assert_eq!(
+            fs::metadata(&root).unwrap().permissions().mode() & 0o777,
+            0o700
+        );
+        let corrupt = preserve_corrupt_history(&path).unwrap();
+        for file in [&path, &history_backup_path(&path), &corrupt] {
+            assert_eq!(
+                fs::metadata(file).unwrap().permissions().mode() & 0o777,
+                0o600
+            );
+        }
+        for (extension, content) in [
+            ("json", serde_json::to_string(&history).unwrap()),
+            ("md", history_as_markdown(&history)),
+        ] {
+            let export = root.join("exports").join(format!("transcript.{extension}"));
+            atomic_write(&export, content.as_bytes()).unwrap();
+            assert_eq!(fs::read_to_string(&export).unwrap(), content);
+            assert_eq!(
+                fs::metadata(&export).unwrap().permissions().mode() & 0o777,
+                0o600
+            );
+            assert_eq!(
+                fs::metadata(export.parent().unwrap())
+                    .unwrap()
+                    .permissions()
+                    .mode()
+                    & 0o777,
+                0o700
+            );
+        }
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn private_directory_rejects_symlinks_without_changing_target() {
+        let root = std::env::temp_dir().join(format!("vv-symlink-{}", Uuid::new_v4()));
+        let target = root.join("target");
+        fs::create_dir_all(&target).unwrap();
+        fs::set_permissions(&target, fs::Permissions::from_mode(0o755)).unwrap();
+        let link = root.join("link");
+        std::os::unix::fs::symlink(&target, &link).unwrap();
+        assert!(prepare_private_directory(&link).is_err());
+        assert_eq!(
+            fs::metadata(&target).unwrap().permissions().mode() & 0o777,
+            0o755
+        );
+        assert!(temp_workspace()
+            .unwrap()
+            .starts_with(dirs::cache_dir().unwrap()));
+        fs::remove_dir_all(root).unwrap();
+    }
     #[test]
     fn dictionary_cleanup_toggle_and_disabled_rules_are_honored() {
         let rules = vec![
