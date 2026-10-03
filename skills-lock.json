@@ -1,0 +1,11 @@
+{
+  "version": 1,
+  "skills": {
+    "rust-skills": {
+      "source": "leonardomso/rust-skills",
+      "sourceType": "github",
+      "skillPath": "SKILL.md",
+      "computedHash": "1223fe91b1130fb7a2276bfdf5d84d9cb71f8d404b599e7342eda1d4799c14ed"
+    }
+  }
+}

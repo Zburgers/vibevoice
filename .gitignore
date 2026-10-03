@@ -2,5 +2,7 @@ app/node_modules/
 app/dist/
 app/src-tauri/gen/
 app/src-tauri/target/
-.agents/
-skills-lock.json
+.agents/*
+!.agents/skills/
+.agents/skills/*
+!.agents/skills/rust-skills/
