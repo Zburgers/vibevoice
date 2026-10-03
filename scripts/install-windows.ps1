@@ -5,8 +5,8 @@ param(
 
 $ErrorActionPreference = "Stop"
 $ModelFile = "ggml-$ModelName.bin"
-$WhisperRef = "v1.9.3"
-$WhisperCommit = "7246b7311e089fe092c4abe7cfad5d0921f8be00"
+$WhisperRef = "v1.9.4"
+$WhisperCommit = "927cfce34f31707e17f2bff35c349632fb9e2c3a"
 $ModelRevision = "5359861c739e955e79d9a303bcbc70fb988958b1"
 $DefaultModelSha256 = "a03779c86df3323075f5e796cb2ce5029f00ec8869eee3fdfb897afe36c6d002"
 $ModelSha256 = if ($env:VIBEVOICE_MODEL_SHA256) { $env:VIBEVOICE_MODEL_SHA256 } else { $DefaultModelSha256 }

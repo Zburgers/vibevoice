@@ -22,6 +22,7 @@ export type Settings = {
   whisper_binary_path: string;
   model_path: string;
   transcription_timeout_seconds: number;
+  transcription_threads: number;
   hotkey: string;
   recording_mode: "toggle";
   auto_paste: boolean;
@@ -80,6 +81,7 @@ export type DictionaryRule = {
 };
 
 export type AppState = {
+  whisper_update?: WhisperCatalog;
   app_version: string;
   voice_state: VoiceState;
   settings: Settings;
@@ -91,6 +93,31 @@ export type AppState = {
   mic_level: number;
   mic_bands: number[];
   recording_started_at: string | null;
+  last_transcription_metrics?: {
+    audio_ms: number;
+    transcription_ms: number;
+    session_ms: number;
+    threads: number;
+    cpu_time_ms: number | null;
+    average_cpu_percent: number | null;
+    peak_memory_mb: number | null;
+  } | null;
+};
+
+export type WhisperCatalog = {
+  engine_version: string;
+  engine_supported: boolean;
+  model_name: string;
+  model_bytes: number;
+  busy: boolean;
+};
+
+export type WhisperProgress = {
+  component: "engine" | "model";
+  stage: string;
+  downloaded_bytes: number;
+  total_bytes: number;
+  message: string;
 };
 
 export type MeterPayload = {
@@ -113,6 +140,7 @@ export const fallbackState: AppState = {
     whisper_binary_path: "auto",
     model_path: "auto",
     transcription_timeout_seconds: 900,
+    transcription_threads: 0,
     hotkey: "Ctrl+Alt+Space",
     recording_mode: "toggle",
     auto_paste: true,

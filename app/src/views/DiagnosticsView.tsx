@@ -1,4 +1,5 @@
 import { Copy, Download, ExternalLink, RefreshCw, Wrench } from "lucide-react";
+import type { ReactNode } from "react";
 import type { AppState, Tone, UpdateStatus } from "../types";
 
 export function DiagnosticsView({
@@ -13,8 +14,10 @@ export function DiagnosticsView({
   onSetup,
   onCopyCommand,
   onCopyReport,
+  componentManager,
 }: {
   state: AppState;
+  componentManager?: ReactNode;
   updateStatus: UpdateStatus;
   setupMessage: string;
   commandStatus: string;
@@ -37,6 +40,16 @@ export function DiagnosticsView({
     { label: "Resolved binary", value: state.diagnostics.whisper_path || "Not resolved", tone: state.diagnostics.whisper_path ? "good" : "warn", mono: true },
     { label: "Resolved model", value: state.diagnostics.model_path || "Not resolved", tone: state.diagnostics.model_path ? "good" : "warn", mono: true },
   ];
+  const metrics = state.last_transcription_metrics;
+  if (metrics) {
+    rows.push(
+      { label: "Last audio length", value: `${(metrics.audio_ms / 1000).toFixed(2)} s`, tone: "neutral" },
+      { label: "Last transcription time", value: `${(metrics.transcription_ms / 1000).toFixed(2)} s (${metrics.threads} threads)`, tone: "neutral" },
+      { label: "Whisper average CPU", value: metrics.average_cpu_percent == null ? "Unavailable on this platform" : `${metrics.average_cpu_percent.toFixed(1)}%`, tone: "neutral" },
+      { label: "Whisper CPU time", value: metrics.cpu_time_ms == null ? "Unavailable on this platform" : `${(metrics.cpu_time_ms / 1000).toFixed(2)} CPU-seconds`, tone: "neutral" },
+      { label: "Whisper peak memory", value: metrics.peak_memory_mb == null ? "Unavailable on this platform" : `${metrics.peak_memory_mb.toFixed(1)} MB`, tone: "neutral" },
+    );
+  }
 
   return (
     <section className="view diagnostics-view">
@@ -57,6 +70,7 @@ export function DiagnosticsView({
         </div>
       </div>
 
+      {componentManager}
       <div className="diagnostics-grid">
         <div className="diag-list">
           {rows.map((row) => (

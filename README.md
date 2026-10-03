@@ -61,6 +61,10 @@ hotkey or pill -> microphone capture -> local WAV -> whisper-cli -> cleanup -> c
 
 Settings default to `auto` for both the Whisper binary and model path. The backend resolves explicit paths, environment variables, app-data engine installs, and legacy `~/tools/whisper.cpp` installs.
 
+From 0.2.8, Settings and Diagnostics also include **Whisper components**: update
+the recommended Windows engine or verify/repair the default English model, with
+verified downloads, progress, cancellation and preserved previous engine files.
+
 ## Privacy
 
 VibeVoice is local-first. Audio is recorded to a temporary local WAV, transcribed locally, and removed after processing. Transcript history is opt-in and stored as atomically replaced local JSON with a recovery backup when enabled.
