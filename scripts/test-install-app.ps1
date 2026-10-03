@@ -20,6 +20,7 @@ function npm {
 function Start-Process {
   param($FilePath, $ArgumentList, [switch]$Wait, [switch]$PassThru)
   $global:VibeVoiceInstallerTest.launched++
+  $global:VibeVoiceInstallerTest.launchedPath = $FilePath
   $global:VibeVoiceInstallerTest.arguments = $ArgumentList
   [pscustomobject]@{ ExitCode = $global:VibeVoiceInstallerTest.installerExit }
 }
@@ -33,16 +34,18 @@ try {
     @{ fail=0; fresh=$true; ext='msi'; exit=0; throws=$false; launches=1 },
     @{ fail=0; fresh=$true; ext='exe'; exit=3010; throws=$false; launches=1 },
     @{ fail=0; fresh=$true; ext='exe'; exit=1603; throws=$true; launches=1 }
+    @{ fail=0; fresh=$true; ext='exe'; exit=0; throws=$false; launches=1; future=$true }
   )) {
     Get-ChildItem -LiteralPath $bundle | Remove-Item -Force
     Set-Content -LiteralPath (Join-Path $bundle 'old.msi') -Value 'stale'
-    (Get-Item -LiteralPath (Join-Path $bundle 'old.msi')).LastWriteTime = (Get-Date).AddDays(-1)
+    (Get-Item -LiteralPath (Join-Path $bundle 'old.msi')).LastWriteTime = if ($case.future) { (Get-Date).AddDays(1) } else { (Get-Date).AddDays(-1) }
     $global:VibeVoiceInstallerTest = @{ calls=0; failAt=$case.fail; fresh=$case.fresh;
       extension=$case.ext; installerExit=$case.exit; launched=0; bundle=$bundle }
     $threw=$false
     try { & (Join-Path $fixture 'scripts/install-app.ps1') } catch { $threw=$true; $errorText=$_.Exception.Message }
     if ($threw -ne $case.throws -or $global:VibeVoiceInstallerTest.launched -ne $case.launches) { throw "Unexpected installer result: $($case | ConvertTo-Json -Compress): $errorText" }
     if ($case.ext -eq 'msi' -and $global:VibeVoiceInstallerTest.launched -eq 1 -and $global:VibeVoiceInstallerTest.arguments[1] -notmatch '^".*"$') { throw 'MSI argument was not quoted.' }
+    if ($case.future -and $global:VibeVoiceInstallerTest.launchedPath -ne (Join-Path $bundle 'new.exe')) { throw 'Future-dated stale MSI was installed instead of the new EXE.' }
   }
   Write-Output 'Installer failure, stale artifact, success and exit-code checks passed.'
 } finally {

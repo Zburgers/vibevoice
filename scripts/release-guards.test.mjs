@@ -25,11 +25,13 @@ test('actual workflow guard rejects invalid tags and every version mismatch', ()
     for (const [tag, mismatch, success] of [
       ['v0.2.8', '', true], ['v', '', false], ['v0.2.9', '', false],
       ['v0.2.8', 'cargo', false], ['v0.2.8', 'tauri', false], ['v0.2.8', 'lock', false],
+      ['v0.2.8-rc.1', 'prerelease', false],
     ]) {
-      writeFileSync(join(root, 'package.json'), JSON.stringify({ version: '0.2.8' }));
-      writeFileSync(join(root, 'src-tauri/Cargo.toml'), `version = "${mismatch === 'cargo' ? '0.2.7' : '0.2.8'}"\n`);
-      writeFileSync(join(root, 'src-tauri/tauri.conf.json'), JSON.stringify({ version: mismatch === 'tauri' ? '0.2.7' : '0.2.8' }));
-      writeFileSync(join(root, 'src-tauri/Cargo.lock'), `name = "vibevoice"\nversion = "${mismatch === 'lock' ? '0.2.7' : '0.2.8'}"\n`);
+      const version = mismatch === 'prerelease' ? '0.2.8-rc.1' : '0.2.8';
+      writeFileSync(join(root, 'package.json'), JSON.stringify({ version }));
+      writeFileSync(join(root, 'src-tauri/Cargo.toml'), `version = "${mismatch === 'cargo' ? '0.2.7' : version}"\n`);
+      writeFileSync(join(root, 'src-tauri/tauri.conf.json'), JSON.stringify({ version: mismatch === 'tauri' ? '0.2.7' : version }));
+      writeFileSync(join(root, 'src-tauri/Cargo.lock'), `name = "vibevoice"\nversion = "${mismatch === 'lock' ? '0.2.7' : version}"\n`);
       const result = spawnSync('bash', ['-c', script], { cwd: root, env: { ...process.env, GITHUB_REF: `refs/tags/${tag}`, GITHUB_REF_NAME: tag }, encoding: 'utf8' });
       assert.equal(result.status === 0, success, `${tag}/${mismatch}: ${result.error ?? result.stderr}`);
     }

@@ -46,7 +46,7 @@ echo "Transcribing..."
   -nt \
   -np >/dev/null 2>&1
 
-TEXT="$(cat "$OUT.txt" | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')"
+TEXT="$(sed 's/^[[:space:]]*//;s/[[:space:]]*$//' "$OUT.txt")"
 
 echo
 echo "$TEXT"

@@ -12,17 +12,30 @@ if (Test-Path "package-lock.json") {
 }
 npm run build
 if ($LASTEXITCODE -ne 0) { throw "Frontend build failed with exit code $LASTEXITCODE." }
+$BundleRoot = Join-Path $SourceDir "app\src-tauri\target\release\bundle"
+function Get-BundleFingerprint($File) {
+  return '{0}:{1}:{2}' -f $File.LastWriteTimeUtc.Ticks, $File.Length, (Get-FileHash -LiteralPath $File.FullName -Algorithm SHA256).Hash
+}
+$PriorBundles = @{}
+Get-ChildItem -Path $BundleRoot -Recurse -File -ErrorAction SilentlyContinue |
+  Where-Object { $_.Extension -in @('.msi', '.exe') } |
+  ForEach-Object { $PriorBundles[$_.FullName] = Get-BundleFingerprint $_ }
+function Test-CurrentBundle($File) {
+  return $File.LastWriteTime -ge $BuildStarted -and (
+    -not $PriorBundles.ContainsKey($File.FullName) -or
+    $PriorBundles[$File.FullName] -ne (Get-BundleFingerprint $File)
+  )
+}
 $BuildStarted = Get-Date
 npm run tauri build -- --bundles msi,nsis
 if ($LASTEXITCODE -ne 0) { throw "Installer build failed with exit code $LASTEXITCODE." }
 
-$BundleRoot = Join-Path $SourceDir "app\src-tauri\target\release\bundle"
 $Msi = Get-ChildItem -Path $BundleRoot -Recurse -Filter "*.msi" -ErrorAction SilentlyContinue |
-  Where-Object { $_.LastWriteTime -ge $BuildStarted } |
+  Where-Object { Test-CurrentBundle $_ } |
   Sort-Object LastWriteTime |
   Select-Object -Last 1
 $Setup = Get-ChildItem -Path $BundleRoot -Recurse -Filter "*.exe" -ErrorAction SilentlyContinue |
-  Where-Object { $_.LastWriteTime -ge $BuildStarted } |
+  Where-Object { Test-CurrentBundle $_ } |
   Sort-Object LastWriteTime |
   Select-Object -Last 1
 
