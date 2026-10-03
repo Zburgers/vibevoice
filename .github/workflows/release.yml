@@ -164,6 +164,11 @@ jobs:
           node --test scripts/finalize-appstream-release.test.mjs
           node scripts/finalize-appstream-release.mjs "$GITHUB_REF_NAME" "$(date -u +%F)"
 
+      - name: Load reviewed release notes and verify all version declarations
+        id: release-notes
+        shell: bash
+        run: node scripts/prepare-release-notes.mjs "$GITHUB_REF_NAME"
+
       - name: Build and publish release assets
         uses: tauri-apps/tauri-action@84b9d35b5fc46c1e45415bdb6144030364f7ebc5 # v0
         env:
@@ -177,7 +182,7 @@ jobs:
           includeUpdaterJson: true
           tagName: ${{ github.ref_name }}
           releaseName: ${{ format('VibeVoice {0}', github.ref_name) }}
-          releaseBody: 'VibeVoice desktop release built from the tested master commit named by this tag.'
-          generateReleaseNotes: true
+          releaseBody: ${{ steps.release-notes.outputs.body }}
+          generateReleaseNotes: false
           releaseDraft: false
           prerelease: false
