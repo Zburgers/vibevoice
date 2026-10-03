@@ -2,6 +2,65 @@ import { useEffect, useRef, useState } from "react";
 import { Activity, BookOpen, Clipboard, ExternalLink, History, Info, Keyboard, Pin, Wrench, Zap } from "lucide-react";
 import type { AppState, Settings } from "../types";
 import { Toggle } from "../ui";
+import { invoke, isTauri } from "@tauri-apps/api/core";
+
+function EnginePathField({ label, value, model, onSave }: {
+  label: string; value: string; model: boolean;
+  onSave: (value: string) => Promise<boolean>;
+}) {
+  const [custom, setCustom] = useState(value !== "auto");
+  const [draft, setDraft] = useState(value === "auto" ? "" : value);
+  const [busy, setBusy] = useState(false);
+  const [error, setError] = useState("");
+  useEffect(() => {
+    setCustom(value !== "auto");
+    setDraft(value === "auto" ? "" : value);
+  }, [value]);
+  async function save(path: string) {
+    setBusy(true);
+    setError("");
+    try {
+      if (!(await onSave(path))) setError("Path was not saved. Check the settings status below for details.");
+    } finally { setBusy(false); }
+  }
+  async function browse() {
+    setBusy(true);
+    setError("");
+    try {
+      if (!isTauri()) throw new Error("File browsing is available in the desktop app.");
+      const path = await invoke<string | null>("pick_engine_file", { model });
+      if (path) {
+        setDraft(path);
+        if (!(await onSave(path))) setError("Path was not saved. Check the settings status below for details.");
+      }
+    } catch (error) { setError(String(error)); }
+    finally { setBusy(false); }
+  }
+  return <div className="field engine-path-field">
+    <label htmlFor={`${model ? "model" : "whisper"}-mode`}>{label}</label>
+    <select id={`${model ? "model" : "whisper"}-mode`} value={custom ? "custom" : "auto"} disabled={busy}
+      onChange={(event) => {
+        setError("");
+        if (event.target.value === "custom") setCustom(true);
+        else void save("auto").then(() => { if (value === "auto") { setCustom(false); setDraft(""); } });
+      }}>
+      <option value="auto">Automatic discovery</option>
+      <option value="custom">Custom file</option>
+    </select>
+    {custom && <>
+      <input aria-label={`${label} custom file`} value={draft} disabled={busy}
+        placeholder={model ? "Full path to a GGML model (.bin)" : "Full path to whisper-cli"}
+        onChange={(event) => { setDraft(event.target.value); setError(""); }} />
+      <div className="engine-path-actions">
+        <button type="button" className="secondary-action" disabled={busy} onClick={() => void browse()}>Browse…</button>
+        <button type="button" className="secondary-action" disabled={busy || !draft.trim() || draft === value}
+          onClick={() => void save(draft)}>Save path</button>
+      </div>
+    </>}
+    <small>{custom ? "The saved path changes only after validation succeeds." : "Find the installed Whisper engine automatically."}</small>
+    {error && <small role="alert">{error}</small>}
+  </div>;
+}
 
 /** Converts a KeyboardEvent into a canonical hotkey string like "Ctrl+Alt+Space" */
 function keyEventToHotkey(event: KeyboardEvent): string {
@@ -17,10 +76,7 @@ function keyEventToHotkey(event: KeyboardEvent): string {
     return "";
   }
   // Normalize common keys
-  const normalized =
-    key === " " ? "Space"
-    : key.length === 1 ? key.toUpperCase()
-    : key;
+  const normalized = event.code.replace(/^(Key|Digit)/, "") || (key === " " ? "Space" : key.length === 1 ? key.toUpperCase() : key);
   parts.push(normalized);
   return parts.join("+");
 }
@@ -35,6 +91,13 @@ function HotkeyField({
   const [recording, setRecording] = useState(false);
   const [preview, setPreview] = useState("");
   const buttonRef = useRef<HTMLButtonElement>(null);
+  const capturedRef = useRef<{ code: string; hotkey: string } | null>(null);
+  const [captureError, setCaptureError] = useState("");
+
+  useEffect(() => {
+    if (!recording) return;
+    return () => { if (isTauri()) void invoke("set_hotkey_capture", { capturing: false }).catch(() => undefined); };
+  }, [recording]);
 
   useEffect(() => {
     if (!recording) return;
@@ -42,17 +105,25 @@ function HotkeyField({
     function onKeyDown(event: KeyboardEvent) {
       event.preventDefault();
       event.stopPropagation();
+      if (event.key === "Escape") {
+        setRecording(false);
+        setPreview("");
+        return;
+      }
+      if (event.repeat) return;
       const hotkey = keyEventToHotkey(event);
       if (hotkey) {
+        capturedRef.current = { code: event.code || event.key, hotkey };
         setPreview(hotkey);
       }
     }
 
     function onKeyUp(event: KeyboardEvent) {
       event.preventDefault();
-      const hotkey = keyEventToHotkey(event);
-      if (hotkey) {
-        onChange(hotkey);
+      event.stopPropagation();
+      const captured = capturedRef.current;
+      if (captured && captured.code === (event.code || event.key)) {
+        onChange(captured.hotkey);
         setRecording(false);
         setPreview("");
         buttonRef.current?.blur();
@@ -81,16 +152,18 @@ function HotkeyField({
       setPreview("");
     }
     window.addEventListener("keydown", onEscape, true);
+    window.addEventListener("blur", onBlur);
     buttonRef.current?.addEventListener("blur", onBlur);
     const btn = buttonRef.current;
     return () => {
       window.removeEventListener("keydown", onEscape, true);
+      window.removeEventListener("blur", onBlur);
       btn?.removeEventListener("blur", onBlur);
     };
   }, [recording]);
 
   return (
-    <label className="field">
+    <div className="field">
       <span>Global Hotkey</span>
       <div className="hotkey-field">
         <span className="hotkey-display">
@@ -100,7 +173,13 @@ function HotkeyField({
           ref={buttonRef}
           type="button"
           className={`hotkey-record-btn ${recording ? "is-recording" : ""}`}
-          onClick={() => {
+          onClick={async () => {
+            setCaptureError("");
+            if (!recording && isTauri()) {
+              try { await invoke("set_hotkey_capture", { capturing: true }); }
+              catch (error) { setCaptureError(String(error)); return; }
+            }
+            capturedRef.current = null;
             setRecording((r) => !r);
             setPreview("");
           }}
@@ -110,7 +189,8 @@ function HotkeyField({
           <span>{recording ? "Cancel" : "Record"}</span>
         </button>
       </div>
-    </label>
+      {captureError && <small role="alert">{captureError}</small>}
+    </div>
   );
 }
 
@@ -120,45 +200,15 @@ export function SettingsView({
   onSetup,
   onOpenReleasePage,
   onOpenDiagnostics,
+  status = "",
 }: {
   state: AppState;
-  onUpdate: (patch: Partial<Settings>) => void;
+  onUpdate: (patch: Partial<Settings>) => Promise<boolean>;
   onSetup: () => void;
   onOpenReleasePage: () => void;
   onOpenDiagnostics: () => void;
+  status?: string;
 }) {
-  const [whisperPath, setWhisperPath] = useState(state.settings.whisper_binary_path);
-  const [modelPath, setModelPath] = useState(state.settings.model_path);
-  const updateRef = useRef(onUpdate);
-
-  useEffect(() => {
-    updateRef.current = onUpdate;
-  }, [onUpdate]);
-
-  useEffect(() => {
-    setWhisperPath(state.settings.whisper_binary_path);
-  }, [state.settings.whisper_binary_path]);
-
-  useEffect(() => {
-    setModelPath(state.settings.model_path);
-  }, [state.settings.model_path]);
-
-  useEffect(() => {
-    if (whisperPath === state.settings.whisper_binary_path) return;
-    const timer = window.setTimeout(() => {
-      updateRef.current({ whisper_binary_path: whisperPath });
-    }, 500);
-    return () => window.clearTimeout(timer);
-  }, [state.settings.whisper_binary_path, whisperPath]);
-
-  useEffect(() => {
-    if (modelPath === state.settings.model_path) return;
-    const timer = window.setTimeout(() => {
-      updateRef.current({ model_path: modelPath });
-    }, 500);
-    return () => window.clearTimeout(timer);
-  }, [modelPath, state.settings.model_path]);
-
   return (
     <section className="view settings-view">
       <div className="view-head">
@@ -180,20 +230,10 @@ export function SettingsView({
       </div>
 
       <div className="settings-grid">
-        <label className="field">
-          <span>Whisper binary path</span>
-          <input
-            value={whisperPath}
-            onChange={(e) => setWhisperPath(e.target.value)}
-          />
-        </label>
-        <label className="field">
-          <span>Model path</span>
-          <input
-            value={modelPath}
-            onChange={(e) => setModelPath(e.target.value)}
-          />
-        </label>
+        <EnginePathField label="Whisper binary path" value={state.settings.whisper_binary_path} model={false}
+          onSave={(whisper_binary_path) => onUpdate({ whisper_binary_path })} />
+        <EnginePathField label="Model path" value={state.settings.model_path} model={true}
+          onSave={(model_path) => onUpdate({ model_path })} />
         <HotkeyField
           value={state.settings.hotkey}
           onChange={(hotkey) => onUpdate({ hotkey })}
@@ -252,6 +292,7 @@ export function SettingsView({
           <strong>Open</strong>
         </button>
       </div>
+      {status && status !== "Idle" && <p className="settings-save-status" role="status">{status}</p>}
     </section>
   );
 }
