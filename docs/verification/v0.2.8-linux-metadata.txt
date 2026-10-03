@@ -31,4 +31,4 @@ All five installed PNG signatures and dimensions were checked:
 
 AppImage metadata mapping was inspected and parsed by Tauri; no AppImage built.
 Fedora graphical installation/icon display was not tested.
-git diff --check passed. No release, tag, or publication performed. PR preparation is separate.
+git diff --check passed. No release, tag, or publication performed. PR preparation is separate.Review fix: three release-finalizer tests passed. Tagged Linux release build now stamps stable status and actual UTC packaging date before Tauri bundling; development source metadata remains a draft.
