@@ -448,18 +448,21 @@ The replacement function uses byte slicing based on a lowercased string. Unicode
 
 ### Current behavior
 
-1. When `clipboard_fallback` is enabled, the final transcript is written through Tauri’s clipboard manager.
-2. When `auto_paste` is enabled and copy succeeded, a platform-specific paste helper runs.
+1. Auto-paste inspects the original clipboard's formats/ownership and stages the transcript temporarily, independently of `clipboard_fallback`. Rich, mixed or unsupported formats fail before mutation. Supported plain text, image or empty contents are restored after the paste attempt.
+2. Without auto-paste, `clipboard_fallback` requests an intentional clipboard-only copy. With both settings off, the transcript remains available in the app/history.
 3. Runtime state becomes:
    - `Inserted` when paste succeeds;
-   - `Copied` when copy succeeds but paste fails;
-   - `Error` when no usable output action succeeds.
+   - `Copied` for successful clipboard-only output;
+   - `Error` when requested insertion fails, retaining the transcript for recovery;
+   - `Ready` when neither output action is requested.
+
+A clipboard-restoration failure after successful paste is a separate warning; it does not change `Inserted` to `Error` or suggest retrying a paste that already completed.
 
 ### Platform adapters
 
 - Windows: PowerShell `System.Windows.Forms.SendKeys` sends `Ctrl+V`.
-- Linux/Unix path: `wtype`, then `xdotool`, then `ydotool`.
-- The current code does not define a dedicated macOS paste adapter; macOS falls through to Linux-style helper detection.
+- Linux: `wtype`, then `xdotool`, then `ydotool`, with native Wayland/X11 clipboard probes.
+- macOS: Quartz Command-V key events, gated by Accessibility trust. Diagnostics reports this adapter and failures explain the System Settings permission path.
 
 ### Recovery
 

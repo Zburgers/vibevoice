@@ -1,0 +1,29 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<component type="desktop-application">
+  <id>dev.zburgers.vibevoice</id>
+  <metadata_license>CC0-1.0</metadata_license>
+  <!-- No application license is declared in this repository. -->
+  <project_license>LicenseRef-proprietary</project_license>
+  <name>VibeVoice</name>
+  <summary>Local-first desktop voice input for developers</summary>
+  <description>
+    <p>VibeVoice records microphone audio and transcribes it locally with
+    whisper.cpp. It cleans developer terms and copies or pastes the result
+    into the focused application.</p>
+  </description>
+  <launchable type="desktop-id">VibeVoice.desktop</launchable>
+  <icon type="stock">vibevoice</icon>
+  <categories>
+    <category>Office</category>
+  </categories>
+  <url type="homepage">https://github.com/Zburgers/vibevoice</url>
+  <url type="bugtracker">https://github.com/Zburgers/vibevoice/issues</url>
+  <url type="vcs-browser">https://github.com/Zburgers/vibevoice</url>
+  <developer id="dev.zburgers">
+    <name>Zburgers</name>
+  </developer>
+  <content_rating type="oars-1.1" />
+  <releases>
+    <release version="0.2.8" date="2026-10-03" type="development" />
+  </releases>
+</component>

@@ -1,0 +1,51 @@
+VibeVoice 0.2.8 settings verification - October 3, 2026
+
+Implementation source: b658fee (codex/settings-fixes-v0.2.8)
+Base: e8e558d (origin/codex/v0.2.8)
+Original checkout's unfinished changes were preserved; this work used a separate checkout.
+
+Automated checks passed:
+- npx vitest run --maxWorkers 1: 8 files, 26 tests.
+- npm run build: TypeScript and production Vite build.
+- cargo test --locked: 59 Rust tests, plus binary/doc tests with no failures.
+- cargo clippy --locked --all-targets -- -D warnings.
+- cargo fmt; git diff --check.
+- cargo build --release --locked: optimized Windows executable built successfully.
+  Test artifact: outputs/settings-fixes/VibeVoice-0.2.8-settings-test.exe in the original checkout.
+  Build receipt alongside the executable records source commit and SHA-256.
+
+Focused evidence:
+- Settings renderer tests cover Automatic/Custom paths, explicit save, picker cancellation,
+  invalid selection, valid picker result, modifier release order, Escape cancellation,
+  physical punctuation keys, and clearing native hotkey-capture suppression.
+- App tests mock Tauri IPC and events: the pill refreshes its hotkey without recording;
+  rapid different settings patches compose; a rejected save retains accepted state.
+- Native unit tests cover dictionary toggle and disabled rules, hotkey parser values,
+  missing/relative paths, directories, executable header, and model header validation.
+- Windows startup test writes and reads an isolated HKCU Software\VibeVoice\SettingsTests
+  key, proving command-line quoting, approval bytes, disabled-entry removal, and idempotency.
+  It does not add an actual Run entry or sign out the owner.
+
+Implementation behavior:
+- Settings saves apply pill topmost state natively and emit the existing state-change event.
+- New shortcuts register before the old shortcut is removed; OS/persistence failures roll back.
+- Windows startup uses quoted current_exe and StartupApproved. Failed save transactions restore
+  original raw registry values. Other platforms use Tauri's autostart manager.
+- Custom path checks validate file existence/type and headers, not full model integrity or DLLs.
+- Dependencies retain Tauri 2.11.2 and the previously qualified runtime versions.
+
+Failed/limited checks retained:
+- Initial concurrent Vitest run: 0 tests ran, 6 worker-start timeout errors.
+  Serial run succeeded after correcting new test cleanup and selector mistakes.
+- Native main-window screenshot capture timed out twice (FrameArrived/window capture).
+- Owner stopped subsequent Computer Use with physical Escape; no further UI input was sent.
+
+Pending owner/runtime acceptance:
+- Toggle topmost off/on and check actual window stacking and restart persistence.
+- Record and use a new global hotkey; confirm the pill label updates immediately.
+- Native Browse dialog selection/cancellation and transcription with selected engine files.
+- Enable/disable login startup from Settings and verify actual launch on next Windows login.
+- Live transcription with dictionary cleanup enabled/disabled.
+- macOS/Linux login startup and native file dialog behavior.
+
+No release was published. PR targets codex/v0.2.8 and remains unmerged for owner testing.

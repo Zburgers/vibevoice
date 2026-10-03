@@ -1,0 +1,5 @@
+Control page verification — 2026-10-03
+Files: App.css, ui.tsx, views/ControlView.tsx and its tests; TranscriptContent.tsx and its tests.
+Independent PR: npm test passed 15 tests; npm run build passed TypeScript/Vite; git diff --check passed.
+Earlier rendered checks: 49 synthetic state/width combinations and seven real app viewport widths passed. Status badge fits its label, primary/cancel actions remain accessible, narrow navigation remains visible.
+New recovery regression: successful transcript remains visible beside an insertion error, including before and after clearing that error. No live microphone/provider test.

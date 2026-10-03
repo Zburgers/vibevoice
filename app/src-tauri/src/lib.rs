@@ -9,7 +9,7 @@ use std::os::unix::process::CommandExt;
 use std::os::windows::process::CommandExt;
 use std::{
     fs,
-    io::{self, Write},
+    io::{self, Read, Write},
     path::{Path, PathBuf},
     process::{Child, Command, ExitStatus, Stdio},
     str::FromStr,
@@ -26,10 +26,28 @@ use tauri::{
     tray::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent},
     AppHandle, Emitter, Manager, WebviewWindow,
 };
+use tauri_plugin_autostart::ManagerExt as AutostartExt;
 use tauri_plugin_clipboard_manager::ClipboardExt;
+use tauri_plugin_dialog::DialogExt;
 use tauri_plugin_global_shortcut::{Code, GlobalShortcutExt, Modifiers, Shortcut, ShortcutState};
 use tauri_plugin_opener::OpenerExt;
+#[cfg(target_os = "windows")]
+mod windows_startup;
+
 use uuid::Uuid;
+
+#[cfg(target_os = "macos")]
+mod macos_paste;
+mod meter;
+mod performance;
+mod platform_clipboard;
+mod whisper_update;
+use performance::{ProcessUsage, TranscriptionMetrics};
+#[cfg(target_os = "windows")]
+mod windows_clipboard;
+#[cfg(any(target_os = "windows", target_os = "macos"))]
+use meter::SpectrumAnalyzer;
+use meter::{empty_spectrum, read_spectrum, SharedSpectrum, BAND_COUNT};
 
 #[cfg(any(target_os = "windows", target_os = "macos"))]
 use cpal::{
@@ -38,7 +56,9 @@ use cpal::{
 };
 
 #[cfg(any(target_os = "windows", target_os = "macos"))]
-use std::sync::mpsc::{self, Sender};
+mod audio_writer;
+#[cfg(any(target_os = "windows", target_os = "macos"))]
+use audio_writer::{AudioQueue, Message as AudioWriterMessage};
 
 const AUTO_PATH: &str = "auto";
 const MODEL_FILE_NAME: &str = "ggml-base.en.bin";
@@ -50,7 +70,9 @@ const RELEASES_URL: &str = "https://github.com/Zburgers/vibevoice/releases";
 const DEFAULT_MAX_HISTORY_ENTRIES: usize = 100;
 const MAX_HISTORY_ENTRIES: usize = 1000;
 const DIAGNOSTICS_CACHE_TTL: Duration = Duration::from_secs(5);
+#[cfg(not(target_os = "macos"))]
 const PASTE_HELPER_TIMEOUT: Duration = Duration::from_secs(2);
+#[cfg(any(not(target_os = "macos"), test))]
 const PASTE_HELPER_POLL_INTERVAL: Duration = Duration::from_millis(20);
 const DEFAULT_TRANSCRIPTION_TIMEOUT_SECONDS: u64 = 900;
 const MIN_TRANSCRIPTION_TIMEOUT_SECONDS: u64 = 30;
@@ -86,6 +108,7 @@ struct Settings {
     whisper_binary_path: String,
     model_path: String,
     transcription_timeout_seconds: u64,
+    transcription_threads: usize,
     hotkey: String,
     recording_mode: String,
     auto_paste: bool,
@@ -104,6 +127,7 @@ impl Default for Settings {
             whisper_binary_path: AUTO_PATH.to_string(),
             model_path: AUTO_PATH.to_string(),
             transcription_timeout_seconds: DEFAULT_TRANSCRIPTION_TIMEOUT_SECONDS,
+            transcription_threads: 0,
             hotkey: "Ctrl+Alt+Space".to_string(),
             recording_mode: "toggle".to_string(),
             auto_paste: true,
@@ -166,6 +190,12 @@ enum InsertionOutcome {
 #[serde(rename_all = "snake_case")]
 enum ClipboardSnapshot {
     Text(String),
+    Image {
+        rgba: Vec<u8>,
+        width: u32,
+        height: u32,
+    },
+    Empty,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -176,6 +206,7 @@ struct InsertionReport {
     paste_status: String,
     clipboard_restored: bool,
     error: Option<String>,
+    warning: Option<String>,
 }
 
 impl Default for InsertionReport {
@@ -186,6 +217,7 @@ impl Default for InsertionReport {
             paste_status: "not_attempted".to_string(),
             clipboard_restored: false,
             error: None,
+            warning: None,
         }
     }
 }
@@ -213,6 +245,7 @@ struct DictionaryRule {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct AppStateSnapshot {
+    whisper_update: whisper_update::Catalog,
     app_version: String,
     voice_state: VoiceState,
     settings: Settings,
@@ -222,12 +255,15 @@ struct AppStateSnapshot {
     last_transcript: Option<String>,
     last_error: Option<String>,
     mic_level: f32,
+    mic_bands: [f32; BAND_COUNT],
     recording_started_at: Option<DateTime<Utc>>,
+    last_transcription_metrics: Option<TranscriptionMetrics>,
 }
 
 #[derive(Debug, Clone, Serialize)]
 struct MeterPayload {
     mic_level: f32,
+    mic_bands: [f32; BAND_COUNT],
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -242,10 +278,11 @@ struct RecordingSession {
     output_prefix: PathBuf,
     started: Instant,
     started_at: DateTime<Utc>,
-    stream: Stream,
-    writer_tx: std::sync::mpsc::Sender<AudioWriterMessage>,
+    stream: Option<Stream>,
+    writer_tx: AudioQueue,
     writer_thread: Option<std::thread::JoinHandle<Result<(), String>>>,
     mic_level: Arc<AtomicU32>,
+    spectrum: SharedSpectrum,
 }
 
 #[cfg(target_os = "linux")]
@@ -256,21 +293,20 @@ struct RecordingSession {
     started_at: DateTime<Utc>,
     recorder_process: Child,
     mic_level: Arc<AtomicU32>,
+    spectrum: SharedSpectrum,
 }
 
 #[cfg(any(target_os = "windows", target_os = "macos"))]
+// SAFETY: this platform-specific session is moved only while serialized by
+// the lifecycle/runtime locks. Windows WASAPI and macOS CoreAudio own their
+// callback workers; no concurrent Rust access to Stream occurs. Stream drop
+// joins callbacks before writer finalization. CPAL's generic !Send marker
+// also covers unsupported platforms; this override is restricted to these
+// two qualified backends and must be re-audited on a CPAL/backend upgrade.
 unsafe impl Send for RecordingSession {}
-
-#[cfg(target_os = "linux")]
-unsafe impl Send for RecordingSession {}
-
-#[cfg(any(target_os = "windows", target_os = "macos"))]
-enum AudioWriterMessage {
-    Samples(Vec<i16>),
-    Stop,
-}
 
 struct RuntimeState {
+    last_transcription_metrics: Option<TranscriptionMetrics>,
     voice_state: VoiceState,
     recording: Option<RecordingSession>,
     last_transcript: Option<String>,
@@ -288,6 +324,7 @@ struct RuntimeState {
 impl Default for RuntimeState {
     fn default() -> Self {
         Self {
+            last_transcription_metrics: None,
             voice_state: VoiceState::Ready,
             recording: None,
             last_transcript: None,
@@ -320,6 +357,11 @@ struct DiagnosticsCache {
 }
 
 struct AppData {
+    component_update_busy: Arc<AtomicBool>,
+    component_update_cancel: Arc<AtomicBool>,
+    settings: Mutex<()>,
+    hotkey_capture: AtomicBool,
+    hotkey_down: AtomicBool,
     runtime: Mutex<RuntimeState>,
     diagnostics_cache: Mutex<Option<DiagnosticsCache>>,
     history: Mutex<()>,
@@ -352,7 +394,8 @@ fn get_app_state(
     window: WebviewWindow,
 ) -> Result<AppStateSnapshot, String> {
     authorize_window(&window, &["main", "pill"])?;
-    let settings = load_settings(&app)?;
+    let mut settings = load_settings(&app)?;
+    settings.start_on_login = app.autolaunch().is_enabled().map_err(|e| e.to_string())?;
     let dictionary = load_dictionary(&app)?;
     let history = load_history_for_settings(&app, &settings, &data.history)?;
     let runtime = data.runtime.lock().map_err(|error| error.to_string())?;
@@ -363,6 +406,7 @@ fn get_app_state(
         .map(|session| session.mic_level.load(Ordering::Relaxed) as f32 / 1000.0)
         .unwrap_or(runtime.mic_level);
     Ok(AppStateSnapshot {
+        whisper_update: whisper_update::catalog(data.component_update_busy.load(Ordering::Acquire)),
         app_version: env!("CARGO_PKG_VERSION").to_string(),
         voice_state: runtime.voice_state.clone(),
         settings: settings.clone(),
@@ -372,7 +416,13 @@ fn get_app_state(
         last_transcript: runtime.last_transcript.clone(),
         last_error: runtime.last_error.clone(),
         mic_level,
+        mic_bands: runtime
+            .recording
+            .as_ref()
+            .map(|session| read_spectrum(&session.spectrum))
+            .unwrap_or([0.0; BAND_COUNT]),
         recording_started_at,
+        last_transcription_metrics: runtime.last_transcription_metrics.clone(),
     })
 }
 
@@ -417,7 +467,14 @@ fn copy_diagnostics_report(
     let runtime = data.runtime.lock().map_err(|error| error.to_string())?;
     let diagnostics =
         cached_diagnostics(&app, &data, &settings, runtime.last_error.clone(), false)?;
-    let report = format_diagnostics_report(&diagnostics, &updater_status);
+    let mut report = format_diagnostics_report(&diagnostics, &updater_status);
+    if let Some(metrics) = runtime.last_transcription_metrics.as_ref() {
+        report.push_str(&format!(
+            "last_transcription_metrics: {}\n",
+            serde_json::to_string(metrics).map_err(|e| e.to_string())?
+        ));
+    }
+    drop(runtime);
     with_insertion_lock(&data.insertion, || {
         copy_to_clipboard(&app, &report).map(|_| ())
     })
@@ -429,22 +486,210 @@ fn save_settings(
     data: tauri::State<AppData>,
     mut settings: Settings,
     window: WebviewWindow,
-) -> Result<(), String> {
+) -> Result<Settings, String> {
     authorize_window(&window, &["main"])?;
+    let _lifecycle = data.lifecycle.lock().map_err(|e| e.to_string())?;
+    if data.component_update_busy.load(Ordering::Acquire) {
+        return Err("Wait for the Whisper update before changing settings.".into());
+    }
+    let _guard = data.settings.lock().map_err(|error| error.to_string())?;
     settings.transcription_timeout_seconds = settings.transcription_timeout_seconds.clamp(
         MIN_TRANSCRIPTION_TIMEOUT_SECONDS,
         MAX_TRANSCRIPTION_TIMEOUT_SECONDS,
     );
-    let previous = load_settings(&app).unwrap_or_default();
-    if settings.hotkey != previous.hotkey {
-        register_global_hotkey(&app, &settings.hotkey)?;
+    settings.transcription_threads = settings.transcription_threads.min(16);
+    let previous = load_settings(&app)?;
+    // Validate before touching working OS registrations or persisting anything.
+    if settings.whisper_binary_path != previous.whisper_binary_path {
+        settings.whisper_binary_path =
+            validate_engine_setting(&settings.whisper_binary_path, false)?;
     }
+    if settings.model_path != previous.model_path {
+        settings.model_path = validate_engine_setting(&settings.model_path, true)?;
+    }
+    parse_hotkey(&settings.hotkey)?;
+    let current_autostart = app.autolaunch().is_enabled().map_err(|e| e.to_string())?;
+    #[cfg(not(windows))]
+    let old_autostart = current_autostart;
+    #[cfg(windows)]
+    let startup_snapshot = windows_startup::snapshot()?;
     if DiagnosticsCacheKey::from_settings(&settings)
         != DiagnosticsCacheKey::from_settings(&previous)
     {
         invalidate_diagnostics_cache(&data)?;
     }
-    write_json(settings_path(&app)?, &settings)
+    let pill = app.get_webview_window("pill");
+    let old_topmost = pill
+        .as_ref()
+        .map(|w| w.is_always_on_top())
+        .transpose()
+        .map_err(|e| e.to_string())?;
+    let applied = (|| {
+        if settings.hotkey != previous.hotkey {
+            replace_global_hotkey(&app, &previous.hotkey, &settings.hotkey)?;
+        }
+        if settings.start_on_login != previous.start_on_login
+            || settings.start_on_login != current_autostart
+        {
+            set_start_on_login(&app, settings.start_on_login)?;
+        }
+        if let Some(pill) = &pill {
+            pill.set_always_on_top(settings.pill_always_on_top)
+                .map_err(|e| e.to_string())?;
+        }
+        write_json(settings_path(&app)?, &settings)
+    })();
+    if let Err(error) = applied {
+        let mut rollback_errors = Vec::new();
+        if settings.hotkey != previous.hotkey {
+            if let Err(e) = replace_global_hotkey(&app, &settings.hotkey, &previous.hotkey) {
+                rollback_errors.push(e);
+            }
+        }
+        #[cfg(not(windows))]
+        if let Err(e) = set_start_on_login(&app, old_autostart) {
+            rollback_errors.push(e);
+        }
+        #[cfg(windows)]
+        if let Err(e) = windows_startup::restore(startup_snapshot) {
+            rollback_errors.push(e);
+        }
+        if let (Some(pill), Some(topmost)) = (&pill, old_topmost) {
+            if let Err(e) = pill.set_always_on_top(topmost) {
+                rollback_errors.push(e.to_string());
+            }
+        }
+        return Err(if rollback_errors.is_empty() {
+            error
+        } else {
+            format!(
+                "{error} Could not restore all settings: {}",
+                rollback_errors.join("; ")
+            )
+        });
+    }
+    emit_state_changed(&app);
+    Ok(settings)
+}
+
+fn set_start_on_login(app: &AppHandle, enabled: bool) -> Result<(), String> {
+    let manager = app.autolaunch();
+    #[cfg(windows)]
+    windows_startup::set_enabled(enabled)
+        .map_err(|e| format!("Could not update login startup: {e}"))?;
+    #[cfg(not(windows))]
+    {
+        let current = manager
+            .is_enabled()
+            .map_err(|e| format!("Could not read login startup: {e}"))?;
+        if current == enabled {
+            return Ok(());
+        }
+        if enabled {
+            manager.enable()
+        } else {
+            manager.disable()
+        }
+        .map_err(|e| format!("Could not update login startup: {e}"))?;
+    }
+    if manager.is_enabled().map_err(|e| e.to_string())? != enabled {
+        return Err("Login startup registration did not change.".to_string());
+    }
+    Ok(())
+}
+
+#[tauri::command]
+fn set_hotkey_capture(
+    data: tauri::State<AppData>,
+    window: WebviewWindow,
+    capturing: bool,
+) -> Result<(), String> {
+    authorize_window(&window, &["main"])?;
+    data.hotkey_capture.store(capturing, Ordering::Release);
+    Ok(())
+}
+
+fn validate_engine_setting(value: &str, model: bool) -> Result<String, String> {
+    let value = value.trim();
+    if value.eq_ignore_ascii_case(AUTO_PATH) {
+        return Ok(AUTO_PATH.to_string());
+    }
+    let label = if model { "Model" } else { "Whisper binary" };
+    let path = expand_home(value);
+    if value.is_empty() || !path.is_absolute() || !path.is_file() {
+        return Err(format!(
+            "{label}: choose an existing file using an absolute path, or use Automatic."
+        ));
+    }
+    let mut header = [0; 4];
+    fs::File::open(&path)
+        .and_then(|mut file| file.read_exact(&mut header))
+        .map_err(|e| format!("{label}: cannot read this file: {e}"))?;
+    if model {
+        if header != *b"lmgg" {
+            return Err("Model: select a whisper.cpp GGML model (.bin). This file has an unsupported header.".to_string());
+        }
+    } else {
+        if path
+            .file_stem()
+            .is_none_or(|name| !name.eq_ignore_ascii_case("whisper-cli"))
+        {
+            return Err(
+                "Whisper binary: select whisper-cli, not another engine utility.".to_string(),
+            );
+        }
+        #[cfg(windows)]
+        if path
+            .extension()
+            .is_none_or(|ext| !ext.eq_ignore_ascii_case("exe"))
+            || &header[..2] != b"MZ"
+        {
+            return Err("Whisper binary: select the whisper-cli executable (.exe).".to_string());
+        }
+        #[cfg(unix)]
+        if fs::metadata(&path)
+            .map_err(|e| e.to_string())?
+            .permissions()
+            .mode()
+            & 0o111
+            == 0
+        {
+            return Err("Whisper binary: this file is not executable.".to_string());
+        }
+    }
+    Ok(path.to_string_lossy().into_owned())
+}
+
+#[tauri::command]
+async fn pick_engine_file(
+    app: AppHandle,
+    window: WebviewWindow,
+    model: bool,
+) -> Result<Option<String>, String> {
+    authorize_window(&window, &["main"])?;
+    async_runtime::spawn_blocking(move || {
+        let mut picker = app.dialog().file().set_parent(&window).set_title(if model {
+            "Choose whisper.cpp model"
+        } else {
+            "Choose Whisper CLI"
+        });
+        if model {
+            picker = picker.add_filter("Whisper GGML model", &["bin"]);
+        }
+        #[cfg(windows)]
+        if !model {
+            picker = picker.add_filter("Whisper CLI executable", &["exe"]);
+        }
+        picker
+            .blocking_pick_file()
+            .map(|file| {
+                let path = file.into_path().map_err(|e| e.to_string())?;
+                validate_engine_setting(&path.to_string_lossy(), model)
+            })
+            .transpose()
+    })
+    .await
+    .map_err(|e| e.to_string())?
 }
 
 #[tauri::command]
@@ -526,6 +771,11 @@ fn invalidate_preparation(runtime: &mut RuntimeState) {
 
 fn begin_recording(app: AppHandle, data: tauri::State<'_, AppData>) -> Result<(), String> {
     let lifecycle = data.lifecycle.lock().map_err(|error| error.to_string())?;
+    if data.component_update_busy.load(Ordering::Acquire) {
+        return Err(
+            "Whisper components are updating. Wait or cancel the update before recording.".into(),
+        );
+    }
     if data.shutdown.load(Ordering::Acquire) {
         return Err("VibeVoice is shutting down.".to_string());
     }
@@ -549,6 +799,8 @@ fn begin_recording(app: AppHandle, data: tauri::State<'_, AppData>) -> Result<()
                 return;
             }
             let mic_level = Arc::clone(&session.mic_level);
+            let spectrum = Arc::clone(&session.spectrum);
+            let meter_audio_path = session.audio_path.clone();
             let data = app_handle.state::<AppData>();
             let mut runtime = match data.runtime.lock() {
                 Ok(runtime) => runtime,
@@ -577,8 +829,13 @@ fn begin_recording(app: AppHandle, data: tauri::State<'_, AppData>) -> Result<()
             runtime.recording = Some(session);
             drop(runtime);
             emit_state_changed(&app_handle);
-            let meter_thread =
-                spawn_meter_emitter(app_handle.clone(), mic_level, Arc::clone(&shutdown));
+            let meter_thread = spawn_meter_emitter(
+                app_handle.clone(),
+                mic_level,
+                spectrum,
+                meter_audio_path,
+                Arc::clone(&shutdown),
+            );
             track_thread(&data.meter_threads, meter_thread);
         }
         Err(error) => {
@@ -619,7 +876,15 @@ fn prepare_recording_session(app: &AppHandle) -> Result<RecordingSession, String
     let output_prefix = tmp.join(stem);
     let session = start_audio_capture(audio_path, output_prefix)?;
     #[cfg(any(target_os = "windows", target_os = "macos"))]
-    start_recording_stream(&session)?;
+    let session = {
+        let mut session = session;
+        if let Err(error) = start_recording_stream(&session) {
+            let _ = stop_audio_capture(&mut session);
+            cleanup_recording_artifacts(&session);
+            return Err(error);
+        }
+        session
+    };
     Ok(session)
 }
 
@@ -654,6 +919,9 @@ async fn stop_recording_impl(
             emit_state_changed(&app);
             return Ok(());
         }
+        // Repeated Stop calls must not clear Processing and admit a second
+        // recording while the first worker still owns transcription/insertion.
+        ensure_stop_allowed(&runtime)?;
         match runtime.recording.take() {
             Some(session) => {
                 runtime.preparing_generation = None;
@@ -720,15 +988,50 @@ fn cancel_transcription(
     window: WebviewWindow,
 ) -> Result<(), String> {
     authorize_window(&window, &["main", "pill"])?;
-    let cancel = data
+    let current = data
         .transcription_cancel
         .lock()
-        .map_err(|error| error.to_string())?
-        .clone()
-        .ok_or_else(|| "No transcription is running.".to_string())?;
+        .map_err(|error| error.to_string())?;
+    let cancel = current
+        .as_ref()
+        .ok_or_else(|| "No cancellable transcription is running.".to_string())?;
     cancel.store(true, Ordering::Relaxed);
+    drop(current);
     emit_state_changed(&app);
     Ok(())
+}
+
+fn ensure_stop_allowed(runtime: &RuntimeState) -> Result<(), String> {
+    if matches!(runtime.voice_state, VoiceState::Processing) {
+        Err("Recording is still processing. Please wait or cancel transcription.".to_string())
+    } else {
+        Ok(())
+    }
+}
+
+fn claim_transcription_result(
+    current: &Mutex<Option<Arc<AtomicBool>>>,
+    cancel: &AtomicBool,
+    shutdown: &AtomicBool,
+) -> Result<(), String> {
+    let mut current = current.lock().map_err(|e| e.to_string())?;
+    if cancel.load(Ordering::Relaxed) || shutdown.load(Ordering::Acquire) {
+        return Err("Transcription cancelled.".to_string());
+    }
+    if !current
+        .as_ref()
+        .is_some_and(|token| std::ptr::eq(token.as_ref(), cancel))
+    {
+        return Err("Transcription is no longer current.".to_string());
+    }
+    *current = None;
+    Ok(())
+}
+
+fn recording_audio_duration_ms(audio_path: &Path) -> Result<u64, String> {
+    let reader = hound::WavReader::open(audio_path)
+        .map_err(|error| format!("Recorded audio is invalid: {error}"))?;
+    Ok(reader.duration() as u64 * 1000 / reader.spec().sample_rate.max(1) as u64)
 }
 
 fn finish_recording(
@@ -738,23 +1041,28 @@ fn finish_recording(
     shutdown: &AtomicBool,
 ) -> Result<HistoryItem, String> {
     stop_audio_capture(session)?;
+    let audio_ms = recording_audio_duration_ms(&session.audio_path)?;
     validate_recording_audio(&session.audio_path)?;
     if shutdown.load(Ordering::Acquire) {
         return Err("Recording cancelled during shutdown.".to_string());
     }
     let settings = load_settings(&app)?;
     let dictionary = load_dictionary(&app)?;
-    let raw_transcript = transcribe(
+    let (raw_transcript, mut metrics) = transcribe(
         &settings,
         &session.audio_path,
         &session.output_prefix,
         transcription_cancel,
         shutdown,
     )?;
-    let mut final_transcript = cleanup_transcript(&raw_transcript);
-    if settings.dictionary_cleanup {
-        final_transcript = apply_dictionary(&final_transcript, &dictionary);
-    }
+    metrics.audio_ms = audio_ms;
+    metrics.session_ms = session.started.elapsed().as_millis() as u64;
+    app.state::<AppData>()
+        .runtime
+        .lock()
+        .map_err(|e| e.to_string())?
+        .last_transcription_metrics = Some(metrics);
+    let final_transcript = prepare_transcript(&raw_transcript, &settings, &dictionary);
 
     if final_transcript.is_empty() {
         let message = "Whisper returned an empty transcript.".to_string();
@@ -766,6 +1074,10 @@ fn finish_recording(
     }
 
     let data = app.state::<AppData>();
+    // Claim insertion under the same mutex used by Cancel. Once claimed,
+    // Cancel reports that transcription is no longer cancellable; a Cancel
+    // acknowledged before this boundary prevents clipboard/paste side effects.
+    claim_transcription_result(&data.transcription_cancel, transcription_cancel, shutdown)?;
     let insertion_report = coordinate_insertion(
         &app,
         &data,
@@ -779,7 +1091,7 @@ fn finish_recording(
         created_at: Utc::now(),
         raw_transcript,
         final_transcript: final_transcript.clone(),
-        duration_ms: Some(session.started.elapsed().as_millis()),
+        duration_ms: Some(audio_ms as u128),
         insert_status: action_status.insert_status,
         error: action_status.error,
         insertion_report: insertion_report.clone(),
@@ -801,7 +1113,11 @@ fn finish_recording(
         .map_err(|lock_error| lock_error.to_string())?;
     runtime.voice_state = voice_state_for_insertion_report(&insertion_report);
     runtime.last_transcript = Some(final_transcript);
-    runtime.last_error = insertion_report.error.clone().or(history_error);
+    runtime.last_error = insertion_report
+        .error
+        .clone()
+        .or(insertion_report.warning.clone())
+        .or(history_error);
     runtime.mic_level = 0.0;
     drop(runtime);
     emit_state_changed(&app);
@@ -830,6 +1146,11 @@ async fn copy_text(
     window: WebviewWindow,
 ) -> Result<(), String> {
     authorize_window(&window, &["main"])?;
+    let _lifecycle = data.lifecycle.lock().map_err(|error| error.to_string())?;
+    manual_output_allowed(
+        &*data.runtime.lock().map_err(|error| error.to_string())?,
+        &data.shutdown,
+    )?;
     with_insertion_lock(&data.insertion, || {
         copy_to_clipboard(&app, &text)?;
         let mut runtime = data.runtime.lock().map_err(|error| error.to_string())?;
@@ -846,7 +1167,6 @@ async fn copy_text(
 async fn insert_text(
     app: AppHandle,
     text: String,
-    data: tauri::State<'_, AppData>,
     window: WebviewWindow,
 ) -> Result<InsertionReport, String> {
     authorize_window(&window, &["main", "pill"])?;
@@ -854,12 +1174,34 @@ async fn insert_text(
     let insertion_text = text.clone();
     let report = async_runtime::spawn_blocking(move || {
         let data = app_handle.state::<AppData>();
-        coordinate_insertion(&app_handle, &data, &insertion_text, true, true)
+        let _lifecycle = data.lifecycle.lock().map_err(|error| error.to_string())?;
+        manual_output_allowed(
+            &*data.runtime.lock().map_err(|error| error.to_string())?,
+            &data.shutdown,
+        )?;
+        let report = coordinate_insertion(&app_handle, &data, &insertion_text, true, true);
+        update_runtime_after_insertion(&app_handle, &data, &insertion_text, &report)?;
+        Ok::<_, String>(report)
     })
     .await
-    .map_err(|error| format!("Insertion task failed: {error}"))?;
-    update_runtime_after_insertion(&app, &data, &text, &report)?;
+    .map_err(|error| format!("Insertion task failed: {error}"))??;
     Ok(report)
+}
+
+fn manual_output_allowed(runtime: &RuntimeState, shutdown: &AtomicBool) -> Result<(), String> {
+    if shutdown.load(Ordering::Acquire) {
+        return Err("VibeVoice is shutting down.".to_string());
+    }
+    if matches!(
+        runtime.voice_state,
+        VoiceState::Preparing | VoiceState::Recording | VoiceState::Processing
+    ) {
+        return Err(
+            "Finish recording and transcription before copying or inserting a saved transcript."
+                .to_string(),
+        );
+    }
+    Ok(())
 }
 
 #[tauri::command]
@@ -926,10 +1268,7 @@ fn export_history(
         extension
     );
     let path = config_dir(&app)?.join("exports").join(filename);
-    if let Some(parent) = path.parent() {
-        fs::create_dir_all(parent).map_err(|error| error.to_string())?;
-    }
-    fs::write(&path, content).map_err(|error| error.to_string())?;
+    atomic_write(&path, content.as_bytes())?;
     Ok(path.display().to_string())
 }
 
@@ -984,6 +1323,105 @@ fn setup_script_name() -> &'static str {
     } else {
         "scripts/install-engine.sh"
     }
+}
+
+fn components_idle(runtime: &RuntimeState) -> Result<(), String> {
+    if matches!(
+        runtime.voice_state,
+        VoiceState::Preparing | VoiceState::Recording | VoiceState::Processing
+    ) {
+        Err("Stop recording and wait for transcription before updating Whisper.".into())
+    } else {
+        Ok(())
+    }
+}
+
+#[tauri::command]
+async fn update_whisper_component(
+    app: AppHandle,
+    component: String,
+    window: WebviewWindow,
+) -> Result<String, String> {
+    authorize_window(&window, &["main"])?;
+    if component != "model" && component != "engine" {
+        return Err("Unknown Whisper component.".into());
+    }
+    let lease = {
+        let data = app.state::<AppData>();
+        let _lifecycle = data.lifecycle.lock().map_err(|e| e.to_string())?;
+        if data.shutdown.load(Ordering::Acquire) {
+            return Err("VibeVoice is shutting down.".into());
+        }
+        components_idle(&*data.runtime.lock().map_err(|e| e.to_string())?)?;
+        let lease = whisper_update::UpdateLease::acquire(Arc::clone(&data.component_update_busy))?;
+        data.component_update_cancel.store(false, Ordering::Release);
+        lease
+    };
+    emit_state_changed(&app);
+    async_runtime::spawn_blocking(move || {
+        let data = app.state::<AppData>();
+        let cancel = &data.component_update_cancel;
+        let shutdown = &data.shutdown;
+        let mut lease = lease;
+        let notify = |progress: whisper_update::Progress| { let _ = app.emit("vibevoice-whisper-update", progress); };
+        let result = (|| {
+            let root = app.path().app_local_data_dir().map_err(|e| e.to_string())?.join("whisper-components");
+            let settings = load_settings(&app)?;
+            let previous_model = resolve_engine_paths(&settings).ok().map(|paths| paths.model);
+            let mut staged = None;
+            let updated_path = if component == "model" {
+                whisper_update::ensure_model(&root, previous_model.as_deref(), notify, cancel, shutdown)?
+            } else {
+                let engine = whisper_update::stage_engine(&root, notify, cancel, shutdown)?;
+                let mut command = Command::new(&engine.binary);
+                command.arg("--help").stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::null());
+                let (status, _) = run_process_with_deadline_measured(&mut command, Duration::from_secs(15), cancel, shutdown)?;
+                if !status.success() { return Err(format!("The new engine could not start ({status}). Your previous engine is preserved.")); }
+                let binary = engine.binary.clone(); staged = Some(engine); binary
+            };
+            // Recording and settings changes share this lock and reject the
+            // active lease. Activation is one atomic settings write; the old
+            // engine/custom model is retained and never overwritten.
+            lease.commit(&data.lifecycle, cancel, shutdown, || {
+            let _settings = data.settings.lock().map_err(|e| e.to_string())?;
+            components_idle(&*data.runtime.lock().map_err(|e| e.to_string())?)?;
+            let mut settings = load_settings(&app)?;
+            if component == "model" { settings.model_path = updated_path.display().to_string(); }
+            else {
+                settings.whisper_binary_path = updated_path.display().to_string();
+                if explicit_path(&settings.model_path).is_none() {
+                    if let Some(model) = previous_model {
+                        settings.model_path = model.display().to_string();
+                    }
+                }
+            }
+            invalidate_diagnostics_cache(&data)?;
+            write_json(settings_path(&app)?, &settings)?;
+            if let Some(engine) = staged.as_mut() { engine.activate(); }
+            Ok(if component == "model" {
+                "base.en model is verified and up to date. The verified model is active.".to_string()
+            } else {
+                format!("Whisper {} is installed and active. Your previous engine is preserved.", whisper_update::ENGINE_VERSION)
+            })
+            })
+        })();
+        let (stage, message) = match &result { Ok(message) => ("complete", message.clone()), Err(error) => ("failed", error.clone()) };
+        drop(lease);
+        notify(whisper_update::Progress { component, stage: stage.into(), downloaded_bytes: 0, total_bytes: 0, message });
+        emit_state_changed(&app);
+        result
+    }).await.map_err(|e| format!("Whisper update worker failed: {e}"))?
+}
+
+#[tauri::command]
+fn cancel_whisper_update(data: tauri::State<AppData>, window: WebviewWindow) -> Result<(), String> {
+    authorize_window(&window, &["main"])?;
+    let _lifecycle = data.lifecycle.lock().map_err(|e| e.to_string())?;
+    if !data.component_update_busy.load(Ordering::Acquire) {
+        return Err("No Whisper update is running.".into());
+    }
+    data.component_update_cancel.store(true, Ordering::Release);
+    Ok(())
 }
 
 fn setup_script_path(app: &AppHandle) -> Option<PathBuf> {
@@ -1049,6 +1487,9 @@ fn run_setup_script(
                 .to_string(),
         );
     }
+    let _lifecycle = data.lifecycle.lock().map_err(|e| e.to_string())?;
+    components_idle(&*data.runtime.lock().map_err(|e| e.to_string())?)?;
+    let _lease = whisper_update::UpdateLease::acquire(Arc::clone(&data.component_update_busy))?;
     let script_name = setup_script_name();
     let script =
         setup_script_path(&app).ok_or_else(|| format!("Setup script not found: {script_name}"))?;
@@ -1296,8 +1737,37 @@ fn config_dir(app: &AppHandle) -> Result<PathBuf, String> {
             .unwrap_or_else(|| PathBuf::from("."))
             .join("vibevoice")
     });
-    fs::create_dir_all(&dir).map_err(|error| error.to_string())?;
+    prepare_private_directory(&dir)?;
     Ok(dir)
+}
+
+fn prepare_private_directory(path: &Path) -> Result<(), String> {
+    let mut builder = fs::DirBuilder::new();
+    builder.recursive(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::DirBuilderExt;
+        builder.mode(0o700);
+    }
+    builder.create(path).map_err(|error| error.to_string())?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
+        // Operate on the opened directory, never a symlink target. The
+        // per-user config/cache parent supplies the namespace boundary.
+        let directory = fs::OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_NOFOLLOW | libc::O_DIRECTORY)
+            .open(path)
+            .map_err(|error| format!("Could not open private directory: {error}"))?;
+        if directory.metadata().map_err(|e| e.to_string())?.uid() != unsafe { libc::geteuid() } {
+            return Err("Private directory belongs to another account.".to_string());
+        }
+        directory
+            .set_permissions(fs::Permissions::from_mode(0o700))
+            .map_err(|error| error.to_string())?;
+    }
+    Ok(())
 }
 
 fn find_repo_file(app: &AppHandle, relative: &str) -> Option<PathBuf> {
@@ -1358,7 +1828,20 @@ fn preserve_corrupt_history(path: &Path) -> Result<PathBuf, String> {
         Utc::now().format("%Y%m%d-%H%M%S%.3f"),
         Uuid::new_v4()
     ));
-    fs::copy(path, &preserved)
+    let mut options = fs::OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    let result = (|| -> io::Result<()> {
+        let mut source = fs::File::open(path)?;
+        let mut destination = options.open(&preserved)?;
+        io::copy(&mut source, &mut destination)?;
+        destination.sync_all()
+    })();
+    result
         .map(|_| preserved)
         .map_err(|error| format!("Could not preserve corrupt history: {error}"))
 }
@@ -1427,13 +1910,23 @@ fn read_history_with_recovery(path: &Path) -> Result<Vec<HistoryItem>, String> {
 
 fn atomic_write(path: &Path, content: &[u8]) -> Result<(), String> {
     if let Some(parent) = path.parent() {
-        fs::create_dir_all(parent).map_err(|error| error.to_string())?;
+        prepare_private_directory(parent)?;
+    }
+    let mut options = fs::OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
     }
     AtomicFile::new(path, AllowOverwrite)
-        .write(|file| {
-            file.write_all(content)?;
-            file.sync_all()
-        })
+        .write_with_options(
+            |file| {
+                file.write_all(content)?;
+                file.sync_all()
+            },
+            options,
+        )
         .map_err(|error| error.to_string())
 }
 
@@ -1627,10 +2120,19 @@ fn transcribe(
     output_prefix: &Path,
     cancel: &AtomicBool,
     shutdown: &AtomicBool,
-) -> Result<String, String> {
+) -> Result<(String, TranscriptionMetrics), String> {
     let paths = resolve_engine_paths(settings)?;
     let mut command = Command::new(paths.whisper_binary);
+    let available = thread::available_parallelism()
+        .map(|n| n.get())
+        .unwrap_or(1);
+    let threads = performance::thread_count(settings.transcription_threads, available);
     command
+        // Request sleeping workers on OpenMP runtimes that support this hint.
+        // Keep the model, beam search and fallback behavior unchanged.
+        .env("OMP_WAIT_POLICY", "PASSIVE")
+        .arg("-t")
+        .arg(threads.to_string())
         .arg("-m")
         .arg(paths.model)
         .arg("-f")
@@ -1641,7 +2143,8 @@ fn transcribe(
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::null());
-    let status = run_process_with_deadline(
+    let started = Instant::now();
+    let (status, usage) = run_process_with_deadline_measured(
         &mut command,
         Duration::from_secs(settings.transcription_timeout_seconds.clamp(
             MIN_TRANSCRIPTION_TIMEOUT_SECONDS,
@@ -1653,8 +2156,25 @@ fn transcribe(
     if !status.success() {
         return Err(format!("Transcription failed with status {status}"));
     }
-    fs::read_to_string(output_prefix.with_extension("txt"))
-        .map_err(|error| format!("Transcript file missing: {error}"))
+    let transcript = fs::read_to_string(output_prefix.with_extension("txt"))
+        .map_err(|error| format!("Transcript file missing: {error}"))?;
+    let transcription_ms = started.elapsed().as_millis() as u64;
+    Ok((
+        transcript,
+        TranscriptionMetrics {
+            audio_ms: 0,
+            transcription_ms,
+            session_ms: 0,
+            threads,
+            cpu_time_ms: usage.cpu_time_ms,
+            average_cpu_percent: performance::cpu_percent(
+                usage.cpu_time_ms,
+                transcription_ms,
+                available,
+            ),
+            peak_memory_mb: usage.peak_memory_mb,
+        },
+    ))
 }
 
 fn configure_process_group(command: &mut Command) {
@@ -1672,12 +2192,22 @@ fn configure_process_group(command: &mut Command) {
     command.creation_flags(CREATE_NO_WINDOW | CREATE_NEW_PROCESS_GROUP);
 }
 
+#[cfg(all(test, unix))]
 fn run_process_with_deadline(
     command: &mut Command,
     timeout: Duration,
     cancel: &AtomicBool,
     shutdown: &AtomicBool,
 ) -> Result<ExitStatus, String> {
+    run_process_with_deadline_measured(command, timeout, cancel, shutdown).map(|(status, _)| status)
+}
+
+fn run_process_with_deadline_measured(
+    command: &mut Command,
+    timeout: Duration,
+    cancel: &AtomicBool,
+    shutdown: &AtomicBool,
+) -> Result<(ExitStatus, ProcessUsage), String> {
     if shutdown.load(Ordering::Acquire) || cancel.load(Ordering::Relaxed) {
         return Err("Transcription cancelled.".to_string());
     }
@@ -1692,7 +2222,7 @@ fn run_process_with_deadline(
             return Err(process_stop_message("Transcription cancelled.", cleanup));
         }
         match child.try_wait() {
-            Ok(Some(status)) => return Ok(status),
+            Ok(Some(status)) => return Ok((status, performance::process_usage(&child))),
             Ok(None) if Instant::now() >= deadline => {
                 let message = format!(
                     "Transcription timed out after {} seconds.",
@@ -1854,9 +2384,6 @@ fn candidate_engine_roots() -> Vec<PathBuf> {
                 .join("engines"),
         );
     }
-    if let Ok(current) = std::env::current_dir() {
-        roots.push(current);
-    }
     roots
 }
 
@@ -1918,30 +2445,31 @@ fn executable_name(base: &str) -> String {
     }
 }
 
-fn temp_workspace() -> PathBuf {
-    std::env::temp_dir().join("vibevoice")
+fn temp_workspace() -> Result<PathBuf, String> {
+    #[cfg(unix)]
+    {
+        // Cache roots are per account; a shared /tmp name lets one account
+        // prevent every other account from recording.
+        dirs::cache_dir()
+            .filter(|root| root.is_absolute())
+            .map(|root| root.join("vibevoice").join("recordings"))
+            .ok_or_else(|| "A per-user cache directory is required for recording.".to_string())
+    }
+    #[cfg(not(unix))]
+    Ok(std::env::temp_dir().join("vibevoice"))
 }
 
 /// App-private temp location with restrictive Unix permissions (0700).
 /// Failures carry actionable context; callers at startup log and continue so
 /// cleanup problems never block recovery.
 fn prepare_temp_workspace() -> Result<PathBuf, String> {
-    let path = temp_workspace();
-    fs::create_dir_all(&path).map_err(|error| {
+    let path = temp_workspace()?;
+    prepare_private_directory(&path).map_err(|error| {
         format!(
             "Could not create temp workspace {}: {error}",
             path.display()
         )
     })?;
-    #[cfg(unix)]
-    {
-        fs::set_permissions(&path, fs::Permissions::from_mode(0o700)).map_err(|error| {
-            format!(
-                "Could not restrict temp workspace {}: {error}",
-                path.display()
-            )
-        })?;
-    }
     Ok(path)
 }
 
@@ -2112,6 +2640,21 @@ fn cleanup_recording_outputs_in_with_pid(directory: &Path, current_pid: u32) -> 
 }
 
 fn cleanup_stale_recording_artifacts() -> Result<(), String> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        let legacy = std::env::temp_dir().join("vibevoice");
+        // Reclaim old crash artifacts only inside an already private,
+        // self-owned directory. Never chmod or follow a foreign path.
+        if let Ok(metadata) = fs::symlink_metadata(&legacy) {
+            if metadata.is_dir()
+                && metadata.uid() == unsafe { libc::geteuid() }
+                && metadata.mode() & 0o777 == 0o700
+            {
+                cleanup_recording_outputs_in(&legacy)?;
+            }
+        }
+    }
     cleanup_recording_outputs_in(&prepare_temp_workspace()?)
 }
 
@@ -2149,7 +2692,10 @@ fn start_audio_capture_impl(
     let channels = config.channels as usize;
     let sample_rate = config.sample_rate.0;
     let mic_level = Arc::new(AtomicU32::new(0));
-    let (writer_tx, writer_rx) = mpsc::channel::<AudioWriterMessage>();
+    let spectrum = empty_spectrum();
+    let writer_spectrum = Arc::clone(&spectrum);
+    let (writer_tx, writer_rx) = AudioQueue::new(64);
+    let writer_failed = writer_tx.failed_flag();
     let writer_path = audio_path.clone();
     let writer_thread = thread::spawn(move || -> Result<(), String> {
         let spec = hound::WavSpec {
@@ -2160,24 +2706,30 @@ fn start_audio_capture_impl(
         };
         let mut writer = hound::WavWriter::create(&writer_path, spec)
             .map_err(|error| format!("Could not create WAV file: {error}"))?;
+        let mut analyzer = SpectrumAnalyzer::new(sample_rate, writer_spectrum);
         while let Ok(message) = writer_rx.recv() {
             match message {
                 AudioWriterMessage::Samples(samples) => {
-                    for sample in samples {
+                    for &sample in &samples {
                         writer
                             .write_sample(sample)
                             .map_err(|error| format!("Could not write WAV sample: {error}"))?;
                     }
+                    analyzer.push(&samples);
                 }
                 AudioWriterMessage::Stop => break,
             }
         }
         writer
             .finalize()
-            .map_err(|error| format!("Could not finalize WAV file: {error}"))
+            .map_err(|error| format!("Could not finalize WAV file: {error}"))?;
+        if writer_failed.load(Ordering::Acquire) {
+            return Err("Recording could not keep up with storage. Audio was incomplete; please record again.".into());
+        }
+        Ok(())
     });
 
-    let stream = match sample_format {
+    let stream_result = match sample_format {
         SampleFormat::F32 => {
             let stream_tx = writer_tx.clone();
             let stream_level = Arc::clone(&mic_level);
@@ -2214,23 +2766,30 @@ fn start_audio_capture_impl(
                 None,
             )
         }
-        _ => {
+        _ => Err(cpal::BuildStreamError::StreamConfigNotSupported),
+    };
+    let stream = match stream_result {
+        Ok(stream) => stream,
+        Err(error) => {
+            writer_tx.stop();
+            let _ = writer_thread.join();
+            let _ = fs::remove_file(&audio_path);
             return Err(format!(
-                "Unsupported microphone sample format: {sample_format:?}"
-            ))
+                "Could not open microphone stream ({sample_format:?}): {error}"
+            ));
         }
-    }
-    .map_err(|error| format!("Could not open microphone stream: {error}"))?;
+    };
 
     Ok(RecordingSession {
         audio_path,
         output_prefix,
         started: Instant::now(),
         started_at: Utc::now(),
-        stream,
+        stream: Some(stream),
         writer_tx,
         writer_thread: Some(writer_thread),
         mic_level,
+        spectrum,
     })
 }
 
@@ -2265,6 +2824,7 @@ fn start_audio_capture_impl(
         started_at: Utc::now(),
         recorder_process: child,
         mic_level: Arc::new(AtomicU32::new(0)),
+        spectrum: empty_spectrum(),
     })
 }
 
@@ -2277,6 +2837,8 @@ fn audio_stream_error_impl(error: cpal::StreamError) {
 fn start_recording_stream(session: &RecordingSession) -> Result<(), String> {
     session
         .stream
+        .as_ref()
+        .ok_or_else(|| "Microphone stream is already stopped.".to_string())?
         .play()
         .map_err(|error| format!("Recording failed to start: {error}"))
 }
@@ -2287,8 +2849,11 @@ fn stop_audio_capture(session: &mut RecordingSession) -> Result<(), String> {
 
 #[cfg(any(target_os = "windows", target_os = "macos"))]
 fn stop_audio_capture_impl(session: &mut RecordingSession) -> Result<(), String> {
-    let _ = session.stream.pause();
-    let _ = session.writer_tx.send(AudioWriterMessage::Stop);
+    // Drop joins the native callback worker before the writer's Stop sentinel.
+    // Pause alone does not establish callback completion; late samples could
+    // otherwise arrive behind Stop and be discarded.
+    drop(session.stream.take());
+    session.writer_tx.stop();
     if let Some(writer_thread) = session.writer_thread.take() {
         writer_thread
             .join()
@@ -2306,14 +2871,14 @@ fn stop_audio_capture_impl(session: &mut RecordingSession) -> Result<(), String>
 fn write_mono_samples<T, F>(
     data: &[T],
     channels: usize,
-    writer_tx: &Sender<AudioWriterMessage>,
+    writer_tx: &AudioQueue,
     mic_level: &Arc<AtomicU32>,
     convert: F,
 ) where
     T: Copy,
     F: Fn(T) -> i16,
 {
-    if channels == 0 {
+    if channels == 0 || writer_tx.has_failed() {
         return;
     }
     let mut output = Vec::with_capacity(data.len() / channels.max(1));
@@ -2331,7 +2896,7 @@ fn write_mono_samples<T, F>(
         ((peak as f32 / i16::MAX as f32) * 1000.0) as u32,
         Ordering::Relaxed,
     );
-    let _ = writer_tx.send(AudioWriterMessage::Samples(output));
+    writer_tx.push(output);
 }
 
 #[cfg(any(target_os = "windows", target_os = "macos"))]
@@ -2460,6 +3025,15 @@ fn apply_dictionary(text: &str, dictionary: &[DictionaryRule]) -> String {
     result
 }
 
+fn prepare_transcript(raw: &str, settings: &Settings, dictionary: &[DictionaryRule]) -> String {
+    let cleaned = cleanup_transcript(raw);
+    if settings.dictionary_cleanup {
+        apply_dictionary(&cleaned, dictionary)
+    } else {
+        cleaned
+    }
+}
+
 fn replace_case_insensitive(input: &str, needle: &str, replacement: &str) -> String {
     if needle.is_empty() {
         return input.to_string();
@@ -2516,15 +3090,64 @@ fn copy_to_clipboard(app: &AppHandle, text: &str) -> Result<String, String> {
 }
 
 fn snapshot_text_clipboard(app: &AppHandle) -> Result<ClipboardSnapshot, String> {
-    app.clipboard()
-        .read_text()
-        .map(ClipboardSnapshot::Text)
-        .map_err(|error| format!("Clipboard read failed: {error}"))
+    // Inspect formats before choosing a representation. On Windows this
+    // rejects rich/mixed data before arboard can silently select plain text.
+    let empty = platform_clipboard::is_empty()?;
+    if empty {
+        return Ok(ClipboardSnapshot::Empty);
+    }
+    snapshot_clipboard_contents(
+        || {
+            app.clipboard()
+                .read_text()
+                .map_err(|error| error.to_string())
+        },
+        || {
+            app.clipboard()
+                .read_image()
+                .map(|image| ClipboardSnapshot::Image {
+                    rgba: image.rgba().to_vec(),
+                    width: image.width(),
+                    height: image.height(),
+                })
+                .map_err(|error| error.to_string())
+        },
+        || Ok(false),
+    )
+}
+
+fn snapshot_clipboard_contents(
+    read_text: impl FnOnce() -> Result<String, String>,
+    read_image: impl FnOnce() -> Result<ClipboardSnapshot, String>,
+    is_empty: impl FnOnce() -> Result<bool, String>,
+) -> Result<ClipboardSnapshot, String> {
+    match (read_text(), read_image()) {
+        (Ok(_), Ok(_)) => Err("Auto paste cannot restore mixed text and image contents. The clipboard was left untouched. Your transcript is ready; use Copy transcript when you want to replace it.".into()),
+        (Ok(text), Err(_)) => Ok(ClipboardSnapshot::Text(text)),
+        (Err(_), Ok(image)) => Ok(image),
+        (Err(text_error), Err(_)) => match is_empty() {
+                Ok(true) => Ok(ClipboardSnapshot::Empty),
+                Ok(false) => Err(format!("Auto paste could not preserve the clipboard: {text_error}. Your transcript is ready; use Copy transcript or change the clipboard contents and retry insertion.")),
+                Err(error) => Err(format!("Clipboard read failed: {error}. Your transcript is ready; retry insertion or use Copy transcript.")),
+        },
+    }
 }
 
 fn restore_text_clipboard(app: &AppHandle, snapshot: &ClipboardSnapshot) -> Result<(), String> {
     match snapshot {
         ClipboardSnapshot::Text(text) => copy_to_clipboard(app, text).map(|_| ()),
+        ClipboardSnapshot::Image {
+            rgba,
+            width,
+            height,
+        } => app
+            .clipboard()
+            .write_image(&tauri::image::Image::new(rgba, *width, *height))
+            .map_err(|error| format!("Clipboard image restore failed: {error}")),
+        ClipboardSnapshot::Empty => app
+            .clipboard()
+            .clear()
+            .map_err(|error| format!("Clipboard clear failed: {error}")),
     }
 }
 
@@ -2576,19 +3199,12 @@ where
     Paste: FnOnce() -> Result<String, String>,
     Restore: FnOnce(&ClipboardSnapshot) -> Result<(), String>,
 {
-    if !should_copy {
+    // Paste always stages a temporary clipboard, independently of whether
+    // clipboard-only output is requested by the fallback setting.
+    if !should_copy && !should_paste {
         return InsertionReport {
-            outcome: if should_paste {
-                InsertionOutcome::Failed
-            } else {
-                InsertionOutcome::Cancelled
-            },
-            paste_status: if should_paste {
-                "not_attempted".to_string()
-            } else {
-                "not_requested".to_string()
-            },
-            error: should_paste.then(|| "Paste requires a clipboard copy.".to_string()),
+            outcome: InsertionOutcome::Cancelled,
+            paste_status: "not_requested".to_string(),
             ..InsertionReport::default()
         };
     }
@@ -2654,7 +3270,14 @@ fn insertion_report_from_results(
         errors.push(error);
     }
     if let Err(error) = restore_result {
-        errors.push(format!("Clipboard restore failed: {error}"));
+        let message = format!("Clipboard could not be restored: {error}");
+        if errors.is_empty() && should_paste {
+            report.warning = Some(format!(
+                "Paste completed. {message}. Do not retry unless you want to paste the text again."
+            ));
+        } else {
+            errors.push(message);
+        }
     }
     report.error = (!errors.is_empty()).then(|| errors.join(" "));
     report.outcome = if report.error.is_some() {
@@ -2668,33 +3291,41 @@ fn insertion_report_from_results(
 }
 
 fn paste_from_clipboard() -> Result<String, String> {
-    if cfg!(target_os = "windows") {
-        let mut command = Command::new("powershell");
-        configure_command(&mut command);
-        command.args([
+    #[cfg(target_os = "macos")]
+    {
+        macos_paste::paste()
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        if cfg!(target_os = "windows") {
+            let mut command = Command::new("powershell");
+            configure_command(&mut command);
+            command.args([
             "-STA",
             "-NoProfile",
             "-Command",
             "Add-Type -AssemblyName System.Windows.Forms; [System.Windows.Forms.SendKeys]::SendWait('^v')",
         ]);
-        return run_paste_helper(&mut command, "powershell:SendKeys", PASTE_HELPER_TIMEOUT);
-    }
-    let candidates: [(&str, &[&str]); 3] = [
-        ("wtype", &["-M", "ctrl", "v", "-m", "ctrl"]),
-        ("xdotool", &["key", "ctrl+v"]),
-        ("ydotool", &["key", "29:1", "47:1", "47:0", "29:0"]),
-    ];
-    for (cmd, args) in candidates {
-        if command_exists(cmd) {
-            let mut command = Command::new(cmd);
-            configure_command(&mut command);
-            command.args(args);
-            return run_paste_helper(&mut command, cmd, PASTE_HELPER_TIMEOUT);
+            return run_paste_helper(&mut command, "powershell:SendKeys", PASTE_HELPER_TIMEOUT);
         }
+        let candidates: [(&str, &[&str]); 3] = [
+            ("wtype", &["-M", "ctrl", "v", "-m", "ctrl"]),
+            ("xdotool", &["key", "ctrl+v"]),
+            ("ydotool", &["key", "29:1", "47:1", "47:0", "29:0"]),
+        ];
+        for (cmd, args) in candidates {
+            if command_exists(cmd) {
+                let mut command = Command::new(cmd);
+                configure_command(&mut command);
+                command.args(args);
+                return run_paste_helper(&mut command, cmd, PASTE_HELPER_TIMEOUT);
+            }
+        }
+        Err("Paste tool missing. Install wtype on Wayland or xdotool on X11.".to_string())
     }
-    Err("Paste tool missing. Install wtype on Wayland or xdotool on X11.".to_string())
 }
 
+#[cfg(any(not(target_os = "macos"), test))]
 fn run_paste_helper(
     command: &mut Command,
     tool: &str,
@@ -2731,6 +3362,7 @@ fn run_paste_helper(
     }
 }
 
+#[cfg(any(not(target_os = "macos"), test))]
 fn cleanup_paste_helper(child: &mut std::process::Child) -> Option<String> {
     let kill_error = child.kill().err();
     let wait_error = child.wait().err();
@@ -2744,6 +3376,7 @@ fn cleanup_paste_helper(child: &mut std::process::Child) -> Option<String> {
     (!errors.is_empty()).then(|| errors.join("; "))
 }
 
+#[cfg(not(target_os = "macos"))]
 fn command_exists(name: &str) -> bool {
     if cfg!(target_os = "windows") {
         let mut command = Command::new("where");
@@ -2769,6 +3402,7 @@ fn command_exists(name: &str) -> bool {
         .unwrap_or(false)
 }
 
+#[cfg(not(target_os = "macos"))]
 fn first_command(names: &[&str]) -> Option<String> {
     names
         .iter()
@@ -2781,10 +3415,17 @@ fn clipboard_tool_name() -> Option<String> {
 }
 
 fn paste_tool_name() -> Option<String> {
-    if cfg!(target_os = "windows") {
-        return command_exists("powershell").then(|| "powershell:SendKeys".to_string());
+    #[cfg(target_os = "macos")]
+    {
+        Some("macos:Command-V (Accessibility required)".into())
     }
-    first_command(&["wtype", "xdotool", "ydotool"])
+    #[cfg(not(target_os = "macos"))]
+    {
+        if cfg!(target_os = "windows") {
+            return command_exists("powershell").then(|| "powershell:SendKeys".to_string());
+        }
+        first_command(&["wtype", "xdotool", "ydotool"])
+    }
 }
 
 fn insert_action_status(report: &InsertionReport) -> InsertActionStatus {
@@ -2804,7 +3445,7 @@ fn insert_action_status(report: &InsertionReport) -> InsertActionStatus {
     };
     InsertActionStatus {
         insert_status,
-        error: report.error.clone(),
+        error: report.error.clone().or(report.warning.clone()),
     }
 }
 
@@ -2826,7 +3467,7 @@ fn update_runtime_after_insertion(
     let mut runtime = data.runtime.lock().map_err(|error| error.to_string())?;
     runtime.voice_state = voice_state_for_insertion_report(report);
     runtime.last_transcript = Some(text.to_string());
-    runtime.last_error = report.error.clone();
+    runtime.last_error = report.error.clone().or(report.warning.clone());
     drop(runtime);
     emit_state_changed(app);
     Ok(())
@@ -2872,30 +3513,56 @@ fn emit_state_changed(app: &AppHandle) {
     let _ = app.emit(STATE_CHANGED_EVENT, ());
 }
 
-fn emit_meter_changed(app: &AppHandle, mic_level: f32) {
-    let _ = app.emit(METER_CHANGED_EVENT, MeterPayload { mic_level });
+fn emit_meter_changed(app: &AppHandle, mic_level: f32, mic_bands: [f32; BAND_COUNT]) {
+    let _ = app.emit(
+        METER_CHANGED_EVENT,
+        MeterPayload {
+            mic_level,
+            mic_bands,
+        },
+    );
 }
 
 fn spawn_meter_emitter(
     app: AppHandle,
     mic_level: Arc<AtomicU32>,
+    spectrum: SharedSpectrum,
+    _audio_path: PathBuf,
     shutdown: Arc<AtomicBool>,
 ) -> thread::JoinHandle<()> {
-    thread::spawn(move || loop {
-        if shutdown.load(Ordering::Acquire) {
-            break;
+    thread::spawn(move || {
+        #[cfg(target_os = "linux")]
+        let mut live_spectrum = meter::LiveWavSpectrum::new(_audio_path, Arc::clone(&spectrum));
+        loop {
+            if shutdown.load(Ordering::Acquire) {
+                break;
+            }
+            let is_recording = app
+                .state::<AppData>()
+                .runtime
+                .lock()
+                .map(|runtime| {
+                    matches!(runtime.voice_state, VoiceState::Recording)
+                        && runtime
+                            .recording
+                            .as_ref()
+                            .is_some_and(|session| Arc::ptr_eq(&session.spectrum, &spectrum))
+                })
+                .unwrap_or(false);
+            if !is_recording {
+                break;
+            }
+            #[cfg(target_os = "linux")]
+            if let Some(level) = live_spectrum.poll() {
+                mic_level.store((level * 1000.0) as u32, Ordering::Relaxed);
+            }
+            emit_meter_changed(
+                &app,
+                mic_level.load(Ordering::Relaxed) as f32 / 1000.0,
+                read_spectrum(&spectrum),
+            );
+            thread::sleep(Duration::from_millis(60));
         }
-        let is_recording = app
-            .state::<AppData>()
-            .runtime
-            .lock()
-            .map(|runtime| matches!(runtime.voice_state, VoiceState::Recording))
-            .unwrap_or(false);
-        if !is_recording {
-            break;
-        }
-        emit_meter_changed(&app, mic_level.load(Ordering::Relaxed) as f32 / 1000.0);
-        thread::sleep(Duration::from_millis(180));
     })
 }
 
@@ -2919,14 +3586,18 @@ fn parse_hotkey(hotkey: &str) -> Result<Shortcut, String> {
 fn register_hotkey_handler(app: &AppHandle, shortcut: Shortcut) -> Result<(), String> {
     let app_handle = app.clone();
     app.global_shortcut()
-        .unregister_all()
-        .map_err(|error| format!("Hotkey unregister failed: {error}"))?;
-    app.global_shortcut()
         .on_shortcut(shortcut, move |_app, _shortcut, event| {
+            let state = app_handle.state::<AppData>();
             if event.state() != ShortcutState::Pressed {
+                state.hotkey_down.store(false, Ordering::Release);
                 return;
             }
-            let state = app_handle.state::<AppData>();
+            if state.hotkey_capture.load(Ordering::Acquire) {
+                return;
+            }
+            if state.hotkey_down.swap(true, Ordering::AcqRel) {
+                return;
+            }
             // Fast toggle during Preparing cancels the in-flight start (#50):
             // both Recording and Preparing route to stop.
             let should_stop = state
@@ -2959,6 +3630,28 @@ fn register_hotkey_handler(app: &AppHandle, shortcut: Shortcut) -> Result<(), St
 fn register_global_hotkey(app: &AppHandle, hotkey: &str) -> Result<(), String> {
     let shortcut = parse_hotkey(hotkey)?;
     register_hotkey_handler(app, shortcut)
+}
+
+fn replace_global_hotkey(app: &AppHandle, previous: &str, next: &str) -> Result<(), String> {
+    let previous = parse_hotkey(previous)?;
+    let next = parse_hotkey(next)?;
+    if previous == next && app.global_shortcut().is_registered(next) {
+        return Ok(());
+    }
+    // Keep the working shortcut until the OS accepts its replacement.
+    if !app.global_shortcut().is_registered(next) {
+        register_hotkey_handler(app, next)?;
+    }
+    if previous != next && app.global_shortcut().is_registered(previous) {
+        if let Err(error) = app.global_shortcut().unregister(previous) {
+            let _ = app.global_shortcut().unregister(next);
+            return Err(format!("Could not remove previous hotkey: {error}"));
+        }
+    }
+    app.state::<AppData>()
+        .hotkey_down
+        .store(false, Ordering::Release);
+    Ok(())
 }
 
 fn show_window(app: &AppHandle, label: &str) {
@@ -3121,11 +3814,22 @@ fn track_thread(threads: &Mutex<Vec<thread::JoinHandle<()>>>, thread: thread::Jo
 pub fn run() {
     let app = tauri::Builder::default()
         .plugin(tauri_plugin_global_shortcut::Builder::new().build())
+        .plugin(
+            tauri_plugin_autostart::Builder::new()
+                .app_name("VibeVoice")
+                .build(),
+        )
+        .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_clipboard_manager::init())
         .plugin(tauri_plugin_opener::init())
         .plugin(tauri_plugin_process::init())
         .plugin(tauri_plugin_updater::Builder::new().build())
         .manage(AppData {
+            component_update_busy: Arc::new(AtomicBool::new(false)),
+            component_update_cancel: Arc::new(AtomicBool::new(false)),
+            settings: Mutex::new(()),
+            hotkey_capture: AtomicBool::new(false),
+            hotkey_down: AtomicBool::new(false),
             runtime: Mutex::new(RuntimeState::default()),
             diagnostics_cache: Mutex::new(None),
             history: Mutex::new(()),
@@ -3143,6 +3847,8 @@ pub fn run() {
             get_diagnostics_report,
             copy_diagnostics_report,
             save_settings,
+            pick_engine_file,
+            set_hotkey_capture,
             start_recording,
             stop_recording,
             cancel_transcription,
@@ -3155,9 +3861,24 @@ pub fn run() {
             delete_dictionary_rule,
             set_dictionary_rule_enabled,
             run_setup_script,
+            update_whisper_component,
+            cancel_whisper_update,
             open_release_page,
             show_main_window
         ])
+        .on_window_event(|window, event| {
+            if window.label() == "main"
+                && matches!(
+                    event,
+                    tauri::WindowEvent::Focused(false) | tauri::WindowEvent::Destroyed
+                )
+            {
+                window
+                    .state::<AppData>()
+                    .hotkey_capture
+                    .store(false, Ordering::Release);
+            }
+        })
         .setup(|app| {
             // Best-effort reclaim of abnormal-termination artifacts. Failures
             // are logged (never logged with audio/transcript content) and do
@@ -3166,6 +3887,15 @@ pub fn run() {
                 eprintln!("Could not clean stale recording artifacts: {error}");
             }
             setup_tray(app.handle())?;
+            let settings = load_settings(app.handle())?;
+            if let Some(pill) = app.get_webview_window("pill") {
+                pill.set_always_on_top(settings.pill_always_on_top)?;
+            }
+            if let Err(error) = set_start_on_login(app.handle(), settings.start_on_login) {
+                if let Ok(mut runtime) = app.state::<AppData>().runtime.lock() {
+                    runtime.last_error = Some(error);
+                }
+            }
             let hotkey = load_settings(app.handle())
                 .map(|settings| settings.hotkey)
                 .unwrap_or_else(|_| Settings::default().hotkey);
@@ -3191,6 +3921,366 @@ pub fn run() {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn manual_output_cannot_replace_an_active_voice_session() {
+        let shutdown = AtomicBool::new(false);
+        for voice_state in [
+            VoiceState::Preparing,
+            VoiceState::Recording,
+            VoiceState::Processing,
+        ] {
+            let runtime = RuntimeState {
+                voice_state,
+                preparing_generation: Some(42),
+                ..RuntimeState::default()
+            };
+            assert!(manual_output_allowed(&runtime, &shutdown).is_err());
+            assert_eq!(runtime.preparing_generation, Some(42));
+            assert!(matches!(
+                runtime.voice_state,
+                VoiceState::Preparing | VoiceState::Recording | VoiceState::Processing
+            ));
+        }
+        for voice_state in [
+            VoiceState::Ready,
+            VoiceState::Copied,
+            VoiceState::Inserted,
+            VoiceState::Error,
+        ] {
+            let runtime = RuntimeState {
+                voice_state,
+                ..RuntimeState::default()
+            };
+            assert!(manual_output_allowed(&runtime, &shutdown).is_ok());
+            assert!(manual_output_allowed(&runtime, &AtomicBool::new(true)).is_err());
+        }
+    }
+    #[test]
+    fn repeated_stop_preserves_processing_and_blocks_another_start() {
+        let mut runtime = RuntimeState {
+            voice_state: VoiceState::Processing,
+            ..RuntimeState::default()
+        };
+        assert!(ensure_stop_allowed(&runtime).is_err());
+        assert!(matches!(runtime.voice_state, VoiceState::Processing));
+        assert!(try_claim_preparation_slot(&mut runtime, 99).is_err());
+    }
+
+    #[test]
+    fn cancel_before_insertion_claim_prevents_commit() {
+        let token = Arc::new(AtomicBool::new(false));
+        let current = Mutex::new(Some(Arc::clone(&token)));
+        // Exercise the same lock order as the Cancel command.
+        current
+            .lock()
+            .unwrap()
+            .as_ref()
+            .unwrap()
+            .store(true, Ordering::Relaxed);
+        assert!(claim_transcription_result(&current, &token, &AtomicBool::new(false)).is_err());
+        assert!(current.lock().unwrap().is_some());
+    }
+
+    #[test]
+    fn insertion_claim_closes_cancel_slot_and_rejects_stale_tokens() {
+        let token = Arc::new(AtomicBool::new(false));
+        let stale = AtomicBool::new(false);
+        let current = Mutex::new(Some(Arc::clone(&token)));
+        let shutdown = AtomicBool::new(false);
+        assert!(claim_transcription_result(&current, &stale, &shutdown).is_err());
+        claim_transcription_result(&current, &token, &shutdown).unwrap();
+        assert!(current.lock().unwrap().is_none());
+        assert!(claim_transcription_result(&current, &token, &shutdown).is_err());
+    }
+
+    #[test]
+    fn audio_duration_uses_frames_instead_of_recording_and_inference_wall_time() {
+        let path = std::env::temp_dir().join(format!("vibevoice-duration-{}.wav", Uuid::new_v4()));
+        let mut writer = hound::WavWriter::create(
+            &path,
+            hound::WavSpec {
+                channels: 2,
+                sample_rate: 16_000,
+                bits_per_sample: 16,
+                sample_format: hound::SampleFormat::Int,
+            },
+        )
+        .unwrap();
+        for _ in 0..32_000 {
+            writer.write_sample(0i16).unwrap();
+        }
+        writer.finalize().unwrap();
+        assert_eq!(recording_audio_duration_ms(&path).unwrap(), 1000);
+        fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    #[ignore = "requires a local Whisper engine and its JFK sample"]
+    fn live_whisper_transcription_reports_measured_usage() {
+        let settings = Settings::default();
+        let paths = resolve_engine_paths(&settings).unwrap();
+        let root = paths.model.parent().unwrap().parent().unwrap();
+        let prefix = std::env::temp_dir().join(format!("vibevoice-live-{}", Uuid::new_v4()));
+        let (text, metrics) = transcribe(
+            &settings,
+            &root.join("samples/jfk.wav"),
+            &prefix,
+            &AtomicBool::new(false),
+            &AtomicBool::new(false),
+        )
+        .unwrap();
+        fs::remove_file(prefix.with_extension("txt")).unwrap();
+        assert!(text.contains("country"));
+        assert!(metrics.transcription_ms > 0);
+        #[cfg(windows)]
+        {
+            assert!(metrics.cpu_time_ms.unwrap() > 0);
+            assert!(metrics.peak_memory_mb.unwrap() > 1.0);
+            assert!(metrics.average_cpu_percent.unwrap() > 0.0);
+        }
+    }
+    #[test]
+    fn component_updates_require_an_idle_voice_pipeline() {
+        let mut runtime = RuntimeState::default();
+        for voice_state in [
+            VoiceState::Preparing,
+            VoiceState::Recording,
+            VoiceState::Processing,
+        ] {
+            runtime.voice_state = voice_state;
+            assert!(components_idle(&runtime).is_err());
+        }
+        for voice_state in [
+            VoiceState::Ready,
+            VoiceState::Inserted,
+            VoiceState::Copied,
+            VoiceState::Error,
+        ] {
+            runtime.voice_state = voice_state;
+            assert!(components_idle(&runtime).is_ok());
+        }
+    }
+
+    #[cfg(all(target_os = "windows", target_arch = "x86_64"))]
+    #[test]
+    #[ignore = "downloads the official engine and retains a validated candidate; requires existing JFK sample"]
+    fn live_component_updater_downloads_verifies_and_transcribes() {
+        let old = resolve_engine_paths(&Settings::default()).unwrap();
+        let sample = old
+            .model
+            .parent()
+            .unwrap()
+            .parent()
+            .unwrap()
+            .join("samples/jfk.wav");
+        let root = dirs::data_local_dir()
+            .unwrap()
+            .join("dev.zburgers.vibevoice")
+            .join("whisper-components");
+        let cancel = AtomicBool::new(false);
+        let shutdown = AtomicBool::new(false);
+        let model =
+            whisper_update::ensure_model(&root, Some(&old.model), |_| {}, &cancel, &shutdown)
+                .unwrap();
+        assert_eq!(model, old.model);
+        let mut engine = whisper_update::stage_engine(
+            &root,
+            |progress| eprintln!("{}", progress.message),
+            &cancel,
+            &shutdown,
+        )
+        .unwrap();
+        let mut command = Command::new(&engine.binary);
+        command
+            .arg("--help")
+            .stdout(Stdio::null())
+            .stderr(Stdio::null());
+        assert!(run_process_with_deadline_measured(
+            &mut command,
+            Duration::from_secs(15),
+            &cancel,
+            &shutdown
+        )
+        .unwrap()
+        .0
+        .success());
+        let settings = Settings {
+            whisper_binary_path: engine.binary.display().to_string(),
+            model_path: model.display().to_string(),
+            ..Settings::default()
+        };
+        let prefix =
+            std::env::temp_dir().join(format!("vibevoice-updater-live-{}", Uuid::new_v4()));
+        let (text, metrics) = transcribe(&settings, &sample, &prefix, &cancel, &shutdown).unwrap();
+        assert!(text.contains("country"));
+        fs::remove_file(prefix.with_extension("txt")).unwrap();
+        let receipt_path =
+            std::env::var("VIBEVOICE_UPDATE_RECEIPT").expect("Set an absolute receipt destination");
+        let receipt = serde_json::json!({ "engine_version": whisper_update::ENGINE_VERSION, "binary": engine.binary, "model": model, "transcript": text, "metrics": metrics });
+        write_json(PathBuf::from(receipt_path), &receipt).unwrap();
+        engine.activate();
+    }
+
+    #[test]
+    fn automatic_engine_discovery_ignores_launch_directory() {
+        const CHILD: &str = "VIBEVOICE_TEST_UNTRUSTED_CWD";
+        if std::env::var_os(CHILD).is_some() {
+            let current = std::env::current_dir().unwrap();
+            assert!(!candidate_engine_roots().contains(&current));
+            if let Ok(paths) = resolve_engine_paths(&Settings::default()) {
+                assert!(!paths.whisper_binary.starts_with(&current));
+            }
+            return;
+        }
+        let root = std::env::temp_dir().join(format!("vv-untrusted-{}", Uuid::new_v4()));
+        fs::create_dir_all(root.join("models")).unwrap();
+        fs::write(
+            root.join(executable_name("whisper-cli")),
+            b"planted executable",
+        )
+        .unwrap();
+        fs::write(root.join("models").join(MODEL_FILE_NAME), b"planted model").unwrap();
+        let status = Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "tests::automatic_engine_discovery_ignores_launch_directory",
+            ])
+            .current_dir(&root)
+            .env(CHILD, "1")
+            .status()
+            .unwrap();
+        fs::remove_dir_all(root).unwrap();
+        assert!(status.success());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn private_state_writes_restrict_existing_files_and_recovery_copies() {
+        let root = std::env::temp_dir().join(format!("vv-private-{}", Uuid::new_v4()));
+        fs::create_dir_all(&root).unwrap();
+        fs::set_permissions(&root, fs::Permissions::from_mode(0o755)).unwrap();
+        let path = root.join("history.json");
+        fs::write(&path, b"old private text").unwrap();
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o644)).unwrap();
+        let history = vec![history_item("private transcript", Utc::now())];
+        write_history(&path, &history).unwrap();
+        assert_eq!(
+            fs::metadata(&root).unwrap().permissions().mode() & 0o777,
+            0o700
+        );
+        let corrupt = preserve_corrupt_history(&path).unwrap();
+        for file in [&path, &history_backup_path(&path), &corrupt] {
+            assert_eq!(
+                fs::metadata(file).unwrap().permissions().mode() & 0o777,
+                0o600
+            );
+        }
+        for (extension, content) in [
+            ("json", serde_json::to_string(&history).unwrap()),
+            ("md", history_as_markdown(&history)),
+        ] {
+            let export = root.join("exports").join(format!("transcript.{extension}"));
+            atomic_write(&export, content.as_bytes()).unwrap();
+            assert_eq!(fs::read_to_string(&export).unwrap(), content);
+            assert_eq!(
+                fs::metadata(&export).unwrap().permissions().mode() & 0o777,
+                0o600
+            );
+            assert_eq!(
+                fs::metadata(export.parent().unwrap())
+                    .unwrap()
+                    .permissions()
+                    .mode()
+                    & 0o777,
+                0o700
+            );
+        }
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn private_directory_rejects_symlinks_without_changing_target() {
+        let root = std::env::temp_dir().join(format!("vv-symlink-{}", Uuid::new_v4()));
+        let target = root.join("target");
+        fs::create_dir_all(&target).unwrap();
+        fs::set_permissions(&target, fs::Permissions::from_mode(0o755)).unwrap();
+        let link = root.join("link");
+        std::os::unix::fs::symlink(&target, &link).unwrap();
+        assert!(prepare_private_directory(&link).is_err());
+        assert_eq!(
+            fs::metadata(&target).unwrap().permissions().mode() & 0o777,
+            0o755
+        );
+        assert!(temp_workspace()
+            .unwrap()
+            .starts_with(dirs::cache_dir().unwrap()));
+        fs::remove_dir_all(root).unwrap();
+    }
+    #[test]
+    fn dictionary_cleanup_toggle_and_disabled_rules_are_honored() {
+        let rules = vec![
+            DictionaryRule {
+                id: "1".into(),
+                spoken: "github".into(),
+                replacement: "GitHub".into(),
+                enabled: true,
+            },
+            DictionaryRule {
+                id: "2".into(),
+                spoken: "actions".into(),
+                replacement: "WRONG".into(),
+                enabled: false,
+            },
+        ];
+        let mut settings = Settings::default();
+        assert_eq!(
+            prepare_transcript("github actions", &settings, &rules),
+            "GitHub actions"
+        );
+        settings.dictionary_cleanup = false;
+        assert_eq!(
+            prepare_transcript("github actions", &settings, &rules),
+            "github actions"
+        );
+    }
+
+    #[test]
+    fn custom_paths_reject_missing_files_directories_and_wrong_model_formats() {
+        assert_eq!(validate_engine_setting(" AUTO ", true).unwrap(), "auto");
+        assert!(validate_engine_setting("", false).is_err());
+        assert!(validate_engine_setting("relative.exe", false).is_err());
+        let root = std::env::temp_dir().join(format!("vv-settings-{}", Uuid::new_v4()));
+        fs::create_dir_all(&root).unwrap();
+        assert!(validate_engine_setting(&root.to_string_lossy(), true).is_err());
+        let model = root.join("model.bin");
+        fs::write(&model, b"not a model").unwrap();
+        assert!(validate_engine_setting(&model.to_string_lossy(), true).is_err());
+        fs::write(&model, b"lmggmodel fixture").unwrap();
+        assert!(validate_engine_setting(&model.to_string_lossy(), true).is_ok());
+        #[cfg(windows)]
+        {
+            let binary = root.join("whisper-cli.exe");
+            fs::write(&binary, b"not executable").unwrap();
+            assert!(validate_engine_setting(&binary.to_string_lossy(), false).is_err());
+            fs::write(&binary, b"MZ executable fixture").unwrap();
+            assert!(validate_engine_setting(&binary.to_string_lossy(), false).is_ok());
+        }
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn recorded_physical_hotkeys_parse_for_letters_and_punctuation() {
+        for hotkey in [
+            "K",
+            "Ctrl+Alt+K",
+            "Ctrl+Shift+Slash",
+            "Alt+ArrowUp",
+            "Ctrl+Alt+Space",
+        ] {
+            assert!(parse_hotkey(hotkey).is_ok(), "{hotkey}");
+        }
+    }
     use super::*;
     use std::sync::atomic::AtomicBool;
 
@@ -3314,6 +4404,7 @@ mod tests {
             started_at: Utc::now(),
             recorder_process: Command::new("sleep").arg("30").spawn().unwrap(),
             mic_level: Arc::new(AtomicU32::new(0)),
+            spectrum: empty_spectrum(),
         };
         cleanup_recording_artifacts(&session);
         let mut session = session;
@@ -3619,6 +4710,58 @@ mod tests {
     }
 
     #[test]
+    fn successful_paste_with_failed_restore_is_inserted_with_a_warning() {
+        let report = insertion_report_from_results(
+            true,
+            Ok("clipboard".into()),
+            Some(Ok("paste".into())),
+            Err("busy".into()),
+        );
+        assert_eq!(report.outcome, InsertionOutcome::Inserted);
+        assert!(matches!(
+            voice_state_for_insertion_report(&report),
+            VoiceState::Inserted
+        ));
+        assert_eq!(report.error, None);
+        assert!(!report.clipboard_restored);
+        assert!(report.warning.as_deref().unwrap().contains("Do not retry"));
+        assert_eq!(
+            insert_action_status(&report).insert_status,
+            "inserted:paste"
+        );
+    }
+
+    #[test]
+    fn auto_paste_stages_and_restores_even_with_clipboard_fallback_off() {
+        use std::cell::RefCell;
+        let actions = RefCell::new(Vec::new());
+        let report = execute_insertion_transaction(
+            "words",
+            false,
+            true,
+            || {
+                actions.borrow_mut().push("snapshot");
+                Ok(ClipboardSnapshot::Empty)
+            },
+            || {
+                actions.borrow_mut().push("copy");
+                Ok("clipboard".into())
+            },
+            || {
+                actions.borrow_mut().push("paste");
+                Ok("paste".into())
+            },
+            |_| {
+                actions.borrow_mut().push("restore");
+                Ok(())
+            },
+        );
+        assert_eq!(report.outcome, InsertionOutcome::Inserted);
+        assert!(report.clipboard_restored);
+        assert_eq!(*actions.borrow(), ["snapshot", "copy", "paste", "restore"]);
+    }
+
+    #[test]
     fn insertion_report_records_clipboard_snapshot_failure() {
         let report = execute_insertion_transaction(
             "transcript",
@@ -3635,6 +4778,109 @@ mod tests {
         assert_eq!(report.paste_status, "not_attempted");
         assert!(!report.clipboard_restored);
         assert!(report.error.unwrap().contains("Clipboard read failed"));
+    }
+
+    #[test]
+    fn clipboard_snapshot_recognizes_verified_empty_but_not_unreadable_contents() {
+        let snapshot = snapshot_clipboard_contents(
+            || Err("no text".into()),
+            || Err("no image".into()),
+            || Ok(true),
+        )
+        .unwrap();
+        assert_eq!(snapshot, ClipboardSnapshot::Empty);
+        assert!(snapshot_clipboard_contents(
+            || Err("private format".into()),
+            || Err("no image".into()),
+            || Ok(false),
+        )
+        .unwrap_err()
+        .contains("Your transcript is ready"));
+        assert!(snapshot_clipboard_contents(
+            || Err("occupied".into()),
+            || Err("occupied".into()),
+            || Err("occupied".into()),
+        )
+        .unwrap_err()
+        .contains("occupied"));
+    }
+
+    #[test]
+    fn clipboard_snapshot_preserves_single_payload_and_refuses_mixed_contents() {
+        let image = ClipboardSnapshot::Image {
+            rgba: vec![10, 20, 30, 255],
+            width: 1,
+            height: 1,
+        };
+        assert_eq!(
+            snapshot_clipboard_contents(
+                || Err("no text".into()),
+                || Ok(image.clone()),
+                || panic!("image is not empty"),
+            )
+            .unwrap(),
+            image
+        );
+        assert_eq!(
+            snapshot_clipboard_contents(
+                || Ok("previous text".into()),
+                || Err("no image".into()),
+                || panic!("text is not empty"),
+            )
+            .unwrap(),
+            ClipboardSnapshot::Text("previous text".into())
+        );
+        assert!(snapshot_clipboard_contents(
+            || Ok("mixed text".into()),
+            || Ok(image),
+            || panic!("occupied")
+        )
+        .unwrap_err()
+        .contains("left untouched"));
+    }
+
+    #[test]
+    fn insertion_restores_empty_and_image_snapshots_after_success_or_paste_failure() {
+        for snapshot in [
+            ClipboardSnapshot::Empty,
+            ClipboardSnapshot::Image {
+                rgba: vec![10, 20, 30, 255],
+                width: 1,
+                height: 1,
+            },
+        ] {
+            for paste_succeeds in [false, true] {
+                let restored = std::cell::RefCell::new(None);
+                let report = execute_insertion_transaction(
+                    "transcript",
+                    true,
+                    true,
+                    || Ok(snapshot.clone()),
+                    || Ok("tauri-clipboard".into()),
+                    || {
+                        if paste_succeeds {
+                            Ok("paste".into())
+                        } else {
+                            Err("target lost focus".into())
+                        }
+                    },
+                    |value| {
+                        *restored.borrow_mut() = Some(value.clone());
+                        Ok(())
+                    },
+                );
+                assert_eq!(*restored.borrow(), Some(snapshot.clone()));
+                assert!(report.clipboard_restored);
+                assert_eq!(
+                    report.outcome,
+                    if paste_succeeds {
+                        InsertionOutcome::Inserted
+                    } else {
+                        InsertionOutcome::Failed
+                    }
+                );
+            }
+        }
     }
 
     #[test]
@@ -3667,7 +4913,9 @@ mod tests {
             || Ok("tauri-clipboard".to_string()),
             || Err("Paste target lost focus".to_string()),
             move |snapshot| {
-                let ClipboardSnapshot::Text(text) = snapshot;
+                let ClipboardSnapshot::Text(text) = snapshot else {
+                    panic!("expected text snapshot")
+                };
                 *restored_text.lock().unwrap() = Some(text.clone());
                 Ok(())
             },
@@ -4714,6 +5962,7 @@ mod tests {
             started_at: Utc::now(),
             recorder_process: child,
             mic_level: Arc::new(AtomicU32::new(0)),
+            spectrum: empty_spectrum(),
         }
     }
 

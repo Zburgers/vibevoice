@@ -1,15 +1,38 @@
-import { fireEvent, render, screen } from "@testing-library/react";
+import { createEvent, fireEvent, render, screen } from "@testing-library/react";
 import { describe, expect, it, vi } from "vitest";
 import { Mic } from "lucide-react";
 import { PillWindow } from "./PillWindow";
 import { fallbackState, stateToPhase } from "./types";
 
 describe("pill renderer regressions", () => {
+  it("blocks browser image dragging and context menus while retaining pill controls", () => {
+    const onDrag = vi.fn();
+    const onToggleExpanded = vi.fn();
+    const view = render(<PillWindow
+      state={fallbackState} phase={stateToPhase.Ready} expanded={false}
+      lastText="" recordingSeconds={0} primaryDisabled={false} ActionIcon={Mic}
+      onToggleExpanded={onToggleExpanded} onCollapse={vi.fn()} onDrag={onDrag}
+      onPrimary={vi.fn()} onPaste={vi.fn()} onOpenMain={vi.fn()}
+    />);
+    const image = view.container.querySelector("img")!;
+    expect(image.draggable).toBe(false);
+    const contextMenu = createEvent.contextMenu(image, { bubbles: true, cancelable: true });
+    fireEvent(image, contextMenu);
+    expect(contextMenu.defaultPrevented).toBe(true);
+    const dragStart = createEvent.dragStart(image, { bubbles: true, cancelable: true });
+    fireEvent(image, dragStart);
+    expect(dragStart.defaultPrevented).toBe(true);
+    fireEvent.mouseDown(screen.getByRole("button", { name: "Move pill" }), { button: 0 });
+    expect(onDrag).toHaveBeenCalledOnce();
+    fireEvent.click(screen.getByRole("button", { name: /open controls/i }));
+    expect(onToggleExpanded).toHaveBeenCalledOnce();
+    view.unmount();
+  });
   it("offers cancellation while transcription is processing", () => {
     const onPrimary = vi.fn();
     const view = render(
       <PillWindow
-        state={{ ...fallbackState, voice_state: "Processing" }}
+        state={{ ...fallbackState, voice_state: "Processing", last_transcript: "Previous words" }}
         phase={stateToPhase.Processing}
         expanded={true}
         lastText="Transcribing"
@@ -26,6 +49,7 @@ describe("pill renderer regressions", () => {
     );
     const cancel = screen.getByRole("button", { name: /cancel/i });
     expect(cancel).toBeEnabled();
+    expect(screen.getByRole("button", { name: "Paste" })).toBeDisabled();
     fireEvent.click(cancel);
     expect(onPrimary).toHaveBeenCalledOnce();
     view.unmount();

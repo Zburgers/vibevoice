@@ -1,7 +1,7 @@
 {
   "$schema": "https://schema.tauri.app/config/2",
   "productName": "VibeVoice",
-  "version": "0.2.7",
+  "version": "0.2.8",
   "identifier": "dev.zburgers.vibevoice",
   "build": {
     "beforeDevCommand": "npm run dev",
@@ -24,11 +24,12 @@
       {
         "label": "pill",
         "title": "VibeVoice Pill",
-        "width": 68,
-        "height": 68,
+        "width": 196,
+        "height": 80,
         "resizable": false,
         "decorations": false,
         "transparent": true,
+        "shadow": false,
         "alwaysOnTop": true,
         "skipTaskbar": true
       }
@@ -42,6 +43,8 @@
     "createUpdaterArtifacts": true,
     "targets": ["nsis", "msi", "deb", "rpm", "appimage", "dmg", "app"],
     "publisher": "Zburgers",
+    "homepage": "https://github.com/Zburgers/vibevoice",
+    "license": "LicenseRef-proprietary",
     "category": "Productivity",
     "shortDescription": "Local-first desktop voice input for developers",
     "longDescription": "VibeVoice records microphone audio, transcribes it locally with whisper.cpp, cleans developer terms, and copies or pastes the result into the focused app.",
@@ -58,8 +61,10 @@
     ],
     "icon": [
       "icons/32x32.png",
+      "icons/64x64.png",
       "icons/128x128.png",
       "icons/128x128@2x.png",
+      "icons/icon.png",
       "icons/icon.icns",
       "icons/icon.ico"
     ],
@@ -74,13 +79,23 @@
     },
     "linux": {
       "appimage": {
-        "bundleMediaFramework": false
+        "bundleMediaFramework": false,
+        "files": {
+          "/usr/share/metainfo/dev.zburgers.vibevoice.metainfo.xml": "linux/dev.zburgers.vibevoice.metainfo.xml"
+        }
       },
       "deb": {
-        "depends": []
+        "depends": [],
+        "section": "sound",
+        "files": {
+          "/usr/share/metainfo/dev.zburgers.vibevoice.metainfo.xml": "linux/dev.zburgers.vibevoice.metainfo.xml"
+        }
       },
       "rpm": {
-        "depends": []
+        "depends": [],
+        "files": {
+          "/usr/share/metainfo/dev.zburgers.vibevoice.metainfo.xml": "linux/dev.zburgers.vibevoice.metainfo.xml"
+        }
       }
     },
     "macOS": {

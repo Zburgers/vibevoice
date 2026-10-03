@@ -1,0 +1,26 @@
+VibeVoice 0.2.8 PR review integration — 2026-10-03
+
+Base: 838be0b, codex/v0.2.8 after #70, #71, #73 merged.
+#72 rebased onto that base. Control retains the redesigned session panel,
+MicVisualizer bands={state.mic_bands} active={recording}, and transcript
+recovery. The clipboard implementation remains present in lib.rs.
+Only transcript-content [role="alert"] receives the error color.
+
+Combined verification on the rebased branch:
+- cargo fmt --check passed.
+- cargo test --locked: 55 passed, 0 failed.
+- cargo clippy --all-targets -- -D warnings passed.
+- npm test: 18 passed, 0 failed.
+- npm run build: TypeScript/Vite production build passed.
+- npm run tauri -- build --no-bundle: Windows native release build passed.
+- node --test scripts/finalize-appstream-release.test.mjs: three passed.
+- Stable finalized AppStream fixture passed appstreamcli 1.0.2 validation
+  with --no-net --pedantic on Linux. Source draft metadata was not changed.
+- git diff --check passed.
+
+Release workflow finalizes the AppStream entry with stable type and actual
+UTC packaging date before building tagged Linux release assets. Mismatched
+versions, duplicate entries, prerelease tags, and invalid dates fail closed.
+
+No tag or release published. Full live microphone/focused-target flow and
+current-source Linux/Fedora graphical packaging qualification remain pending.

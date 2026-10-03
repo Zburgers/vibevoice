@@ -22,6 +22,7 @@ export type Settings = {
   whisper_binary_path: string;
   model_path: string;
   transcription_timeout_seconds: number;
+  transcription_threads: number;
   hotkey: string;
   recording_mode: "toggle";
   auto_paste: boolean;
@@ -59,6 +60,7 @@ export type InsertionReport = {
   paste_status: string;
   clipboard_restored: boolean;
   error: string | null;
+  warning?: string | null;
 };
 
 export type HistoryItem = {
@@ -80,6 +82,7 @@ export type DictionaryRule = {
 };
 
 export type AppState = {
+  whisper_update?: WhisperCatalog;
   app_version: string;
   voice_state: VoiceState;
   settings: Settings;
@@ -89,11 +92,38 @@ export type AppState = {
   last_transcript: string | null;
   last_error: string | null;
   mic_level: number;
+  mic_bands: number[];
   recording_started_at: string | null;
+  last_transcription_metrics?: {
+    audio_ms: number;
+    transcription_ms: number;
+    session_ms: number;
+    threads: number;
+    cpu_time_ms: number | null;
+    average_cpu_percent: number | null;
+    peak_memory_mb: number | null;
+  } | null;
+};
+
+export type WhisperCatalog = {
+  engine_version: string;
+  engine_supported: boolean;
+  model_name: string;
+  model_bytes: number;
+  busy: boolean;
+};
+
+export type WhisperProgress = {
+  component: "engine" | "model";
+  stage: string;
+  downloaded_bytes: number;
+  total_bytes: number;
+  message: string;
 };
 
 export type MeterPayload = {
   mic_level: number;
+  mic_bands: number[];
 };
 
 export type UpdateStatus = {
@@ -105,12 +135,13 @@ export type UpdateStatus = {
 };
 
 export const fallbackState: AppState = {
-  app_version: "0.2.7",
+  app_version: "0.2.8",
   voice_state: "Ready",
   settings: {
     whisper_binary_path: "auto",
     model_path: "auto",
     transcription_timeout_seconds: 900,
+    transcription_threads: 0,
     hotkey: "Ctrl+Alt+Space",
     recording_mode: "toggle",
     auto_paste: true,
@@ -143,6 +174,7 @@ export const fallbackState: AppState = {
   last_transcript: null,
   last_error: null,
   mic_level: 0,
+  mic_bands: [],
   recording_started_at: null,
 };
 
@@ -201,14 +233,10 @@ export function formatDuration(duration: number | null) {
 
 export function actionLabel(state: VoiceState) {
   if (state === "Recording") return "Stop recording";
-  if (state === "Preparing") return "Starting";
+  if (state === "Preparing") return "Cancel start";
   if (state === "Processing") return "Cancel transcription";
   if (state === "Error") return "Retry recording";
   return "Start recording";
-}
-
-export function canStartOrStop(state: VoiceState) {
-  return state !== "Preparing";
 }
 
 export function actionIcon(state: VoiceState): LucideIcon {

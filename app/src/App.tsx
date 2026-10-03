@@ -12,12 +12,12 @@ import vibevoiceIcon from "./assets/vibevoice-icon.png";
 import { PillWindow } from "./PillWindow";
 import {
   actionIcon,
-  canStartOrStop,
   fallbackState,
   navItems,
   stateToPhase,
 } from "./types";
-import type { AppState, InsertionReport, LibraryMode, MeterPayload, Settings, TabKey, UpdateStatus } from "./types";
+import type { AppState, InsertionReport, LibraryMode, MeterPayload, Settings, TabKey, UpdateStatus, WhisperProgress } from "./types";
+import { WhisperUpdatePanel } from "./WhisperUpdatePanel";
 import { StatusChip } from "./ui";
 import { ControlView } from "./views/ControlView";
 import { DiagnosticsView } from "./views/DiagnosticsView";
@@ -55,10 +55,10 @@ type ResizeDirection = "East" | "North" | "NorthEast" | "NorthWest" | "South" | 
 
 const RELEASES_URL = "https://github.com/Zburgers/vibevoice/releases";
 const LATEST_RELEASE_API = "https://api.github.com/repos/Zburgers/vibevoice/releases/latest";
-const COLLAPSED_PILL_SIZE = new LogicalSize(68, 68);
-const EXPANDED_PILL_SIZE = new LogicalSize(318, 262);
-const COLLAPSED_PILL_DIMENSIONS = { width: 68, height: 68 };
-const EXPANDED_PILL_DIMENSIONS = { width: 318, height: 262 };
+const COLLAPSED_PILL_SIZE = new LogicalSize(196, 80);
+const EXPANDED_PILL_SIZE = new LogicalSize(340, 280);
+const COLLAPSED_PILL_DIMENSIONS = { width: 196, height: 80 };
+const EXPANDED_PILL_DIMENSIONS = { width: 340, height: 280 };
 const resizeHandles: Array<{ direction: ResizeDirection; className: string }> = [
   { direction: "North", className: "is-north" },
   { direction: "South", className: "is-south" },
@@ -91,10 +91,13 @@ function App() {
   const [newRuleReplacement, setNewRuleReplacement] = useState("");
   const [updateStatus, setUpdateStatus] = useState<UpdateStatus>(initialUpdateStatus);
   const [pendingUpdate, setPendingUpdate] = useState<Update | null>(null);
+  const [whisperProgress, setWhisperProgress] = useState<WhisperProgress | null>(null);
+  const [whisperPending, setWhisperPending] = useState(false);
   const [, setTimerTick] = useState(0);
   const [pillFlipX, setPillFlipX] = useState(false);
   const [pillFlipY, setPillFlipY] = useState(false);
   const settingsRef = useRef(fallbackState.settings);
+  const settingsQueueRef = useRef<Promise<unknown>>(Promise.resolve());
   const pillExpansionRef = useRef({ flipX: false, flipY: false });
   const refreshSequence = useRef(0);
   const pillLayoutRequestRef = useRef(0);
@@ -111,13 +114,9 @@ function App() {
     state.recording_started_at && state.voice_state === "Recording"
       ? Math.max(0, Math.floor((Date.now() - new Date(state.recording_started_at).getTime()) / 1000))
       : 0;
-  const lastText = state.last_error || state.last_transcript || "No transcript captured yet.";
-  const primaryDisabled = !canStartOrStop(state.voice_state);
+  const lastText = state.last_transcript || state.last_error || "No transcript captured yet.";
+  const primaryDisabled = whisperPending || Boolean(state.whisper_update?.busy);
   const ActionIcon = actionIcon(state.voice_state);
-
-  useEffect(() => {
-    settingsRef.current = state.settings;
-  }, [state.settings]);
 
   async function refresh(forceDiagnostics = false) {
     if (!inTauri) {
@@ -130,6 +129,7 @@ function App() {
     const sequence = ++refreshSequence.current;
     const next = await invoke<AppState>("get_app_state");
     if (sequence !== refreshSequence.current) return;
+    settingsRef.current = next.settings;
     setState(next);
     setSelectedHistoryId((currentId) => {
       if (currentId && next.history.some((entry) => entry.id === currentId)) return currentId;
@@ -221,6 +221,7 @@ function App() {
 
     let cleanupState: (() => void) | undefined;
     let cleanupMeter: (() => void) | undefined;
+    let cleanupWhisper: (() => void) | undefined;
     let disposed = false;
 
     listen("vibevoice-state-changed", () => {
@@ -233,7 +234,7 @@ function App() {
       .catch((error) => setCommandStatus(errorMessage(error)));
 
     listen<MeterPayload>("vibevoice-meter-changed", (event) => {
-      setState((current) => ({ ...current, mic_level: event.payload.mic_level }));
+      setState((current) => ({ ...current, mic_level: event.payload.mic_level, mic_bands: event.payload.mic_bands ?? [] }));
     })
       .then((cleanup) => {
         if (disposed) cleanup();
@@ -241,13 +242,48 @@ function App() {
       })
       .catch((error) => setCommandStatus(errorMessage(error)));
 
+    listen<WhisperProgress>("vibevoice-whisper-update", (event) => setWhisperProgress(event.payload))
+      .then((cleanup) => {
+        if (disposed) cleanup();
+        else cleanupWhisper = cleanup;
+      })
+      .catch((error) => setCommandStatus(errorMessage(error)));
+
     return () => {
       disposed = true;
       cleanupState?.();
       cleanupMeter?.();
+      cleanupWhisper?.();
     };
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [inTauri]);
+
+  async function handleWhisperUpdate(component: "engine" | "model") {
+    if (!inTauri || whisperPending) return;
+    setWhisperPending(true);
+    setWhisperProgress({ component, stage: "checking", downloaded_bytes: 0, total_bytes: 0, message: "Checking Whisper components…" });
+    try {
+      const message = await invoke<string>("update_whisper_component", { component });
+      setWhisperProgress({ component, stage: "complete", downloaded_bytes: 0, total_bytes: 0, message });
+    } catch (error) {
+      setWhisperProgress({ component, stage: "failed", downloaded_bytes: 0, total_bytes: 0, message: errorMessage(error) });
+    } finally {
+      setWhisperPending(false);
+      await refresh(true).catch((error) => setCommandStatus(errorMessage(error)));
+    }
+  }
+
+  async function handleWhisperCancel() {
+    try {
+      await invoke("cancel_whisper_update");
+      setWhisperProgress((current) => current && ({ ...current, message: "Cancelling update…" }));
+    } catch (error) {
+      setCommandStatus(errorMessage(error));
+    }
+  }
+
+  const componentManager = <WhisperUpdatePanel state={state} progress={whisperProgress} pending={whisperPending}
+    onUpdate={handleWhisperUpdate} onCancel={handleWhisperCancel} />;
 
   useEffect(() => {
     if (state.voice_state !== "Recording") return;
@@ -263,14 +299,13 @@ function App() {
     const isCurrentRequest = () => pillLayoutRequestRef.current === requestId;
 
     async function positionPill() {
-      await pillWindow.setAlwaysOnTop(state.settings.pill_always_on_top);
       const previousPosition = await pillWindow.outerPosition();
       const previousSize = await pillWindow.outerSize();
       if (!isCurrentRequest()) return;
 
       const centerX = previousPosition.x + previousSize.width / 2;
       const centerY = previousPosition.y + previousSize.height / 2;
-      const monitor = await monitorFromPoint(centerX, centerY);
+      const monitor = await monitorFromPoint(centerX, centerY).catch(() => null);
       if (!isCurrentRequest()) return;
 
       if (!monitor) {
@@ -326,7 +361,7 @@ function App() {
         pillLayoutRequestRef.current += 1;
       }
     };
-  }, [currentWindow, expanded, isPillWindow, state.settings.pill_always_on_top]);
+  }, [currentWindow, expanded, isPillWindow]);
 
   useEffect(() => {
     if (isPillWindow || activeTab !== "diagnostics" || updateStatus.state !== "idle") return;
@@ -401,7 +436,6 @@ function App() {
   }
 
   async function handlePrimaryAction() {
-    if (!canStartOrStop(state.voice_state)) return;
     if (!inTauri) {
       setCommandStatus("Desktop runtime unavailable in browser preview");
       return;
@@ -410,10 +444,11 @@ function App() {
       if (state.voice_state === "Processing") {
         setCommandStatus("Cancelling transcription");
         await invoke("cancel_transcription");
-      } else if (state.voice_state === "Recording") {
-        setCommandStatus("Stopping recording");
+      } else if (state.voice_state === "Recording" || state.voice_state === "Preparing") {
+        const cancellingStart = state.voice_state === "Preparing";
+        setCommandStatus(cancellingStart ? "Cancelling microphone start" : "Stopping recording");
         await invoke("stop_recording");
-        setCommandStatus("Transcribing");
+        setCommandStatus(cancellingStart ? "Microphone start cancelled" : "Transcribing");
       } else {
         setCommandStatus("Starting recorder");
         await invoke("start_recording");
@@ -426,24 +461,34 @@ function App() {
   }
 
   async function updateSettings(patch: Partial<Settings>) {
-    const settings = { ...settingsRef.current, ...patch };
-    settingsRef.current = settings;
     const enginePathChanged =
       patch.whisper_binary_path !== undefined || patch.model_path !== undefined;
     const retentionChanged =
       patch.max_history_entries !== undefined || patch.history_retention_days !== undefined;
-    setState((current) => ({ ...current, settings }));
-    if (!inTauri) return;
-    try {
-      await invoke("save_settings", { settings });
-      setCommandStatus("Settings saved");
-      if (enginePathChanged || retentionChanged) {
-        await refresh(enginePathChanged);
+    const task = settingsQueueRef.current.then(async () => {
+      const settings = { ...settingsRef.current, ...patch };
+      if (!inTauri) {
+        settingsRef.current = settings;
+        setState((current) => ({ ...current, settings }));
+        return true;
       }
-    } catch (error) {
-      setCommandStatus(errorMessage(error));
-      await refresh().catch(() => undefined);
-    }
+      try {
+        const saved = await invoke<Settings>("save_settings", { settings });
+        // Ignore snapshots started before this save completed.
+        refreshSequence.current += 1;
+        settingsRef.current = saved;
+        setState((current) => ({ ...current, settings: saved }));
+        setCommandStatus("Settings saved");
+        if (enginePathChanged || retentionChanged) await refresh(enginePathChanged);
+        return true;
+      } catch (error) {
+        setCommandStatus(errorMessage(error));
+        await refresh().catch(() => undefined);
+        return false;
+      }
+    });
+    settingsQueueRef.current = task;
+    return task;
   }
 
   async function handleSetup() {
@@ -576,7 +621,7 @@ function App() {
       const report = await invoke<InsertionReport>("insert_text", { text: value });
       setCommandStatus(
         report.outcome === "inserted"
-          ? "Paste helper completed; previous clipboard restored."
+          ? report.warning || "Paste helper completed; previous clipboard restored."
           : report.outcome === "copied_only"
             ? "Transcript copied."
             : report.error || "Paste did not complete. Use Copy or retry insertion.",
@@ -753,6 +798,8 @@ function App() {
 
           {activeTab === "settings" && (
             <SettingsView
+              componentManager={componentManager}
+              status={commandStatus}
               state={state}
               onUpdate={updateSettings}
               onSetup={handleSetup}
@@ -786,6 +833,7 @@ function App() {
 
           {activeTab === "diagnostics" && (
             <DiagnosticsView
+              componentManager={componentManager}
               state={state}
               updateStatus={updateStatus}
               setupMessage={setupMessage}

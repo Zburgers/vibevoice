@@ -4,3 +4,5 @@ app/src-tauri/gen/
 app/src-tauri/target/
 .agents/
 skills-lock.json
+outputs/
+.hallmark/
