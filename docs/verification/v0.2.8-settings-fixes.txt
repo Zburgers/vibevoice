@@ -10,6 +10,9 @@ Automated checks passed:
 - cargo test --locked: 59 Rust tests, plus binary/doc tests with no failures.
 - cargo clippy --locked --all-targets -- -D warnings.
 - cargo fmt; git diff --check.
+- cargo build --release --locked: optimized Windows executable built successfully.
+  Test artifact: outputs/settings-fixes/VibeVoice-0.2.8-settings-test.exe in the original checkout.
+  Build receipt alongside the executable records source commit and SHA-256.
 
 Focused evidence:
 - Settings renderer tests cover Automatic/Custom paths, explicit save, picker cancellation,
