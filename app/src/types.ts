@@ -60,6 +60,7 @@ export type InsertionReport = {
   paste_status: string;
   clipboard_restored: boolean;
   error: string | null;
+  warning?: string | null;
 };
 
 export type HistoryItem = {
@@ -232,14 +233,10 @@ export function formatDuration(duration: number | null) {
 
 export function actionLabel(state: VoiceState) {
   if (state === "Recording") return "Stop recording";
-  if (state === "Preparing") return "Starting";
+  if (state === "Preparing") return "Cancel start";
   if (state === "Processing") return "Cancel transcription";
   if (state === "Error") return "Retry recording";
   return "Start recording";
-}
-
-export function canStartOrStop(state: VoiceState) {
-  return state !== "Preparing";
 }
 
 export function actionIcon(state: VoiceState): LucideIcon {

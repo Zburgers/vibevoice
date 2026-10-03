@@ -12,7 +12,6 @@ import vibevoiceIcon from "./assets/vibevoice-icon.png";
 import { PillWindow } from "./PillWindow";
 import {
   actionIcon,
-  canStartOrStop,
   fallbackState,
   navItems,
   stateToPhase,
@@ -116,7 +115,7 @@ function App() {
       ? Math.max(0, Math.floor((Date.now() - new Date(state.recording_started_at).getTime()) / 1000))
       : 0;
   const lastText = state.last_transcript || state.last_error || "No transcript captured yet.";
-  const primaryDisabled = !canStartOrStop(state.voice_state) || whisperPending || Boolean(state.whisper_update?.busy);
+  const primaryDisabled = whisperPending || Boolean(state.whisper_update?.busy);
   const ActionIcon = actionIcon(state.voice_state);
 
   async function refresh(forceDiagnostics = false) {
@@ -437,7 +436,6 @@ function App() {
   }
 
   async function handlePrimaryAction() {
-    if (!canStartOrStop(state.voice_state)) return;
     if (!inTauri) {
       setCommandStatus("Desktop runtime unavailable in browser preview");
       return;
@@ -446,10 +444,11 @@ function App() {
       if (state.voice_state === "Processing") {
         setCommandStatus("Cancelling transcription");
         await invoke("cancel_transcription");
-      } else if (state.voice_state === "Recording") {
-        setCommandStatus("Stopping recording");
+      } else if (state.voice_state === "Recording" || state.voice_state === "Preparing") {
+        const cancellingStart = state.voice_state === "Preparing";
+        setCommandStatus(cancellingStart ? "Cancelling microphone start" : "Stopping recording");
         await invoke("stop_recording");
-        setCommandStatus("Transcribing");
+        setCommandStatus(cancellingStart ? "Microphone start cancelled" : "Transcribing");
       } else {
         setCommandStatus("Starting recorder");
         await invoke("start_recording");
@@ -622,7 +621,7 @@ function App() {
       const report = await invoke<InsertionReport>("insert_text", { text: value });
       setCommandStatus(
         report.outcome === "inserted"
-          ? "Paste helper completed; previous clipboard restored."
+          ? report.warning || "Paste helper completed; previous clipboard restored."
           : report.outcome === "copied_only"
             ? "Transcript copied."
             : report.error || "Paste did not complete. Use Copy or retry insertion.",

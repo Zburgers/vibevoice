@@ -58,10 +58,12 @@ test('malformed tags and missing, reversed, duplicated or empty notes are reject
   }
 }));
 
-test('workflow passes the reviewed body to the publisher on every platform', () => {
+test('workflow validates reviewed notes before build and single publication', () => {
   const workflow = readFileSync(new URL('../.github/workflows/release.yml', import.meta.url), 'utf8');
   const step = workflow.split('      - name: Load reviewed release notes')[1].split('      - name:')[0];
   assert.doesNotMatch(step, /^\s*if:/m);
-  assert.match(workflow, /releaseBody: \$\{\{ steps\.release-notes\.outputs\.body \}\}/);
-  assert.match(workflow, /generateReleaseNotes: false/);
+  assert.match(workflow, /release-artifacts\.mjs assemble/);
+  const publisher = readFileSync(new URL('./release-artifacts.mjs', import.meta.url), 'utf8');
+  assert.match(publisher, /prepareReleaseNotes\(root, tag\)/);
+  assert.match(publisher, /'--notes-file', notesFile/);
 });

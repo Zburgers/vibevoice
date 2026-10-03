@@ -96,7 +96,7 @@ export function ControlView({
       </div>
 
       <div className="quick-grid control-details">
-        <Metric icon={Zap} label="Output" value={state.settings.auto_paste ? "Auto paste" : "Clipboard only"} />
+        <Metric icon={Zap} label="Output" value={state.settings.auto_paste ? "Auto paste" : state.settings.clipboard_fallback ? "Clipboard only" : "Saved transcript"} />
         <Metric icon={ShieldCheck} label="Engine" value={state.diagnostics.whisper_found && state.diagnostics.model_found ? "Ready" : "Setup needed"} />
         <Metric icon={Activity} label="Recorder" value={state.diagnostics.recorder || "Unavailable"} />
       </div>
@@ -129,7 +129,7 @@ export function ControlView({
             </button>
             <button type="button" className="ghost-button" disabled={outputDisabled} onClick={onPaste}>
               <RotateCcw size={15} aria-hidden="true" />
-              <span>Retry insertion</span>
+              <span>{state.voice_state === "Inserted" ? "Paste again" : "Retry insertion"}</span>
             </button>
           </div>
         </div>

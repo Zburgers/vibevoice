@@ -39,6 +39,17 @@ beforeEach(() => {
 afterEach(() => { cleanup(); delete window.__TAURI_INTERNALS__; });
 
 describe("settings persistence and cross-window refresh", () => {
+  it.each(["main", "pill"])("cancels microphone preparation from the %s action", async (label) => {
+    runtime.label = label;
+    saved.voice_state = "Preparing";
+    render(<App />);
+    if (label === "pill") fireEvent.click(await screen.findByRole("button", { name: /open controls/i }));
+    const cancel = await screen.findByRole("button", { name: "Cancel start" });
+    expect(cancel).toBeEnabled();
+    fireEvent.click(cancel);
+    await waitFor(() => expect(runtime.invoke).toHaveBeenCalledWith("stop_recording"));
+    expect(runtime.invoke).not.toHaveBeenCalledWith("start_recording");
+  });
   it("refreshes the pill hotkey on the settings event without a recording transition", async () => {
     runtime.label = "pill";
     render(<App />);

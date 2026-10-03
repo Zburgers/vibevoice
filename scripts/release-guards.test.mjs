@@ -11,7 +11,7 @@ const script = step.split('        run: |')[1].trimEnd().split('\n').slice(1).ma
 
 test('all publishing platforms enforce metadata validation', () => {
   assert.doesNotMatch(step, /^\s*if:/m);
-  assert.ok(workflow.indexOf('Verify release metadata consistency') < workflow.indexOf('Build and publish release assets'));
+  assert.ok(workflow.indexOf('Verify release metadata consistency') < workflow.indexOf('Build signed release assets without publishing'));
   const ci = readFileSync(new URL('../.github/workflows/ci.yml', import.meta.url), 'utf8');
   for (const event of ['pull_request:', 'push:']) {
     assert.match(ci.split(event)[1].split('\n\n')[0], /- codex\/v0\.2\.8/);

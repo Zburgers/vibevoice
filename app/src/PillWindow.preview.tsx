@@ -1,7 +1,7 @@
 import { createRoot } from "react-dom/client";
 import { useState } from "react";
 import { PillWindow } from "./PillWindow";
-import { fallbackState, stateToPhase, actionIcon, canStartOrStop } from "./types";
+import { fallbackState, stateToPhase, actionIcon } from "./types";
 import type { VoiceState } from "./types";
 import "./App.css";
 function Preview() {
@@ -10,7 +10,7 @@ function Preview() {
   const props = (voice_state: VoiceState) => ({
     state: { ...fallbackState, voice_state, last_transcript: voice_state === "Ready" ? "" : "Transcript ".repeat(100) },
     phase: stateToPhase[voice_state], lastText: voice_state === "Error" ? "Could not transcribe. Try recording again." : "A transcript that stays readable in the compact menu. ".repeat(10),
-    recordingSeconds: 12, primaryDisabled: !canStartOrStop(voice_state), ActionIcon: actionIcon(voice_state),
+    recordingSeconds: 12, primaryDisabled: false, ActionIcon: actionIcon(voice_state),
     onToggleExpanded: () => setExpanded(value => !value), onCollapse: () => setExpanded(false),
     onDrag: () => {}, onPrimary: () => {}, onPaste: () => {}, onOpenMain: () => {},
   });

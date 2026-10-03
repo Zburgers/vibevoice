@@ -1,7 +1,7 @@
 import { cleanup, fireEvent, render, screen } from "@testing-library/react";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { ControlView } from "./ControlView";
-import { actionIcon, canStartOrStop, fallbackState, stateToPhase } from "../types";
+import { actionIcon, fallbackState, stateToPhase } from "../types";
 import type { AppState } from "../types";
 
 afterEach(cleanup);
@@ -13,12 +13,20 @@ function show(state: AppState = fallbackState) {
   };
   render(<ControlView state={state} phase={stateToPhase[state.voice_state]}
     commandStatus="Idle" recordingSeconds={73}
-    primaryDisabled={!canStartOrStop(state.voice_state)} ActionIcon={actionIcon(state.voice_state)}
+    primaryDisabled={false} ActionIcon={actionIcon(state.voice_state)}
     {...callbacks} />);
   return callbacks;
 }
 
 describe("control workspace actions", () => {
+  it("shows a restore warning as inserted and labels a repeat paste explicitly", () => {
+    show({ ...fallbackState, voice_state: "Inserted", last_transcript: "Already pasted",
+      last_error: "Paste completed. Clipboard could not be restored. Do not retry." });
+    expect(screen.getByRole("heading", { name: "Your words are in." })).toBeVisible();
+    expect(screen.queryByRole("button", { name: "Retry insertion" })).not.toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "Paste again" })).toBeEnabled();
+    expect(screen.getByRole("alert")).toHaveTextContent("Do not retry");
+  });
   it.each(["Preparing", "Recording", "Processing"] as const)("protects the %s session from older transcript actions", (voice_state) => {
     const callbacks = show({ ...fallbackState, voice_state, last_transcript: "Previous words" });
     const copy = screen.getByRole("button", { name: "Copy transcript" });
@@ -67,10 +75,13 @@ describe("control workspace actions", () => {
     expect(callbacks.onPaste).toHaveBeenCalledOnce();
   });
 
-  it("keeps the preparing action disabled while showing the setup command when available", () => {
+  it("allows cancelling microphone preparation while retaining setup", () => {
     const callbacks = show({ ...fallbackState, voice_state: "Preparing",
       diagnostics: { ...fallbackState.diagnostics, setup_available: true } });
-    expect(screen.getByRole("button", { name: "Starting" })).toBeDisabled();
+    const cancel = screen.getByRole("button", { name: "Cancel start" });
+    expect(cancel).toBeEnabled();
+    fireEvent.click(cancel);
+    expect(callbacks.onPrimary).toHaveBeenCalledOnce();
     fireEvent.click(screen.getByRole("button", { name: "Run setup" }));
     expect(callbacks.onSetup).toHaveBeenCalledOnce();
   });

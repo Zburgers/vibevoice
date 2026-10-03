@@ -18,6 +18,21 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
+  rust-advisories:
+    name: Rust dependency advisories
+    runs-on: ubuntu-22.04
+    steps:
+      - name: Checkout
+        uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@d1031067263f94b142dd6c0ce24c5eb9d02d52a0 # master
+        with:
+          toolchain: stable
+      - name: Install pinned Cargo audit
+        run: cargo install cargo-audit --locked --version 0.22.2
+      - name: Reject Rust dependency vulnerabilities
+        run: cargo audit --file app/src-tauri/Cargo.lock
+
   rust:
     name: Rust checks
     runs-on: ubuntu-22.04
@@ -40,6 +55,9 @@ jobs:
             libayatana-appindicator3-dev \
             librsvg2-dev
 
+      - name: Install disposable X11 clipboard test display
+        run: sudo apt-get install -y --no-install-recommends xvfb xauth
+
       - name: Cache Rust
         uses: swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
         with:
@@ -53,6 +71,9 @@ jobs:
 
       - name: Run Rust tests
         run: cargo test --locked --manifest-path app/src-tauri/Cargo.toml --no-default-features
+
+      - name: Verify native empty Linux clipboard and inaccessible display
+        run: xvfb-run -a cargo test --locked --manifest-path app/src-tauri/Cargo.toml linux_empty_clipboard_native_probe -- --ignored --test-threads=1
 
   frontend:
     name: Frontend checks
@@ -117,6 +138,9 @@ jobs:
         working-directory: app
       - name: Run native Rust tests
         run: cargo test --locked --manifest-path app/src-tauri/Cargo.toml
+      - name: Verify native mixed Windows clipboard stays untouched
+        if: runner.os == 'Windows'
+        run: cargo test --locked --manifest-path app/src-tauri/Cargo.toml windows_mixed_clipboard_native_probe -- --ignored --test-threads=1
       - name: Run native Clippy
         run: cargo clippy --locked --manifest-path app/src-tauri/Cargo.toml --all-targets -- -D warnings
       - name: Build native release executable without publishing

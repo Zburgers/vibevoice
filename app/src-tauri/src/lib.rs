@@ -36,8 +36,11 @@ mod windows_startup;
 
 use uuid::Uuid;
 
+#[cfg(target_os = "macos")]
+mod macos_paste;
 mod meter;
 mod performance;
+mod platform_clipboard;
 mod whisper_update;
 use performance::{ProcessUsage, TranscriptionMetrics};
 #[cfg(target_os = "windows")]
@@ -53,7 +56,9 @@ use cpal::{
 };
 
 #[cfg(any(target_os = "windows", target_os = "macos"))]
-use std::sync::mpsc::{self, Sender};
+mod audio_writer;
+#[cfg(any(target_os = "windows", target_os = "macos"))]
+use audio_writer::{AudioQueue, Message as AudioWriterMessage};
 
 const AUTO_PATH: &str = "auto";
 const MODEL_FILE_NAME: &str = "ggml-base.en.bin";
@@ -65,7 +70,9 @@ const RELEASES_URL: &str = "https://github.com/Zburgers/vibevoice/releases";
 const DEFAULT_MAX_HISTORY_ENTRIES: usize = 100;
 const MAX_HISTORY_ENTRIES: usize = 1000;
 const DIAGNOSTICS_CACHE_TTL: Duration = Duration::from_secs(5);
+#[cfg(not(target_os = "macos"))]
 const PASTE_HELPER_TIMEOUT: Duration = Duration::from_secs(2);
+#[cfg(any(not(target_os = "macos"), test))]
 const PASTE_HELPER_POLL_INTERVAL: Duration = Duration::from_millis(20);
 const DEFAULT_TRANSCRIPTION_TIMEOUT_SECONDS: u64 = 900;
 const MIN_TRANSCRIPTION_TIMEOUT_SECONDS: u64 = 30;
@@ -199,6 +206,7 @@ struct InsertionReport {
     paste_status: String,
     clipboard_restored: bool,
     error: Option<String>,
+    warning: Option<String>,
 }
 
 impl Default for InsertionReport {
@@ -209,6 +217,7 @@ impl Default for InsertionReport {
             paste_status: "not_attempted".to_string(),
             clipboard_restored: false,
             error: None,
+            warning: None,
         }
     }
 }
@@ -270,7 +279,7 @@ struct RecordingSession {
     started: Instant,
     started_at: DateTime<Utc>,
     stream: Option<Stream>,
-    writer_tx: std::sync::mpsc::Sender<AudioWriterMessage>,
+    writer_tx: AudioQueue,
     writer_thread: Option<std::thread::JoinHandle<Result<(), String>>>,
     mic_level: Arc<AtomicU32>,
     spectrum: SharedSpectrum,
@@ -288,16 +297,13 @@ struct RecordingSession {
 }
 
 #[cfg(any(target_os = "windows", target_os = "macos"))]
+// SAFETY: this platform-specific session is moved only while serialized by
+// the lifecycle/runtime locks. Windows WASAPI and macOS CoreAudio own their
+// callback workers; no concurrent Rust access to Stream occurs. Stream drop
+// joins callbacks before writer finalization. CPAL's generic !Send marker
+// also covers unsupported platforms; this override is restricted to these
+// two qualified backends and must be re-audited on a CPAL/backend upgrade.
 unsafe impl Send for RecordingSession {}
-
-#[cfg(target_os = "linux")]
-unsafe impl Send for RecordingSession {}
-
-#[cfg(any(target_os = "windows", target_os = "macos"))]
-enum AudioWriterMessage {
-    Samples(Vec<i16>),
-    Stop,
-}
 
 struct RuntimeState {
     last_transcription_metrics: Option<TranscriptionMetrics>,
@@ -1107,7 +1113,11 @@ fn finish_recording(
         .map_err(|lock_error| lock_error.to_string())?;
     runtime.voice_state = voice_state_for_insertion_report(&insertion_report);
     runtime.last_transcript = Some(final_transcript);
-    runtime.last_error = insertion_report.error.clone().or(history_error);
+    runtime.last_error = insertion_report
+        .error
+        .clone()
+        .or(insertion_report.warning.clone())
+        .or(history_error);
     runtime.mic_level = 0.0;
     drop(runtime);
     emit_state_changed(&app);
@@ -2684,7 +2694,8 @@ fn start_audio_capture_impl(
     let mic_level = Arc::new(AtomicU32::new(0));
     let spectrum = empty_spectrum();
     let writer_spectrum = Arc::clone(&spectrum);
-    let (writer_tx, writer_rx) = mpsc::channel::<AudioWriterMessage>();
+    let (writer_tx, writer_rx) = AudioQueue::new(64);
+    let writer_failed = writer_tx.failed_flag();
     let writer_path = audio_path.clone();
     let writer_thread = thread::spawn(move || -> Result<(), String> {
         let spec = hound::WavSpec {
@@ -2711,7 +2722,11 @@ fn start_audio_capture_impl(
         }
         writer
             .finalize()
-            .map_err(|error| format!("Could not finalize WAV file: {error}"))
+            .map_err(|error| format!("Could not finalize WAV file: {error}"))?;
+        if writer_failed.load(Ordering::Acquire) {
+            return Err("Recording could not keep up with storage. Audio was incomplete; please record again.".into());
+        }
+        Ok(())
     });
 
     let stream_result = match sample_format {
@@ -2756,7 +2771,7 @@ fn start_audio_capture_impl(
     let stream = match stream_result {
         Ok(stream) => stream,
         Err(error) => {
-            let _ = writer_tx.send(AudioWriterMessage::Stop);
+            writer_tx.stop();
             let _ = writer_thread.join();
             let _ = fs::remove_file(&audio_path);
             return Err(format!(
@@ -2838,7 +2853,7 @@ fn stop_audio_capture_impl(session: &mut RecordingSession) -> Result<(), String>
     // Pause alone does not establish callback completion; late samples could
     // otherwise arrive behind Stop and be discarded.
     drop(session.stream.take());
-    let _ = session.writer_tx.send(AudioWriterMessage::Stop);
+    session.writer_tx.stop();
     if let Some(writer_thread) = session.writer_thread.take() {
         writer_thread
             .join()
@@ -2856,14 +2871,14 @@ fn stop_audio_capture_impl(session: &mut RecordingSession) -> Result<(), String>
 fn write_mono_samples<T, F>(
     data: &[T],
     channels: usize,
-    writer_tx: &Sender<AudioWriterMessage>,
+    writer_tx: &AudioQueue,
     mic_level: &Arc<AtomicU32>,
     convert: F,
 ) where
     T: Copy,
     F: Fn(T) -> i16,
 {
-    if channels == 0 {
+    if channels == 0 || writer_tx.has_failed() {
         return;
     }
     let mut output = Vec::with_capacity(data.len() / channels.max(1));
@@ -2881,7 +2896,7 @@ fn write_mono_samples<T, F>(
         ((peak as f32 / i16::MAX as f32) * 1000.0) as u32,
         Ordering::Relaxed,
     );
-    let _ = writer_tx.send(AudioWriterMessage::Samples(output));
+    writer_tx.push(output);
 }
 
 #[cfg(any(target_os = "windows", target_os = "macos"))]
@@ -3075,6 +3090,12 @@ fn copy_to_clipboard(app: &AppHandle, text: &str) -> Result<String, String> {
 }
 
 fn snapshot_text_clipboard(app: &AppHandle) -> Result<ClipboardSnapshot, String> {
+    // Inspect formats before choosing a representation. On Windows this
+    // rejects rich/mixed data before arboard can silently select plain text.
+    let empty = platform_clipboard::is_empty()?;
+    if empty {
+        return Ok(ClipboardSnapshot::Empty);
+    }
     snapshot_clipboard_contents(
         || {
             app.clipboard()
@@ -3091,16 +3112,7 @@ fn snapshot_text_clipboard(app: &AppHandle) -> Result<ClipboardSnapshot, String>
                 })
                 .map_err(|error| error.to_string())
         },
-        || {
-            #[cfg(target_os = "windows")]
-            {
-                windows_clipboard::is_empty()
-            }
-            #[cfg(not(target_os = "windows"))]
-            {
-                Ok(false)
-            }
-        },
+        || Ok(false),
     )
 }
 
@@ -3109,15 +3121,14 @@ fn snapshot_clipboard_contents(
     read_image: impl FnOnce() -> Result<ClipboardSnapshot, String>,
     is_empty: impl FnOnce() -> Result<bool, String>,
 ) -> Result<ClipboardSnapshot, String> {
-    match read_text() {
-        Ok(text) => Ok(ClipboardSnapshot::Text(text)),
-        Err(text_error) => match read_image() {
-            Ok(image) => Ok(image),
-            Err(_) => match is_empty() {
+    match (read_text(), read_image()) {
+        (Ok(_), Ok(_)) => Err("Auto paste cannot restore mixed text and image contents. The clipboard was left untouched. Your transcript is ready; use Copy transcript when you want to replace it.".into()),
+        (Ok(text), Err(_)) => Ok(ClipboardSnapshot::Text(text)),
+        (Err(_), Ok(image)) => Ok(image),
+        (Err(text_error), Err(_)) => match is_empty() {
                 Ok(true) => Ok(ClipboardSnapshot::Empty),
                 Ok(false) => Err(format!("Auto paste could not preserve the clipboard: {text_error}. Your transcript is ready; use Copy transcript or change the clipboard contents and retry insertion.")),
                 Err(error) => Err(format!("Clipboard read failed: {error}. Your transcript is ready; retry insertion or use Copy transcript.")),
-            },
         },
     }
 }
@@ -3188,19 +3199,12 @@ where
     Paste: FnOnce() -> Result<String, String>,
     Restore: FnOnce(&ClipboardSnapshot) -> Result<(), String>,
 {
-    if !should_copy {
+    // Paste always stages a temporary clipboard, independently of whether
+    // clipboard-only output is requested by the fallback setting.
+    if !should_copy && !should_paste {
         return InsertionReport {
-            outcome: if should_paste {
-                InsertionOutcome::Failed
-            } else {
-                InsertionOutcome::Cancelled
-            },
-            paste_status: if should_paste {
-                "not_attempted".to_string()
-            } else {
-                "not_requested".to_string()
-            },
-            error: should_paste.then(|| "Paste requires a clipboard copy.".to_string()),
+            outcome: InsertionOutcome::Cancelled,
+            paste_status: "not_requested".to_string(),
             ..InsertionReport::default()
         };
     }
@@ -3266,7 +3270,14 @@ fn insertion_report_from_results(
         errors.push(error);
     }
     if let Err(error) = restore_result {
-        errors.push(format!("Clipboard restore failed: {error}"));
+        let message = format!("Clipboard could not be restored: {error}");
+        if errors.is_empty() && should_paste {
+            report.warning = Some(format!(
+                "Paste completed. {message}. Do not retry unless you want to paste the text again."
+            ));
+        } else {
+            errors.push(message);
+        }
     }
     report.error = (!errors.is_empty()).then(|| errors.join(" "));
     report.outcome = if report.error.is_some() {
@@ -3280,33 +3291,41 @@ fn insertion_report_from_results(
 }
 
 fn paste_from_clipboard() -> Result<String, String> {
-    if cfg!(target_os = "windows") {
-        let mut command = Command::new("powershell");
-        configure_command(&mut command);
-        command.args([
+    #[cfg(target_os = "macos")]
+    {
+        return macos_paste::paste();
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        if cfg!(target_os = "windows") {
+            let mut command = Command::new("powershell");
+            configure_command(&mut command);
+            command.args([
             "-STA",
             "-NoProfile",
             "-Command",
             "Add-Type -AssemblyName System.Windows.Forms; [System.Windows.Forms.SendKeys]::SendWait('^v')",
         ]);
-        return run_paste_helper(&mut command, "powershell:SendKeys", PASTE_HELPER_TIMEOUT);
-    }
-    let candidates: [(&str, &[&str]); 3] = [
-        ("wtype", &["-M", "ctrl", "v", "-m", "ctrl"]),
-        ("xdotool", &["key", "ctrl+v"]),
-        ("ydotool", &["key", "29:1", "47:1", "47:0", "29:0"]),
-    ];
-    for (cmd, args) in candidates {
-        if command_exists(cmd) {
-            let mut command = Command::new(cmd);
-            configure_command(&mut command);
-            command.args(args);
-            return run_paste_helper(&mut command, cmd, PASTE_HELPER_TIMEOUT);
+            return run_paste_helper(&mut command, "powershell:SendKeys", PASTE_HELPER_TIMEOUT);
         }
+        let candidates: [(&str, &[&str]); 3] = [
+            ("wtype", &["-M", "ctrl", "v", "-m", "ctrl"]),
+            ("xdotool", &["key", "ctrl+v"]),
+            ("ydotool", &["key", "29:1", "47:1", "47:0", "29:0"]),
+        ];
+        for (cmd, args) in candidates {
+            if command_exists(cmd) {
+                let mut command = Command::new(cmd);
+                configure_command(&mut command);
+                command.args(args);
+                return run_paste_helper(&mut command, cmd, PASTE_HELPER_TIMEOUT);
+            }
+        }
+        Err("Paste tool missing. Install wtype on Wayland or xdotool on X11.".to_string())
     }
-    Err("Paste tool missing. Install wtype on Wayland or xdotool on X11.".to_string())
 }
 
+#[cfg(any(not(target_os = "macos"), test))]
 fn run_paste_helper(
     command: &mut Command,
     tool: &str,
@@ -3343,6 +3362,7 @@ fn run_paste_helper(
     }
 }
 
+#[cfg(any(not(target_os = "macos"), test))]
 fn cleanup_paste_helper(child: &mut std::process::Child) -> Option<String> {
     let kill_error = child.kill().err();
     let wait_error = child.wait().err();
@@ -3381,6 +3401,7 @@ fn command_exists(name: &str) -> bool {
         .unwrap_or(false)
 }
 
+#[cfg(not(target_os = "macos"))]
 fn first_command(names: &[&str]) -> Option<String> {
     names
         .iter()
@@ -3393,10 +3414,17 @@ fn clipboard_tool_name() -> Option<String> {
 }
 
 fn paste_tool_name() -> Option<String> {
-    if cfg!(target_os = "windows") {
-        return command_exists("powershell").then(|| "powershell:SendKeys".to_string());
+    #[cfg(target_os = "macos")]
+    {
+        return Some("macos:Command-V (Accessibility required)".into());
     }
-    first_command(&["wtype", "xdotool", "ydotool"])
+    #[cfg(not(target_os = "macos"))]
+    {
+        if cfg!(target_os = "windows") {
+            return command_exists("powershell").then(|| "powershell:SendKeys".to_string());
+        }
+        first_command(&["wtype", "xdotool", "ydotool"])
+    }
 }
 
 fn insert_action_status(report: &InsertionReport) -> InsertActionStatus {
@@ -3416,7 +3444,7 @@ fn insert_action_status(report: &InsertionReport) -> InsertActionStatus {
     };
     InsertActionStatus {
         insert_status,
-        error: report.error.clone(),
+        error: report.error.clone().or(report.warning.clone()),
     }
 }
 
@@ -3438,7 +3466,7 @@ fn update_runtime_after_insertion(
     let mut runtime = data.runtime.lock().map_err(|error| error.to_string())?;
     runtime.voice_state = voice_state_for_insertion_report(report);
     runtime.last_transcript = Some(text.to_string());
-    runtime.last_error = report.error.clone();
+    runtime.last_error = report.error.clone().or(report.warning.clone());
     drop(runtime);
     emit_state_changed(app);
     Ok(())
@@ -4681,6 +4709,58 @@ mod tests {
     }
 
     #[test]
+    fn successful_paste_with_failed_restore_is_inserted_with_a_warning() {
+        let report = insertion_report_from_results(
+            true,
+            Ok("clipboard".into()),
+            Some(Ok("paste".into())),
+            Err("busy".into()),
+        );
+        assert_eq!(report.outcome, InsertionOutcome::Inserted);
+        assert!(matches!(
+            voice_state_for_insertion_report(&report),
+            VoiceState::Inserted
+        ));
+        assert_eq!(report.error, None);
+        assert!(!report.clipboard_restored);
+        assert!(report.warning.as_deref().unwrap().contains("Do not retry"));
+        assert_eq!(
+            insert_action_status(&report).insert_status,
+            "inserted:paste"
+        );
+    }
+
+    #[test]
+    fn auto_paste_stages_and_restores_even_with_clipboard_fallback_off() {
+        use std::cell::RefCell;
+        let actions = RefCell::new(Vec::new());
+        let report = execute_insertion_transaction(
+            "words",
+            false,
+            true,
+            || {
+                actions.borrow_mut().push("snapshot");
+                Ok(ClipboardSnapshot::Empty)
+            },
+            || {
+                actions.borrow_mut().push("copy");
+                Ok("clipboard".into())
+            },
+            || {
+                actions.borrow_mut().push("paste");
+                Ok("paste".into())
+            },
+            |_| {
+                actions.borrow_mut().push("restore");
+                Ok(())
+            },
+        );
+        assert_eq!(report.outcome, InsertionOutcome::Inserted);
+        assert!(report.clipboard_restored);
+        assert_eq!(*actions.borrow(), ["snapshot", "copy", "paste", "restore"]);
+    }
+
+    #[test]
     fn insertion_report_records_clipboard_snapshot_failure() {
         let report = execute_insertion_transaction(
             "transcript",
@@ -4725,7 +4805,7 @@ mod tests {
     }
 
     #[test]
-    fn clipboard_snapshot_preserves_image_and_prefers_text() {
+    fn clipboard_snapshot_preserves_single_payload_and_refuses_mixed_contents() {
         let image = ClipboardSnapshot::Image {
             rgba: vec![10, 20, 30, 255],
             width: 1,
@@ -4743,12 +4823,19 @@ mod tests {
         assert_eq!(
             snapshot_clipboard_contents(
                 || Ok("previous text".into()),
-                || panic!("text is enough"),
+                || Err("no image".into()),
                 || panic!("text is not empty"),
             )
             .unwrap(),
             ClipboardSnapshot::Text("previous text".into())
         );
+        assert!(snapshot_clipboard_contents(
+            || Ok("mixed text".into()),
+            || Ok(image),
+            || panic!("occupied")
+        )
+        .unwrap_err()
+        .contains("left untouched"));
     }
 
     #[test]

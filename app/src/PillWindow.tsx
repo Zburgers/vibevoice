@@ -100,7 +100,7 @@ export function PillWindow({
           <div className="pill-actions">
             <button type="button" className={`primary-action tone-${tone}`} disabled={primaryDisabled} onClick={onPrimary}>
               <ActionIcon size={16} className={state.voice_state === "Preparing" || state.voice_state === "Processing" ? "spin" : ""} />
-              <span>{state.voice_state === "Recording" ? "Stop" : state.voice_state === "Processing" ? "Cancel" : state.voice_state === "Error" ? "Retry" : "Record"}</span>
+              <span>{state.voice_state === "Recording" ? "Stop" : state.voice_state === "Preparing" ? "Cancel start" : state.voice_state === "Processing" ? "Cancel" : state.voice_state === "Error" ? "Retry" : "Record"}</span>
             </button>
             <button type="button" className="secondary-action" disabled={!state.last_transcript || ["Preparing", "Recording", "Processing"].includes(state.voice_state)} onClick={onPaste}>
               <RotateCcw size={15} />
