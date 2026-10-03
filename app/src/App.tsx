@@ -17,7 +17,8 @@ import {
   navItems,
   stateToPhase,
 } from "./types";
-import type { AppState, InsertionReport, LibraryMode, MeterPayload, Settings, TabKey, UpdateStatus } from "./types";
+import type { AppState, InsertionReport, LibraryMode, MeterPayload, Settings, TabKey, UpdateStatus, WhisperProgress } from "./types";
+import { WhisperUpdatePanel } from "./WhisperUpdatePanel";
 import { StatusChip } from "./ui";
 import { ControlView } from "./views/ControlView";
 import { DiagnosticsView } from "./views/DiagnosticsView";
@@ -91,6 +92,8 @@ function App() {
   const [newRuleReplacement, setNewRuleReplacement] = useState("");
   const [updateStatus, setUpdateStatus] = useState<UpdateStatus>(initialUpdateStatus);
   const [pendingUpdate, setPendingUpdate] = useState<Update | null>(null);
+  const [whisperProgress, setWhisperProgress] = useState<WhisperProgress | null>(null);
+  const [whisperPending, setWhisperPending] = useState(false);
   const [, setTimerTick] = useState(0);
   const [pillFlipX, setPillFlipX] = useState(false);
   const [pillFlipY, setPillFlipY] = useState(false);
@@ -113,7 +116,7 @@ function App() {
       ? Math.max(0, Math.floor((Date.now() - new Date(state.recording_started_at).getTime()) / 1000))
       : 0;
   const lastText = state.last_transcript || state.last_error || "No transcript captured yet.";
-  const primaryDisabled = !canStartOrStop(state.voice_state);
+  const primaryDisabled = !canStartOrStop(state.voice_state) || whisperPending || Boolean(state.whisper_update?.busy);
   const ActionIcon = actionIcon(state.voice_state);
 
   async function refresh(forceDiagnostics = false) {
@@ -219,6 +222,7 @@ function App() {
 
     let cleanupState: (() => void) | undefined;
     let cleanupMeter: (() => void) | undefined;
+    let cleanupWhisper: (() => void) | undefined;
     let disposed = false;
 
     listen("vibevoice-state-changed", () => {
@@ -239,13 +243,48 @@ function App() {
       })
       .catch((error) => setCommandStatus(errorMessage(error)));
 
+    listen<WhisperProgress>("vibevoice-whisper-update", (event) => setWhisperProgress(event.payload))
+      .then((cleanup) => {
+        if (disposed) cleanup();
+        else cleanupWhisper = cleanup;
+      })
+      .catch((error) => setCommandStatus(errorMessage(error)));
+
     return () => {
       disposed = true;
       cleanupState?.();
       cleanupMeter?.();
+      cleanupWhisper?.();
     };
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [inTauri]);
+
+  async function handleWhisperUpdate(component: "engine" | "model") {
+    if (!inTauri || whisperPending) return;
+    setWhisperPending(true);
+    setWhisperProgress({ component, stage: "checking", downloaded_bytes: 0, total_bytes: 0, message: "Checking Whisper components…" });
+    try {
+      const message = await invoke<string>("update_whisper_component", { component });
+      setWhisperProgress({ component, stage: "complete", downloaded_bytes: 0, total_bytes: 0, message });
+    } catch (error) {
+      setWhisperProgress({ component, stage: "failed", downloaded_bytes: 0, total_bytes: 0, message: errorMessage(error) });
+    } finally {
+      setWhisperPending(false);
+      await refresh(true).catch((error) => setCommandStatus(errorMessage(error)));
+    }
+  }
+
+  async function handleWhisperCancel() {
+    try {
+      await invoke("cancel_whisper_update");
+      setWhisperProgress((current) => current && ({ ...current, message: "Cancelling update…" }));
+    } catch (error) {
+      setCommandStatus(errorMessage(error));
+    }
+  }
+
+  const componentManager = <WhisperUpdatePanel state={state} progress={whisperProgress} pending={whisperPending}
+    onUpdate={handleWhisperUpdate} onCancel={handleWhisperCancel} />;
 
   useEffect(() => {
     if (state.voice_state !== "Recording") return;
@@ -760,6 +799,7 @@ function App() {
 
           {activeTab === "settings" && (
             <SettingsView
+              componentManager={componentManager}
               status={commandStatus}
               state={state}
               onUpdate={updateSettings}
@@ -794,6 +834,7 @@ function App() {
 
           {activeTab === "diagnostics" && (
             <DiagnosticsView
+              componentManager={componentManager}
               state={state}
               updateStatus={updateStatus}
               setupMessage={setupMessage}

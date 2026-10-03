@@ -32,13 +32,16 @@ use tauri_plugin_dialog::DialogExt;
 use tauri_plugin_global_shortcut::{Code, GlobalShortcutExt, Modifiers, Shortcut, ShortcutState};
 use tauri_plugin_opener::OpenerExt;
 #[cfg(target_os = "windows")]
-mod windows_clipboard;
-#[cfg(target_os = "windows")]
 mod windows_startup;
 
 use uuid::Uuid;
 
 mod meter;
+mod performance;
+mod whisper_update;
+use performance::{ProcessUsage, TranscriptionMetrics};
+#[cfg(target_os = "windows")]
+mod windows_clipboard;
 #[cfg(any(target_os = "windows", target_os = "macos"))]
 use meter::SpectrumAnalyzer;
 use meter::{empty_spectrum, read_spectrum, SharedSpectrum, BAND_COUNT};
@@ -98,6 +101,7 @@ struct Settings {
     whisper_binary_path: String,
     model_path: String,
     transcription_timeout_seconds: u64,
+    transcription_threads: usize,
     hotkey: String,
     recording_mode: String,
     auto_paste: bool,
@@ -116,6 +120,7 @@ impl Default for Settings {
             whisper_binary_path: AUTO_PATH.to_string(),
             model_path: AUTO_PATH.to_string(),
             transcription_timeout_seconds: DEFAULT_TRANSCRIPTION_TIMEOUT_SECONDS,
+            transcription_threads: 0,
             hotkey: "Ctrl+Alt+Space".to_string(),
             recording_mode: "toggle".to_string(),
             auto_paste: true,
@@ -231,6 +236,7 @@ struct DictionaryRule {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct AppStateSnapshot {
+    whisper_update: whisper_update::Catalog,
     app_version: String,
     voice_state: VoiceState,
     settings: Settings,
@@ -242,6 +248,7 @@ struct AppStateSnapshot {
     mic_level: f32,
     mic_bands: [f32; BAND_COUNT],
     recording_started_at: Option<DateTime<Utc>>,
+    last_transcription_metrics: Option<TranscriptionMetrics>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -262,7 +269,7 @@ struct RecordingSession {
     output_prefix: PathBuf,
     started: Instant,
     started_at: DateTime<Utc>,
-    stream: Stream,
+    stream: Option<Stream>,
     writer_tx: std::sync::mpsc::Sender<AudioWriterMessage>,
     writer_thread: Option<std::thread::JoinHandle<Result<(), String>>>,
     mic_level: Arc<AtomicU32>,
@@ -293,6 +300,7 @@ enum AudioWriterMessage {
 }
 
 struct RuntimeState {
+    last_transcription_metrics: Option<TranscriptionMetrics>,
     voice_state: VoiceState,
     recording: Option<RecordingSession>,
     last_transcript: Option<String>,
@@ -310,6 +318,7 @@ struct RuntimeState {
 impl Default for RuntimeState {
     fn default() -> Self {
         Self {
+            last_transcription_metrics: None,
             voice_state: VoiceState::Ready,
             recording: None,
             last_transcript: None,
@@ -342,6 +351,8 @@ struct DiagnosticsCache {
 }
 
 struct AppData {
+    component_update_busy: Arc<AtomicBool>,
+    component_update_cancel: Arc<AtomicBool>,
     settings: Mutex<()>,
     hotkey_capture: AtomicBool,
     hotkey_down: AtomicBool,
@@ -389,6 +400,7 @@ fn get_app_state(
         .map(|session| session.mic_level.load(Ordering::Relaxed) as f32 / 1000.0)
         .unwrap_or(runtime.mic_level);
     Ok(AppStateSnapshot {
+        whisper_update: whisper_update::catalog(data.component_update_busy.load(Ordering::Acquire)),
         app_version: env!("CARGO_PKG_VERSION").to_string(),
         voice_state: runtime.voice_state.clone(),
         settings: settings.clone(),
@@ -404,6 +416,7 @@ fn get_app_state(
             .map(|session| read_spectrum(&session.spectrum))
             .unwrap_or([0.0; BAND_COUNT]),
         recording_started_at,
+        last_transcription_metrics: runtime.last_transcription_metrics.clone(),
     })
 }
 
@@ -448,7 +461,14 @@ fn copy_diagnostics_report(
     let runtime = data.runtime.lock().map_err(|error| error.to_string())?;
     let diagnostics =
         cached_diagnostics(&app, &data, &settings, runtime.last_error.clone(), false)?;
-    let report = format_diagnostics_report(&diagnostics, &updater_status);
+    let mut report = format_diagnostics_report(&diagnostics, &updater_status);
+    if let Some(metrics) = runtime.last_transcription_metrics.as_ref() {
+        report.push_str(&format!(
+            "last_transcription_metrics: {}\n",
+            serde_json::to_string(metrics).map_err(|e| e.to_string())?
+        ));
+    }
+    drop(runtime);
     with_insertion_lock(&data.insertion, || {
         copy_to_clipboard(&app, &report).map(|_| ())
     })
@@ -462,11 +482,16 @@ fn save_settings(
     window: WebviewWindow,
 ) -> Result<Settings, String> {
     authorize_window(&window, &["main"])?;
+    let _lifecycle = data.lifecycle.lock().map_err(|e| e.to_string())?;
+    if data.component_update_busy.load(Ordering::Acquire) {
+        return Err("Wait for the Whisper update before changing settings.".into());
+    }
     let _guard = data.settings.lock().map_err(|error| error.to_string())?;
     settings.transcription_timeout_seconds = settings.transcription_timeout_seconds.clamp(
         MIN_TRANSCRIPTION_TIMEOUT_SECONDS,
         MAX_TRANSCRIPTION_TIMEOUT_SECONDS,
     );
+    settings.transcription_threads = settings.transcription_threads.min(16);
     let previous = load_settings(&app)?;
     // Validate before touching working OS registrations or persisting anything.
     if settings.whisper_binary_path != previous.whisper_binary_path {
@@ -740,6 +765,11 @@ fn invalidate_preparation(runtime: &mut RuntimeState) {
 
 fn begin_recording(app: AppHandle, data: tauri::State<'_, AppData>) -> Result<(), String> {
     let lifecycle = data.lifecycle.lock().map_err(|error| error.to_string())?;
+    if data.component_update_busy.load(Ordering::Acquire) {
+        return Err(
+            "Whisper components are updating. Wait or cancel the update before recording.".into(),
+        );
+    }
     if data.shutdown.load(Ordering::Acquire) {
         return Err("VibeVoice is shutting down.".to_string());
     }
@@ -840,7 +870,15 @@ fn prepare_recording_session(app: &AppHandle) -> Result<RecordingSession, String
     let output_prefix = tmp.join(stem);
     let session = start_audio_capture(audio_path, output_prefix)?;
     #[cfg(any(target_os = "windows", target_os = "macos"))]
-    start_recording_stream(&session)?;
+    let session = {
+        let mut session = session;
+        if let Err(error) = start_recording_stream(&session) {
+            let _ = stop_audio_capture(&mut session);
+            cleanup_recording_artifacts(&session);
+            return Err(error);
+        }
+        session
+    };
     Ok(session)
 }
 
@@ -875,6 +913,9 @@ async fn stop_recording_impl(
             emit_state_changed(&app);
             return Ok(());
         }
+        // Repeated Stop calls must not clear Processing and admit a second
+        // recording while the first worker still owns transcription/insertion.
+        ensure_stop_allowed(&runtime)?;
         match runtime.recording.take() {
             Some(session) => {
                 runtime.preparing_generation = None;
@@ -941,15 +982,50 @@ fn cancel_transcription(
     window: WebviewWindow,
 ) -> Result<(), String> {
     authorize_window(&window, &["main", "pill"])?;
-    let cancel = data
+    let current = data
         .transcription_cancel
         .lock()
-        .map_err(|error| error.to_string())?
-        .clone()
-        .ok_or_else(|| "No transcription is running.".to_string())?;
+        .map_err(|error| error.to_string())?;
+    let cancel = current
+        .as_ref()
+        .ok_or_else(|| "No cancellable transcription is running.".to_string())?;
     cancel.store(true, Ordering::Relaxed);
+    drop(current);
     emit_state_changed(&app);
     Ok(())
+}
+
+fn ensure_stop_allowed(runtime: &RuntimeState) -> Result<(), String> {
+    if matches!(runtime.voice_state, VoiceState::Processing) {
+        Err("Recording is still processing. Please wait or cancel transcription.".to_string())
+    } else {
+        Ok(())
+    }
+}
+
+fn claim_transcription_result(
+    current: &Mutex<Option<Arc<AtomicBool>>>,
+    cancel: &AtomicBool,
+    shutdown: &AtomicBool,
+) -> Result<(), String> {
+    let mut current = current.lock().map_err(|e| e.to_string())?;
+    if cancel.load(Ordering::Relaxed) || shutdown.load(Ordering::Acquire) {
+        return Err("Transcription cancelled.".to_string());
+    }
+    if !current
+        .as_ref()
+        .is_some_and(|token| std::ptr::eq(token.as_ref(), cancel))
+    {
+        return Err("Transcription is no longer current.".to_string());
+    }
+    *current = None;
+    Ok(())
+}
+
+fn recording_audio_duration_ms(audio_path: &Path) -> Result<u64, String> {
+    let reader = hound::WavReader::open(audio_path)
+        .map_err(|error| format!("Recorded audio is invalid: {error}"))?;
+    Ok(reader.duration() as u64 * 1000 / reader.spec().sample_rate.max(1) as u64)
 }
 
 fn finish_recording(
@@ -959,19 +1035,27 @@ fn finish_recording(
     shutdown: &AtomicBool,
 ) -> Result<HistoryItem, String> {
     stop_audio_capture(session)?;
+    let audio_ms = recording_audio_duration_ms(&session.audio_path)?;
     validate_recording_audio(&session.audio_path)?;
     if shutdown.load(Ordering::Acquire) {
         return Err("Recording cancelled during shutdown.".to_string());
     }
     let settings = load_settings(&app)?;
     let dictionary = load_dictionary(&app)?;
-    let raw_transcript = transcribe(
+    let (raw_transcript, mut metrics) = transcribe(
         &settings,
         &session.audio_path,
         &session.output_prefix,
         transcription_cancel,
         shutdown,
     )?;
+    metrics.audio_ms = audio_ms;
+    metrics.session_ms = session.started.elapsed().as_millis() as u64;
+    app.state::<AppData>()
+        .runtime
+        .lock()
+        .map_err(|e| e.to_string())?
+        .last_transcription_metrics = Some(metrics);
     let final_transcript = prepare_transcript(&raw_transcript, &settings, &dictionary);
 
     if final_transcript.is_empty() {
@@ -984,6 +1068,10 @@ fn finish_recording(
     }
 
     let data = app.state::<AppData>();
+    // Claim insertion under the same mutex used by Cancel. Once claimed,
+    // Cancel reports that transcription is no longer cancellable; a Cancel
+    // acknowledged before this boundary prevents clipboard/paste side effects.
+    claim_transcription_result(&data.transcription_cancel, transcription_cancel, shutdown)?;
     let insertion_report = coordinate_insertion(
         &app,
         &data,
@@ -997,7 +1085,7 @@ fn finish_recording(
         created_at: Utc::now(),
         raw_transcript,
         final_transcript: final_transcript.clone(),
-        duration_ms: Some(session.started.elapsed().as_millis()),
+        duration_ms: Some(audio_ms as u128),
         insert_status: action_status.insert_status,
         error: action_status.error,
         insertion_report: insertion_report.clone(),
@@ -1201,6 +1289,104 @@ fn setup_script_name() -> &'static str {
     }
 }
 
+fn components_idle(runtime: &RuntimeState) -> Result<(), String> {
+    if matches!(
+        runtime.voice_state,
+        VoiceState::Preparing | VoiceState::Recording | VoiceState::Processing
+    ) {
+        Err("Stop recording and wait for transcription before updating Whisper.".into())
+    } else {
+        Ok(())
+    }
+}
+
+#[tauri::command]
+async fn update_whisper_component(
+    app: AppHandle,
+    component: String,
+    window: WebviewWindow,
+) -> Result<String, String> {
+    authorize_window(&window, &["main"])?;
+    if component != "model" && component != "engine" {
+        return Err("Unknown Whisper component.".into());
+    }
+    let lease = {
+        let data = app.state::<AppData>();
+        let _lifecycle = data.lifecycle.lock().map_err(|e| e.to_string())?;
+        if data.shutdown.load(Ordering::Acquire) {
+            return Err("VibeVoice is shutting down.".into());
+        }
+        components_idle(&*data.runtime.lock().map_err(|e| e.to_string())?)?;
+        let lease = whisper_update::UpdateLease::acquire(Arc::clone(&data.component_update_busy))?;
+        data.component_update_cancel.store(false, Ordering::Release);
+        lease
+    };
+    emit_state_changed(&app);
+    async_runtime::spawn_blocking(move || {
+        let data = app.state::<AppData>();
+        let cancel = &data.component_update_cancel;
+        let shutdown = &data.shutdown;
+        let notify = |progress: whisper_update::Progress| { let _ = app.emit("vibevoice-whisper-update", progress); };
+        let result = (|| {
+            let root = app.path().app_local_data_dir().map_err(|e| e.to_string())?.join("whisper-components");
+            let settings = load_settings(&app)?;
+            let previous_model = resolve_engine_paths(&settings).ok().map(|paths| paths.model);
+            let mut staged = None;
+            let updated_path = if component == "model" {
+                whisper_update::ensure_model(&root, previous_model.as_deref(), notify, cancel, shutdown)?
+            } else {
+                let engine = whisper_update::stage_engine(&root, notify, cancel, shutdown)?;
+                let mut command = Command::new(&engine.binary);
+                command.arg("--help").stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::null());
+                let (status, _) = run_process_with_deadline_measured(&mut command, Duration::from_secs(15), cancel, shutdown)?;
+                if !status.success() { return Err(format!("The new engine could not start ({status}). Your previous engine is preserved.")); }
+                let binary = engine.binary.clone(); staged = Some(engine); binary
+            };
+            // Recording and settings changes share this lock and reject the
+            // active lease. Activation is one atomic settings write; the old
+            // engine/custom model is retained and never overwritten.
+            let _lifecycle = data.lifecycle.lock().map_err(|e| e.to_string())?;
+            let _settings = data.settings.lock().map_err(|e| e.to_string())?;
+            whisper_update::check_cancel(cancel, shutdown)?;
+            components_idle(&*data.runtime.lock().map_err(|e| e.to_string())?)?;
+            let mut settings = load_settings(&app)?;
+            if component == "model" { settings.model_path = updated_path.display().to_string(); }
+            else {
+                settings.whisper_binary_path = updated_path.display().to_string();
+                if explicit_path(&settings.model_path).is_none() {
+                    if let Some(model) = previous_model {
+                        settings.model_path = model.display().to_string();
+                    }
+                }
+            }
+            invalidate_diagnostics_cache(&data)?;
+            write_json(settings_path(&app)?, &settings)?;
+            if let Some(engine) = staged.as_mut() { engine.activate(); }
+            Ok(if component == "model" {
+                "base.en model is verified and up to date. The verified model is active.".to_string()
+            } else {
+                format!("Whisper {} is installed and active. Your previous engine is preserved.", whisper_update::ENGINE_VERSION)
+            })
+        })();
+        let (stage, message) = match &result { Ok(message) => ("complete", message.clone()), Err(error) => ("failed", error.clone()) };
+        drop(lease);
+        notify(whisper_update::Progress { component, stage: stage.into(), downloaded_bytes: 0, total_bytes: 0, message });
+        emit_state_changed(&app);
+        result
+    }).await.map_err(|e| format!("Whisper update worker failed: {e}"))?
+}
+
+#[tauri::command]
+fn cancel_whisper_update(data: tauri::State<AppData>, window: WebviewWindow) -> Result<(), String> {
+    authorize_window(&window, &["main"])?;
+    let _lifecycle = data.lifecycle.lock().map_err(|e| e.to_string())?;
+    if !data.component_update_busy.load(Ordering::Acquire) {
+        return Err("No Whisper update is running.".into());
+    }
+    data.component_update_cancel.store(true, Ordering::Release);
+    Ok(())
+}
+
 fn setup_script_path(app: &AppHandle) -> Option<PathBuf> {
     if !setup_execution_enabled() {
         return None;
@@ -1264,6 +1450,9 @@ fn run_setup_script(
                 .to_string(),
         );
     }
+    let _lifecycle = data.lifecycle.lock().map_err(|e| e.to_string())?;
+    components_idle(&*data.runtime.lock().map_err(|e| e.to_string())?)?;
+    let _lease = whisper_update::UpdateLease::acquire(Arc::clone(&data.component_update_busy))?;
     let script_name = setup_script_name();
     let script =
         setup_script_path(&app).ok_or_else(|| format!("Setup script not found: {script_name}"))?;
@@ -1894,10 +2083,19 @@ fn transcribe(
     output_prefix: &Path,
     cancel: &AtomicBool,
     shutdown: &AtomicBool,
-) -> Result<String, String> {
+) -> Result<(String, TranscriptionMetrics), String> {
     let paths = resolve_engine_paths(settings)?;
     let mut command = Command::new(paths.whisper_binary);
+    let available = thread::available_parallelism()
+        .map(|n| n.get())
+        .unwrap_or(1);
+    let threads = performance::thread_count(settings.transcription_threads, available);
     command
+        // Request sleeping workers on OpenMP runtimes that support this hint.
+        // Keep the model, beam search and fallback behavior unchanged.
+        .env("OMP_WAIT_POLICY", "PASSIVE")
+        .arg("-t")
+        .arg(threads.to_string())
         .arg("-m")
         .arg(paths.model)
         .arg("-f")
@@ -1908,7 +2106,8 @@ fn transcribe(
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::null());
-    let status = run_process_with_deadline(
+    let started = Instant::now();
+    let (status, usage) = run_process_with_deadline_measured(
         &mut command,
         Duration::from_secs(settings.transcription_timeout_seconds.clamp(
             MIN_TRANSCRIPTION_TIMEOUT_SECONDS,
@@ -1920,8 +2119,25 @@ fn transcribe(
     if !status.success() {
         return Err(format!("Transcription failed with status {status}"));
     }
-    fs::read_to_string(output_prefix.with_extension("txt"))
-        .map_err(|error| format!("Transcript file missing: {error}"))
+    let transcript = fs::read_to_string(output_prefix.with_extension("txt"))
+        .map_err(|error| format!("Transcript file missing: {error}"))?;
+    let transcription_ms = started.elapsed().as_millis() as u64;
+    Ok((
+        transcript,
+        TranscriptionMetrics {
+            audio_ms: 0,
+            transcription_ms,
+            session_ms: 0,
+            threads,
+            cpu_time_ms: usage.cpu_time_ms,
+            average_cpu_percent: performance::cpu_percent(
+                usage.cpu_time_ms,
+                transcription_ms,
+                available,
+            ),
+            peak_memory_mb: usage.peak_memory_mb,
+        },
+    ))
 }
 
 fn configure_process_group(command: &mut Command) {
@@ -1939,12 +2155,22 @@ fn configure_process_group(command: &mut Command) {
     command.creation_flags(CREATE_NO_WINDOW | CREATE_NEW_PROCESS_GROUP);
 }
 
+#[cfg(all(test, unix))]
 fn run_process_with_deadline(
     command: &mut Command,
     timeout: Duration,
     cancel: &AtomicBool,
     shutdown: &AtomicBool,
 ) -> Result<ExitStatus, String> {
+    run_process_with_deadline_measured(command, timeout, cancel, shutdown).map(|(status, _)| status)
+}
+
+fn run_process_with_deadline_measured(
+    command: &mut Command,
+    timeout: Duration,
+    cancel: &AtomicBool,
+    shutdown: &AtomicBool,
+) -> Result<(ExitStatus, ProcessUsage), String> {
     if shutdown.load(Ordering::Acquire) || cancel.load(Ordering::Relaxed) {
         return Err("Transcription cancelled.".to_string());
     }
@@ -1959,7 +2185,7 @@ fn run_process_with_deadline(
             return Err(process_stop_message("Transcription cancelled.", cleanup));
         }
         match child.try_wait() {
-            Ok(Some(status)) => return Ok(status),
+            Ok(Some(status)) => return Ok((status, performance::process_usage(&child))),
             Ok(None) if Instant::now() >= deadline => {
                 let message = format!(
                     "Transcription timed out after {} seconds.",
@@ -2461,7 +2687,7 @@ fn start_audio_capture_impl(
             .map_err(|error| format!("Could not finalize WAV file: {error}"))
     });
 
-    let stream = match sample_format {
+    let stream_result = match sample_format {
         SampleFormat::F32 => {
             let stream_tx = writer_tx.clone();
             let stream_level = Arc::clone(&mic_level);
@@ -2498,20 +2724,26 @@ fn start_audio_capture_impl(
                 None,
             )
         }
-        _ => {
+        _ => Err(cpal::BuildStreamError::StreamConfigNotSupported),
+    };
+    let stream = match stream_result {
+        Ok(stream) => stream,
+        Err(error) => {
+            let _ = writer_tx.send(AudioWriterMessage::Stop);
+            let _ = writer_thread.join();
+            let _ = fs::remove_file(&audio_path);
             return Err(format!(
-                "Unsupported microphone sample format: {sample_format:?}"
-            ))
+                "Could not open microphone stream ({sample_format:?}): {error}"
+            ));
         }
-    }
-    .map_err(|error| format!("Could not open microphone stream: {error}"))?;
+    };
 
     Ok(RecordingSession {
         audio_path,
         output_prefix,
         started: Instant::now(),
         started_at: Utc::now(),
-        stream,
+        stream: Some(stream),
         writer_tx,
         writer_thread: Some(writer_thread),
         mic_level,
@@ -2563,6 +2795,8 @@ fn audio_stream_error_impl(error: cpal::StreamError) {
 fn start_recording_stream(session: &RecordingSession) -> Result<(), String> {
     session
         .stream
+        .as_ref()
+        .ok_or_else(|| "Microphone stream is already stopped.".to_string())?
         .play()
         .map_err(|error| format!("Recording failed to start: {error}"))
 }
@@ -2573,7 +2807,10 @@ fn stop_audio_capture(session: &mut RecordingSession) -> Result<(), String> {
 
 #[cfg(any(target_os = "windows", target_os = "macos"))]
 fn stop_audio_capture_impl(session: &mut RecordingSession) -> Result<(), String> {
-    let _ = session.stream.pause();
+    // Drop joins the native callback worker before the writer's Stop sentinel.
+    // Pause alone does not establish callback completion; late samples could
+    // otherwise arrive behind Stop and be discarded.
+    drop(session.stream.take());
     let _ = session.writer_tx.send(AudioWriterMessage::Stop);
     if let Some(writer_thread) = session.writer_thread.take() {
         writer_thread
@@ -3532,6 +3769,8 @@ pub fn run() {
         .plugin(tauri_plugin_process::init())
         .plugin(tauri_plugin_updater::Builder::new().build())
         .manage(AppData {
+            component_update_busy: Arc::new(AtomicBool::new(false)),
+            component_update_cancel: Arc::new(AtomicBool::new(false)),
             settings: Mutex::new(()),
             hotkey_capture: AtomicBool::new(false),
             hotkey_down: AtomicBool::new(false),
@@ -3566,6 +3805,8 @@ pub fn run() {
             delete_dictionary_rule,
             set_dictionary_rule_enabled,
             run_setup_script,
+            update_whisper_component,
+            cancel_whisper_update,
             open_release_page,
             show_main_window
         ])
@@ -3624,6 +3865,172 @@ pub fn run() {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn repeated_stop_preserves_processing_and_blocks_another_start() {
+        let mut runtime = RuntimeState {
+            voice_state: VoiceState::Processing,
+            ..RuntimeState::default()
+        };
+        assert!(ensure_stop_allowed(&runtime).is_err());
+        assert!(matches!(runtime.voice_state, VoiceState::Processing));
+        assert!(try_claim_preparation_slot(&mut runtime, 99).is_err());
+    }
+
+    #[test]
+    fn cancel_before_insertion_claim_prevents_commit() {
+        let token = Arc::new(AtomicBool::new(false));
+        let current = Mutex::new(Some(Arc::clone(&token)));
+        // Exercise the same lock order as the Cancel command.
+        current
+            .lock()
+            .unwrap()
+            .as_ref()
+            .unwrap()
+            .store(true, Ordering::Relaxed);
+        assert!(claim_transcription_result(&current, &token, &AtomicBool::new(false)).is_err());
+        assert!(current.lock().unwrap().is_some());
+    }
+
+    #[test]
+    fn insertion_claim_closes_cancel_slot_and_rejects_stale_tokens() {
+        let token = Arc::new(AtomicBool::new(false));
+        let stale = AtomicBool::new(false);
+        let current = Mutex::new(Some(Arc::clone(&token)));
+        let shutdown = AtomicBool::new(false);
+        assert!(claim_transcription_result(&current, &stale, &shutdown).is_err());
+        claim_transcription_result(&current, &token, &shutdown).unwrap();
+        assert!(current.lock().unwrap().is_none());
+        assert!(claim_transcription_result(&current, &token, &shutdown).is_err());
+    }
+
+    #[test]
+    fn audio_duration_uses_frames_instead_of_recording_and_inference_wall_time() {
+        let path = std::env::temp_dir().join(format!("vibevoice-duration-{}.wav", Uuid::new_v4()));
+        let mut writer = hound::WavWriter::create(
+            &path,
+            hound::WavSpec {
+                channels: 2,
+                sample_rate: 16_000,
+                bits_per_sample: 16,
+                sample_format: hound::SampleFormat::Int,
+            },
+        )
+        .unwrap();
+        for _ in 0..32_000 {
+            writer.write_sample(0i16).unwrap();
+        }
+        writer.finalize().unwrap();
+        assert_eq!(recording_audio_duration_ms(&path).unwrap(), 1000);
+        fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    #[ignore = "requires a local Whisper engine and its JFK sample"]
+    fn live_whisper_transcription_reports_measured_usage() {
+        let settings = Settings::default();
+        let paths = resolve_engine_paths(&settings).unwrap();
+        let root = paths.model.parent().unwrap().parent().unwrap();
+        let prefix = std::env::temp_dir().join(format!("vibevoice-live-{}", Uuid::new_v4()));
+        let (text, metrics) = transcribe(
+            &settings,
+            &root.join("samples/jfk.wav"),
+            &prefix,
+            &AtomicBool::new(false),
+            &AtomicBool::new(false),
+        )
+        .unwrap();
+        fs::remove_file(prefix.with_extension("txt")).unwrap();
+        assert!(text.contains("country"));
+        assert!(metrics.transcription_ms > 0);
+        #[cfg(windows)]
+        {
+            assert!(metrics.cpu_time_ms.unwrap() > 0);
+            assert!(metrics.peak_memory_mb.unwrap() > 1.0);
+            assert!(metrics.average_cpu_percent.unwrap() > 0.0);
+        }
+    }
+    #[test]
+    fn component_updates_require_an_idle_voice_pipeline() {
+        let mut runtime = RuntimeState::default();
+        for voice_state in [
+            VoiceState::Preparing,
+            VoiceState::Recording,
+            VoiceState::Processing,
+        ] {
+            runtime.voice_state = voice_state;
+            assert!(components_idle(&runtime).is_err());
+        }
+        for voice_state in [
+            VoiceState::Ready,
+            VoiceState::Inserted,
+            VoiceState::Copied,
+            VoiceState::Error,
+        ] {
+            runtime.voice_state = voice_state;
+            assert!(components_idle(&runtime).is_ok());
+        }
+    }
+
+    #[cfg(all(target_os = "windows", target_arch = "x86_64"))]
+    #[test]
+    #[ignore = "downloads the official engine and retains a validated candidate; requires existing JFK sample"]
+    fn live_component_updater_downloads_verifies_and_transcribes() {
+        let old = resolve_engine_paths(&Settings::default()).unwrap();
+        let sample = old
+            .model
+            .parent()
+            .unwrap()
+            .parent()
+            .unwrap()
+            .join("samples/jfk.wav");
+        let root = dirs::data_local_dir()
+            .unwrap()
+            .join("dev.zburgers.vibevoice")
+            .join("whisper-components");
+        let cancel = AtomicBool::new(false);
+        let shutdown = AtomicBool::new(false);
+        let model =
+            whisper_update::ensure_model(&root, Some(&old.model), |_| {}, &cancel, &shutdown)
+                .unwrap();
+        assert_eq!(model, old.model);
+        let mut engine = whisper_update::stage_engine(
+            &root,
+            |progress| eprintln!("{}", progress.message),
+            &cancel,
+            &shutdown,
+        )
+        .unwrap();
+        let mut command = Command::new(&engine.binary);
+        command
+            .arg("--help")
+            .stdout(Stdio::null())
+            .stderr(Stdio::null());
+        assert!(run_process_with_deadline_measured(
+            &mut command,
+            Duration::from_secs(15),
+            &cancel,
+            &shutdown
+        )
+        .unwrap()
+        .0
+        .success());
+        let settings = Settings {
+            whisper_binary_path: engine.binary.display().to_string(),
+            model_path: model.display().to_string(),
+            ..Settings::default()
+        };
+        let prefix =
+            std::env::temp_dir().join(format!("vibevoice-updater-live-{}", Uuid::new_v4()));
+        let (text, metrics) = transcribe(&settings, &sample, &prefix, &cancel, &shutdown).unwrap();
+        assert!(text.contains("country"));
+        fs::remove_file(prefix.with_extension("txt")).unwrap();
+        let receipt_path =
+            std::env::var("VIBEVOICE_UPDATE_RECEIPT").expect("Set an absolute receipt destination");
+        let receipt = serde_json::json!({ "engine_version": whisper_update::ENGINE_VERSION, "binary": engine.binary, "model": model, "transcript": text, "metrics": metrics });
+        write_json(PathBuf::from(receipt_path), &receipt).unwrap();
+        engine.activate();
+    }
+
     #[test]
     fn automatic_engine_discovery_ignores_launch_directory() {
         const CHILD: &str = "VIBEVOICE_TEST_UNTRUSTED_CWD";

@@ -1,4 +1,5 @@
 import { useEffect, useRef, useState } from "react";
+import type { ReactNode } from "react";
 import { Activity, BookOpen, Clipboard, ExternalLink, History, Info, Keyboard, Pin, Wrench, Zap } from "lucide-react";
 import type { AppState, Settings } from "../types";
 import { Toggle } from "../ui";
@@ -200,9 +201,11 @@ export function SettingsView({
   onSetup,
   onOpenReleasePage,
   onOpenDiagnostics,
+  componentManager,
   status = "",
 }: {
   state: AppState;
+  componentManager?: ReactNode;
   onUpdate: (patch: Partial<Settings>) => Promise<boolean>;
   onSetup: () => void;
   onOpenReleasePage: () => void;
@@ -229,6 +232,7 @@ export function SettingsView({
         )}
       </div>
 
+      {componentManager}
       <div className="settings-grid">
         <EnginePathField label="Whisper binary path" value={state.settings.whisper_binary_path} model={false}
           onSave={(whisper_binary_path) => onUpdate({ whisper_binary_path })} />
@@ -256,6 +260,22 @@ export function SettingsView({
             value={state.settings.transcription_timeout_seconds}
             onChange={(e) => onUpdate({ transcription_timeout_seconds: Number(e.target.value) || 30 })}
           />
+        </label>
+        <label className="field">
+          <span>Transcription CPU threads</span>
+          <select
+            value={state.settings.transcription_threads ?? 0}
+            onChange={(e) => onUpdate({ transcription_threads: Number(e.target.value) })}
+          >
+            <option value={0}>Automatic (up to 4)</option>
+            <option value={1}>1 — lowest CPU use</option>
+            <option value={2}>2 — lower CPU use</option>
+            <option value={4}>4 — faster processing</option>
+            {![0, 1, 2, 4].includes(state.settings.transcription_threads ?? 0) && (
+              <option value={state.settings.transcription_threads}>{state.settings.transcription_threads}</option>
+            )}
+          </select>
+          <small>Fewer threads leave more CPU available, but may take longer. Accuracy settings stay the same.</small>
         </label>
         <label className="field">
           <span>Maximum saved transcripts</span>
