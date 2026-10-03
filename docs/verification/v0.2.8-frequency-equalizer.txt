@@ -1,0 +1,47 @@
+VibeVoice 0.2.8 equalizer verification
+
+Implemented 12 independent frequency bands, bass left to treble right,
+using a 2048-sample Hann-windowed FFT with DC removal and attack/release
+smoothing. Fixed gain scaling preserves differences between quiet and loud
+signals. Compact meters aggregate adjacent bands into six bars.
+
+Native capture retains the existing CPAL callback and WAV sample writes.
+Spectrum analysis reads the same mono samples after writing. Linux reads
+the growing recorder WAV without changing recorder arguments or opening a
+second microphone. No release was published.
+
+Passed:
+- cargo test --locked --manifest-path app/src-tauri/Cargo.toml: 52 tests.
+- cargo clippy --locked --manifest-path app/src-tauri/Cargo.toml --all-targets -- -D warnings.
+- cargo fmt --manifest-path app/src-tauri/Cargo.toml -- --check.
+- npm test (app): 16 tests.
+- npm run build (app): TypeScript and Vite build.
+- npm run tauri -- build --no-bundle (app): native Windows release build.
+- git diff --check.
+
+DSP tests cover silence/DC, independent equal-volume frequency peaks at
+16/44.1/48 kHz, mixed tones, quieter signals, decay, 8 kHz Nyquist limits,
+and growing WAV parsing with incomplete headers and partial samples.
+The WAV fixture verifies the input file remains bit-exact.
+Frontend tests cover independent peaks, idle/missing data, compact band
+aggregation, and invalid/out-of-range values.
+
+Rendered synthetic mixed-tone fixture: 220 Hz at 0.2 gain, 1800 Hz at 0.08,
+5200 Hz at 0.025. Actual DSP output is saved in tone-bands.json; preview.png
+shows the real shared meter component with these values. Full bar heights
+were [6,16,37,15,4,4,4,32,4,4,25,4] in a 40px container; compact heights
+were [10,21,3,18,3,15] in a 24px container. No browser errors or horizontal
+overflow. Reduced-motion styling was checked.
+
+Processing benchmark: 100 seconds of synthetic 48 kHz audio analyzed in
+455.1163 ms (about 0.46 percent of real time).
+
+Local executable: VibeVoice-0.2.8-equalizer-test.exe
+SHA256: CD771E038D7D2EE7F3D79E397F7D9730D324DB9F99647613E9D9094529206503
+
+Limits: No live native microphone recording/insertion test was performed.
+Linux live recorder behavior was not exercised; its growing-WAV reader was
+verified using fixtures. The preview uses synthetic audio, not a microphone.
+
+Independent PR frontend: 11 tests and TypeScript/Vite build passed. Combined clipboard/UI source has 55 Rust and 18 frontend tests passing; individual DSP tests and Clippy are also run for this PR.
+Independent PR backend: 52 Rust tests and Clippy -D warnings passed.

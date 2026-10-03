@@ -78,7 +78,7 @@ export function PillWindow({
                 <span className="pill-title">{phaseCopy[phase]}</span>
                 <span className="pill-subtitle">{state.voice_state === "Recording" ? `${recordingSeconds}s` : state.settings.hotkey}</span>
               </span>
-              <MicVisualizer level={state.mic_level} active={state.voice_state === "Recording"} compact />
+              <MicVisualizer bands={state.mic_bands} active={state.voice_state === "Recording"} compact />
             </>
           )}
         </button>

@@ -34,6 +34,11 @@ mod windows_clipboard;
 
 use uuid::Uuid;
 
+mod meter;
+#[cfg(any(target_os = "windows", target_os = "macos"))]
+use meter::SpectrumAnalyzer;
+use meter::{empty_spectrum, read_spectrum, SharedSpectrum, BAND_COUNT};
+
 #[cfg(any(target_os = "windows", target_os = "macos"))]
 use cpal::{
     traits::{DeviceTrait, HostTrait, StreamTrait},
@@ -231,12 +236,14 @@ struct AppStateSnapshot {
     last_transcript: Option<String>,
     last_error: Option<String>,
     mic_level: f32,
+    mic_bands: [f32; BAND_COUNT],
     recording_started_at: Option<DateTime<Utc>>,
 }
 
 #[derive(Debug, Clone, Serialize)]
 struct MeterPayload {
     mic_level: f32,
+    mic_bands: [f32; BAND_COUNT],
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -255,6 +262,7 @@ struct RecordingSession {
     writer_tx: std::sync::mpsc::Sender<AudioWriterMessage>,
     writer_thread: Option<std::thread::JoinHandle<Result<(), String>>>,
     mic_level: Arc<AtomicU32>,
+    spectrum: SharedSpectrum,
 }
 
 #[cfg(target_os = "linux")]
@@ -265,6 +273,7 @@ struct RecordingSession {
     started_at: DateTime<Utc>,
     recorder_process: Child,
     mic_level: Arc<AtomicU32>,
+    spectrum: SharedSpectrum,
 }
 
 #[cfg(any(target_os = "windows", target_os = "macos"))]
@@ -381,6 +390,11 @@ fn get_app_state(
         last_transcript: runtime.last_transcript.clone(),
         last_error: runtime.last_error.clone(),
         mic_level,
+        mic_bands: runtime
+            .recording
+            .as_ref()
+            .map(|session| read_spectrum(&session.spectrum))
+            .unwrap_or([0.0; BAND_COUNT]),
         recording_started_at,
     })
 }
@@ -558,6 +572,8 @@ fn begin_recording(app: AppHandle, data: tauri::State<'_, AppData>) -> Result<()
                 return;
             }
             let mic_level = Arc::clone(&session.mic_level);
+            let spectrum = Arc::clone(&session.spectrum);
+            let meter_audio_path = session.audio_path.clone();
             let data = app_handle.state::<AppData>();
             let mut runtime = match data.runtime.lock() {
                 Ok(runtime) => runtime,
@@ -586,8 +602,13 @@ fn begin_recording(app: AppHandle, data: tauri::State<'_, AppData>) -> Result<()
             runtime.recording = Some(session);
             drop(runtime);
             emit_state_changed(&app_handle);
-            let meter_thread =
-                spawn_meter_emitter(app_handle.clone(), mic_level, Arc::clone(&shutdown));
+            let meter_thread = spawn_meter_emitter(
+                app_handle.clone(),
+                mic_level,
+                spectrum,
+                meter_audio_path,
+                Arc::clone(&shutdown),
+            );
             track_thread(&data.meter_threads, meter_thread);
         }
         Err(error) => {
@@ -2158,6 +2179,8 @@ fn start_audio_capture_impl(
     let channels = config.channels as usize;
     let sample_rate = config.sample_rate.0;
     let mic_level = Arc::new(AtomicU32::new(0));
+    let spectrum = empty_spectrum();
+    let writer_spectrum = Arc::clone(&spectrum);
     let (writer_tx, writer_rx) = mpsc::channel::<AudioWriterMessage>();
     let writer_path = audio_path.clone();
     let writer_thread = thread::spawn(move || -> Result<(), String> {
@@ -2169,14 +2192,16 @@ fn start_audio_capture_impl(
         };
         let mut writer = hound::WavWriter::create(&writer_path, spec)
             .map_err(|error| format!("Could not create WAV file: {error}"))?;
+        let mut analyzer = SpectrumAnalyzer::new(sample_rate, writer_spectrum);
         while let Ok(message) = writer_rx.recv() {
             match message {
                 AudioWriterMessage::Samples(samples) => {
-                    for sample in samples {
+                    for &sample in &samples {
                         writer
                             .write_sample(sample)
                             .map_err(|error| format!("Could not write WAV sample: {error}"))?;
                     }
+                    analyzer.push(&samples);
                 }
                 AudioWriterMessage::Stop => break,
             }
@@ -2240,6 +2265,7 @@ fn start_audio_capture_impl(
         writer_tx,
         writer_thread: Some(writer_thread),
         mic_level,
+        spectrum,
     })
 }
 
@@ -2274,6 +2300,7 @@ fn start_audio_capture_impl(
         started_at: Utc::now(),
         recorder_process: child,
         mic_level: Arc::new(AtomicU32::new(0)),
+        spectrum: empty_spectrum(),
     })
 }
 
@@ -2934,30 +2961,56 @@ fn emit_state_changed(app: &AppHandle) {
     let _ = app.emit(STATE_CHANGED_EVENT, ());
 }
 
-fn emit_meter_changed(app: &AppHandle, mic_level: f32) {
-    let _ = app.emit(METER_CHANGED_EVENT, MeterPayload { mic_level });
+fn emit_meter_changed(app: &AppHandle, mic_level: f32, mic_bands: [f32; BAND_COUNT]) {
+    let _ = app.emit(
+        METER_CHANGED_EVENT,
+        MeterPayload {
+            mic_level,
+            mic_bands,
+        },
+    );
 }
 
 fn spawn_meter_emitter(
     app: AppHandle,
     mic_level: Arc<AtomicU32>,
+    spectrum: SharedSpectrum,
+    _audio_path: PathBuf,
     shutdown: Arc<AtomicBool>,
 ) -> thread::JoinHandle<()> {
-    thread::spawn(move || loop {
-        if shutdown.load(Ordering::Acquire) {
-            break;
+    thread::spawn(move || {
+        #[cfg(target_os = "linux")]
+        let mut live_spectrum = meter::LiveWavSpectrum::new(_audio_path, Arc::clone(&spectrum));
+        loop {
+            if shutdown.load(Ordering::Acquire) {
+                break;
+            }
+            let is_recording = app
+                .state::<AppData>()
+                .runtime
+                .lock()
+                .map(|runtime| {
+                    matches!(runtime.voice_state, VoiceState::Recording)
+                        && runtime
+                            .recording
+                            .as_ref()
+                            .is_some_and(|session| Arc::ptr_eq(&session.spectrum, &spectrum))
+                })
+                .unwrap_or(false);
+            if !is_recording {
+                break;
+            }
+            #[cfg(target_os = "linux")]
+            if let Some(level) = live_spectrum.poll() {
+                mic_level.store((level * 1000.0) as u32, Ordering::Relaxed);
+            }
+            emit_meter_changed(
+                &app,
+                mic_level.load(Ordering::Relaxed) as f32 / 1000.0,
+                read_spectrum(&spectrum),
+            );
+            thread::sleep(Duration::from_millis(60));
         }
-        let is_recording = app
-            .state::<AppData>()
-            .runtime
-            .lock()
-            .map(|runtime| matches!(runtime.voice_state, VoiceState::Recording))
-            .unwrap_or(false);
-        if !is_recording {
-            break;
-        }
-        emit_meter_changed(&app, mic_level.load(Ordering::Relaxed) as f32 / 1000.0);
-        thread::sleep(Duration::from_millis(180));
     })
 }
 
@@ -3376,6 +3429,7 @@ mod tests {
             started_at: Utc::now(),
             recorder_process: Command::new("sleep").arg("30").spawn().unwrap(),
             mic_level: Arc::new(AtomicU32::new(0)),
+            spectrum: empty_spectrum(),
         };
         cleanup_recording_artifacts(&session);
         let mut session = session;
@@ -4874,6 +4928,7 @@ mod tests {
             started_at: Utc::now(),
             recorder_process: child,
             mic_level: Arc::new(AtomicU32::new(0)),
+            spectrum: empty_spectrum(),
         }
     }
 

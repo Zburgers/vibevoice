@@ -233,7 +233,7 @@ function App() {
       .catch((error) => setCommandStatus(errorMessage(error)));
 
     listen<MeterPayload>("vibevoice-meter-changed", (event) => {
-      setState((current) => ({ ...current, mic_level: event.payload.mic_level }));
+      setState((current) => ({ ...current, mic_level: event.payload.mic_level, mic_bands: event.payload.mic_bands ?? [] }));
     })
       .then((cleanup) => {
         if (disposed) cleanup();
