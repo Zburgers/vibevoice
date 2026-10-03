@@ -2599,7 +2599,6 @@ fn snapshot_clipboard_contents(
     }
 }
 
-
 fn restore_text_clipboard(app: &AppHandle, snapshot: &ClipboardSnapshot) -> Result<(), String> {
     match snapshot {
         ClipboardSnapshot::Text(text) => copy_to_clipboard(app, text).map(|_| ()),
@@ -3753,9 +3752,6 @@ mod tests {
         assert!(!report.clipboard_restored);
         assert!(report.error.unwrap().contains("Clipboard read failed"));
     }
-
-
-
 
     #[test]
     fn clipboard_snapshot_recognizes_verified_empty_but_not_unreadable_contents() {
