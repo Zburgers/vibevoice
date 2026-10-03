@@ -108,7 +108,6 @@ jobs:
           echo "Publishing VibeVoice v$version"
 
       - name: Verify release metadata consistency
-        if: matrix.name == 'Linux'
         shell: bash
         working-directory: app
         run: |

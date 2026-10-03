@@ -4,9 +4,11 @@ on:
   pull_request:
     branches:
       - master
+      - codex/v0.2.8
   push:
     branches:
       - master
+      - codex/v0.2.8
 
 permissions:
   contents: read
@@ -113,8 +115,10 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install --no-install-recommends -y shellcheck
-          bash -n scripts/*.sh
-          shellcheck scripts/*.sh
+          for script in scripts/*.sh vp; do bash -n "$script"; done
+          shellcheck scripts/*.sh vp
+          bash scripts/test-vp.sh
+          node --test scripts/*.test.mjs
 
       - name: Parse PowerShell scripts
         shell: pwsh
@@ -127,3 +131,7 @@ jobs:
             if ($parseErrors.Count -gt 0) { $errors += "{0}: {1}" -f $_.Name, ($parseErrors -join '; ') }
           }
           if ($errors.Count -gt 0) { $errors | Write-Error; exit 1 }
+
+      - name: Test Windows source installer failure handling
+        shell: pwsh
+        run: ./scripts/test-install-app.ps1
