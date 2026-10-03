@@ -60,10 +60,12 @@ hotkey or pill -> microphone capture -> local WAV -> whisper-cli -> cleanup -> c
 ```
 
 Settings default to `auto` for both the Whisper binary and model path. The backend resolves explicit paths, environment variables, app-data engine installs, and legacy `~/tools/whisper.cpp` installs.
+Project-local engines require an explicit path or engine environment variable; automatic discovery does not execute binaries from the launch directory.
 
 ## Privacy
 
 VibeVoice is local-first. Audio is recorded to a temporary local WAV, transcribed locally, and removed after processing. Transcript history is opt-in and stored as atomically replaced local JSON with a recovery backup when enabled.
+On Unix, recording workspaces use the account's cache directory under `vibevoice/recordings`; application state and exports use private directories (0700) and new transcript files use 0600 permissions. Startup also reclaims eligible old recording artifacts only from a private, self-owned legacy temp directory. The legacy `vp` CLI uses a separate private temporary directory for each run and cleans it on exit.
 
 ## Updates
 

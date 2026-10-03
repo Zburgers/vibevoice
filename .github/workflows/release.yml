@@ -108,7 +108,6 @@ jobs:
           echo "Publishing VibeVoice v$version"
 
       - name: Verify release metadata consistency
-        if: matrix.name == 'Linux'
         shell: bash
         working-directory: app
         run: |
@@ -120,8 +119,8 @@ jobs:
           # malformed release refs. A bare "v" tag (the 0.2.6 incident)
           # matches the push trigger but must never reach publishing.
           if [[ "$GITHUB_REF" == refs/tags/* ]]; then
-            if [[ ! "$GITHUB_REF_NAME" =~ ^v[0-9]+\.[0-9]+\.[0-9]+([-.][0-9A-Za-z.-]+)?$ ]]; then
-              echo "Malformed release tag '$GITHUB_REF_NAME': expected SemVer after 'v'" >&2
+            if [[ ! "$GITHUB_REF_NAME" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+              echo "Malformed release tag '$GITHUB_REF_NAME': expected a stable version after 'v'" >&2
               exit 1
             fi
           fi
