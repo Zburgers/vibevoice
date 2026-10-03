@@ -3293,7 +3293,7 @@ fn insertion_report_from_results(
 fn paste_from_clipboard() -> Result<String, String> {
     #[cfg(target_os = "macos")]
     {
-        return macos_paste::paste();
+        macos_paste::paste()
     }
     #[cfg(not(target_os = "macos"))]
     {
@@ -3376,6 +3376,7 @@ fn cleanup_paste_helper(child: &mut std::process::Child) -> Option<String> {
     (!errors.is_empty()).then(|| errors.join("; "))
 }
 
+#[cfg(not(target_os = "macos"))]
 fn command_exists(name: &str) -> bool {
     if cfg!(target_os = "windows") {
         let mut command = Command::new("where");
@@ -3416,7 +3417,7 @@ fn clipboard_tool_name() -> Option<String> {
 fn paste_tool_name() -> Option<String> {
     #[cfg(target_os = "macos")]
     {
-        return Some("macos:Command-V (Accessibility required)".into());
+        Some("macos:Command-V (Accessibility required)".into())
     }
     #[cfg(not(target_os = "macos"))]
     {

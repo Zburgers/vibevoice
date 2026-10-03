@@ -216,7 +216,8 @@ mod tests {
         assert!(std::env::var_os("WAYLAND_DISPLAY").is_none());
         assert!(is_empty().unwrap());
         // A failed connection must remain an error, never an empty clipboard.
-        std::env::set_var("DISPLAY", ":65530");
+        // X11 TCP ports are 6000 + display; keep the display within that range.
+        std::env::set_var("DISPLAY", ":12345");
         assert!(is_empty().is_err());
     }
 }
