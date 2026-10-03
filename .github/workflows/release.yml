@@ -157,6 +157,14 @@ jobs:
           fi
           echo "Release metadata consistent at version $version"
 
+      - name: Finalize Linux AppStream release date and stability
+        if: matrix.name == 'Linux'
+        shell: bash
+        run: |
+          set -euo pipefail
+          node --test scripts/finalize-appstream-release.test.mjs
+          node scripts/finalize-appstream-release.mjs "$GITHUB_REF_NAME" "$(date -u +%F)"
+
       - name: Build and publish release assets
         uses: tauri-apps/tauri-action@84b9d35b5fc46c1e45415bdb6144030364f7ebc5 # v0
         env:
