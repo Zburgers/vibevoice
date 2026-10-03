@@ -29,6 +29,9 @@ use tauri::{
 use tauri_plugin_clipboard_manager::ClipboardExt;
 use tauri_plugin_global_shortcut::{Code, GlobalShortcutExt, Modifiers, Shortcut, ShortcutState};
 use tauri_plugin_opener::OpenerExt;
+#[cfg(target_os = "windows")]
+mod windows_clipboard;
+
 use uuid::Uuid;
 
 #[cfg(any(target_os = "windows", target_os = "macos"))]
@@ -166,6 +169,12 @@ enum InsertionOutcome {
 #[serde(rename_all = "snake_case")]
 enum ClipboardSnapshot {
     Text(String),
+    Image {
+        rgba: Vec<u8>,
+        width: u32,
+        height: u32,
+    },
+    Empty,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -2516,15 +2525,68 @@ fn copy_to_clipboard(app: &AppHandle, text: &str) -> Result<String, String> {
 }
 
 fn snapshot_text_clipboard(app: &AppHandle) -> Result<ClipboardSnapshot, String> {
-    app.clipboard()
-        .read_text()
-        .map(ClipboardSnapshot::Text)
-        .map_err(|error| format!("Clipboard read failed: {error}"))
+    snapshot_clipboard_contents(
+        || {
+            app.clipboard()
+                .read_text()
+                .map_err(|error| error.to_string())
+        },
+        || {
+            app.clipboard()
+                .read_image()
+                .map(|image| ClipboardSnapshot::Image {
+                    rgba: image.rgba().to_vec(),
+                    width: image.width(),
+                    height: image.height(),
+                })
+                .map_err(|error| error.to_string())
+        },
+        || {
+            #[cfg(target_os = "windows")]
+            {
+                windows_clipboard::is_empty()
+            }
+            #[cfg(not(target_os = "windows"))]
+            {
+                Ok(false)
+            }
+        },
+    )
+}
+
+fn snapshot_clipboard_contents(
+    read_text: impl FnOnce() -> Result<String, String>,
+    read_image: impl FnOnce() -> Result<ClipboardSnapshot, String>,
+    is_empty: impl FnOnce() -> Result<bool, String>,
+) -> Result<ClipboardSnapshot, String> {
+    match read_text() {
+        Ok(text) => Ok(ClipboardSnapshot::Text(text)),
+        Err(text_error) => match read_image() {
+            Ok(image) => Ok(image),
+            Err(_) => match is_empty() {
+                Ok(true) => Ok(ClipboardSnapshot::Empty),
+                Ok(false) => Err(format!("Auto paste could not preserve the clipboard: {text_error}. Your transcript is ready; use Copy transcript or change the clipboard contents and retry insertion.")),
+                Err(error) => Err(format!("Clipboard read failed: {error}. Your transcript is ready; retry insertion or use Copy transcript.")),
+            },
+        },
+    }
 }
 
 fn restore_text_clipboard(app: &AppHandle, snapshot: &ClipboardSnapshot) -> Result<(), String> {
     match snapshot {
         ClipboardSnapshot::Text(text) => copy_to_clipboard(app, text).map(|_| ()),
+        ClipboardSnapshot::Image {
+            rgba,
+            width,
+            height,
+        } => app
+            .clipboard()
+            .write_image(&tauri::image::Image::new(rgba, *width, *height))
+            .map_err(|error| format!("Clipboard image restore failed: {error}")),
+        ClipboardSnapshot::Empty => app
+            .clipboard()
+            .clear()
+            .map_err(|error| format!("Clipboard clear failed: {error}")),
     }
 }
 
@@ -3638,6 +3700,102 @@ mod tests {
     }
 
     #[test]
+    fn clipboard_snapshot_recognizes_verified_empty_but_not_unreadable_contents() {
+        let snapshot = snapshot_clipboard_contents(
+            || Err("no text".into()),
+            || Err("no image".into()),
+            || Ok(true),
+        )
+        .unwrap();
+        assert_eq!(snapshot, ClipboardSnapshot::Empty);
+        assert!(snapshot_clipboard_contents(
+            || Err("private format".into()),
+            || Err("no image".into()),
+            || Ok(false),
+        )
+        .unwrap_err()
+        .contains("Your transcript is ready"));
+        assert!(snapshot_clipboard_contents(
+            || Err("occupied".into()),
+            || Err("occupied".into()),
+            || Err("occupied".into()),
+        )
+        .unwrap_err()
+        .contains("occupied"));
+    }
+
+    #[test]
+    fn clipboard_snapshot_preserves_image_and_prefers_text() {
+        let image = ClipboardSnapshot::Image {
+            rgba: vec![10, 20, 30, 255],
+            width: 1,
+            height: 1,
+        };
+        assert_eq!(
+            snapshot_clipboard_contents(
+                || Err("no text".into()),
+                || Ok(image.clone()),
+                || panic!("image is not empty"),
+            )
+            .unwrap(),
+            image
+        );
+        assert_eq!(
+            snapshot_clipboard_contents(
+                || Ok("previous text".into()),
+                || panic!("text is enough"),
+                || panic!("text is not empty"),
+            )
+            .unwrap(),
+            ClipboardSnapshot::Text("previous text".into())
+        );
+    }
+
+    #[test]
+    fn insertion_restores_empty_and_image_snapshots_after_success_or_paste_failure() {
+        for snapshot in [
+            ClipboardSnapshot::Empty,
+            ClipboardSnapshot::Image {
+                rgba: vec![10, 20, 30, 255],
+                width: 1,
+                height: 1,
+            },
+        ] {
+            for paste_succeeds in [false, true] {
+                let restored = std::cell::RefCell::new(None);
+                let report = execute_insertion_transaction(
+                    "transcript",
+                    true,
+                    true,
+                    || Ok(snapshot.clone()),
+                    || Ok("tauri-clipboard".into()),
+                    || {
+                        if paste_succeeds {
+                            Ok("paste".into())
+                        } else {
+                            Err("target lost focus".into())
+                        }
+                    },
+                    |value| {
+                        *restored.borrow_mut() = Some(value.clone());
+                        Ok(())
+                    },
+                );
+                assert_eq!(*restored.borrow(), Some(snapshot.clone()));
+                assert!(report.clipboard_restored);
+                assert_eq!(
+                    report.outcome,
+                    if paste_succeeds {
+                        InsertionOutcome::Inserted
+                    } else {
+                        InsertionOutcome::Failed
+                    }
+                );
+            }
+        }
+    }
+
+    #[test]
     fn clipboard_only_output_does_not_snapshot_or_restore_clipboard() {
         let report = execute_insertion_transaction(
             "transcript",
@@ -3667,7 +3825,9 @@ mod tests {
             || Ok("tauri-clipboard".to_string()),
             || Err("Paste target lost focus".to_string()),
             move |snapshot| {
-                let ClipboardSnapshot::Text(text) = snapshot;
+                let ClipboardSnapshot::Text(text) = snapshot else {
+                    panic!("expected text snapshot")
+                };
                 *restored_text.lock().unwrap() = Some(text.clone());
                 Ok(())
             },

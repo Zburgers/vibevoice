@@ -111,7 +111,7 @@ function App() {
     state.recording_started_at && state.voice_state === "Recording"
       ? Math.max(0, Math.floor((Date.now() - new Date(state.recording_started_at).getTime()) / 1000))
       : 0;
-  const lastText = state.last_error || state.last_transcript || "No transcript captured yet.";
+  const lastText = state.last_transcript || state.last_error || "No transcript captured yet.";
   const primaryDisabled = !canStartOrStop(state.voice_state);
   const ActionIcon = actionIcon(state.voice_state);
 
