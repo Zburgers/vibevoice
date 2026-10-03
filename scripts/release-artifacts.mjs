@@ -6,7 +6,23 @@ import { fileURLToPath } from 'node:url';
 import { prepareReleaseNotes } from './prepare-release-notes.mjs';
 
 export const platforms = ['windows-x86_64', 'linux-x86_64', 'darwin-aarch64'];
-const updaterSuffix = { 'windows-x86_64': '-setup.exe', 'linux-x86_64': '.AppImage', 'darwin-aarch64': '.app.tar.gz' };
+const updaterBundles = {
+  'windows-x86_64': [
+    { bundle: 'msi', suffix: '.msi' },
+    { bundle: 'nsis', suffix: '-setup.exe' },
+  ],
+  'linux-x86_64': [
+    { bundle: 'appimage', suffix: '.AppImage' },
+    { bundle: 'deb', suffix: '.deb' },
+    { bundle: 'rpm', suffix: '.rpm' },
+  ],
+  'darwin-aarch64': [{ bundle: 'app', suffix: '.app.tar.gz' }],
+};
+const genericUpdaterBundle = {
+  'windows-x86_64': 'msi',
+  'linux-x86_64': 'appimage',
+  'darwin-aarch64': 'app',
+};
 
 export function stageArtifacts(paths, platform, output) {
   if (!platforms.includes(platform)) throw new Error('Unexpected release platform');
@@ -19,15 +35,19 @@ export function stageArtifacts(paths, platform, output) {
     files.set(basename(path), path);
     if (existsSync(`${path}.sig`)) files.set(`${basename(path)}.sig`, `${path}.sig`);
   }
-  const updaters = [...files.keys()].filter(name => name.endsWith(updaterSuffix[platform]));
-  if (updaters.length !== 1) throw new Error(`Expected exactly one signed updater for ${platform}`);
-  const updater = updaters[0];
-  if (!files.has(`${updater}.sig`)) throw new Error(`Missing updater signature for ${platform}`);
+  const updaters = {};
+  for (const { bundle, suffix } of updaterBundles[platform]) {
+    const matches = [...files.keys()].filter(name => name.endsWith(suffix));
+    if (matches.length !== 1) throw new Error(`Expected exactly one ${bundle} updater for ${platform}`);
+    const updater = matches[0];
+    if (!files.has(`${updater}.sig`)) throw new Error(`Missing ${bundle} updater signature for ${platform}`);
+    updaters[bundle] = updater;
+  }
   for (const [name, path] of files) {
     if (name === 'platform.json' || name === 'latest.json') throw new Error('Reserved release filename');
     copyFileSync(path, join(output, name));
   }
-  writeFileSync(join(output, 'platform.json'), JSON.stringify({ platform, updater, files: [...files.keys()] }, null, 2));
+  writeFileSync(join(output, 'platform.json'), JSON.stringify({ platform, updaters, files: [...files.keys()] }, null, 2));
 }
 
 export function assembleArtifacts(input, output, version, repository, notes, date = new Date().toISOString()) {
@@ -37,11 +57,19 @@ export function assembleArtifacts(input, output, version, repository, notes, dat
   for (const platform of platforms) {
     const dir = join(input, `release-${platform}`);
     const receipt = JSON.parse(readFileSync(join(dir, 'platform.json'), 'utf8'));
-    if (receipt.platform !== platform || !receipt.updater.endsWith(updaterSuffix[platform]) || basename(receipt.updater) !== receipt.updater) throw new Error('Invalid platform receipt');
-    if (!receipt.files.includes(receipt.updater) || !receipt.files.includes(`${receipt.updater}.sig`)) throw new Error('Incomplete updater receipt');
-    const signature = readFileSync(join(dir, `${receipt.updater}.sig`), 'utf8').trim();
-    if (!/^[A-Za-z0-9+/]+={0,2}$/.test(signature) || signature.length < 80) throw new Error('Invalid updater signature');
-    manifest.platforms[platform] = { signature, url: `https://github.com/${repository}/releases/download/v${version}/${encodeURIComponent(receipt.updater)}` };
+    if (receipt.platform !== platform || !receipt.updaters || Array.isArray(receipt.updaters)) throw new Error('Invalid platform receipt');
+    const entries = {};
+    for (const { bundle, suffix } of updaterBundles[platform]) {
+      const updater = receipt.updaters[bundle];
+      if (typeof updater !== 'string' || !updater.endsWith(suffix) || basename(updater) !== updater) throw new Error('Invalid updater receipt');
+      if (!receipt.files.includes(updater) || !receipt.files.includes(`${updater}.sig`)) throw new Error('Incomplete updater receipt');
+      const signature = readFileSync(join(dir, `${updater}.sig`), 'utf8').trim();
+      if (!/^[A-Za-z0-9+/]+={0,2}$/.test(signature) || signature.length < 80) throw new Error('Invalid updater signature');
+      const entry = { signature, url: `https://github.com/${repository}/releases/download/v${version}/${encodeURIComponent(updater)}` };
+      manifest.platforms[`${platform}-${bundle}`] = entry;
+      entries[bundle] = entry;
+    }
+    manifest.platforms[platform] = entries[genericUpdaterBundle[platform]];
     for (const name of receipt.files) {
       if (basename(name) !== name || name === 'latest.json' || name === 'platform.json' || assets.has(name)) throw new Error(`Invalid or duplicate release asset: ${name}`);
       const path = join(dir, name);

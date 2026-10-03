@@ -5,39 +5,77 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import { stageArtifacts, assembleArtifacts, publishDraft, platforms } from './release-artifacts.mjs';
 
+const bundleFiles = {
+  'windows-x86_64': {
+    msi: 'VibeVoice_0.2.8_x64_en-US.msi',
+    nsis: 'VibeVoice_0.2.8_x64-setup.exe',
+  },
+  'linux-x86_64': {
+    appimage: 'VibeVoice_0.2.8_amd64.AppImage',
+    deb: 'VibeVoice_0.2.8_amd64.deb',
+    rpm: 'VibeVoice-0.2.8-1.x86_64.rpm',
+  },
+  'darwin-aarch64': {
+    app: 'VibeVoice_aarch64.app.tar.gz',
+  },
+};
+
 function fixture(run) {
   const root = mkdtempSync(join(tmpdir(), 'vibevoice-release-'));
   const input = join(root, 'input');
   const output = join(root, 'output');
-  const names = ['VibeVoice_0.2.8_x64-setup.exe', 'VibeVoice_0.2.8_amd64.AppImage', 'VibeVoice_0.2.8_aarch64.app.tar.gz'];
-  for (let i = 0; i < platforms.length; i++) {
-    const build = join(root, platforms[i]);
+  let seed = 1;
+  for (const platform of platforms) {
+    const build = join(root, platform);
     mkdirSync(build);
-    const file = join(build, names[i]);
-    writeFileSync(file, Buffer.from([0, 255, 128, i]));
-    writeFileSync(`${file}.sig`, Buffer.alloc(96, i).toString('base64'));
-    stageArtifacts([file, `${file}.sig`], platforms[i], join(input, `release-${platforms[i]}`));
+    const paths = [];
+    for (const name of Object.values(bundleFiles[platform])) {
+      const file = join(build, name);
+      writeFileSync(file, Buffer.from([0, 255, 128, seed++]));
+      writeFileSync(`${file}.sig`, Buffer.alloc(96, seed).toString('base64'));
+      paths.push(file, `${file}.sig`);
+    }
+    stageArtifacts(paths, platform, join(input, `release-${platform}`));
   }
-  try { run({ root, input, output, names }); } finally { rmSync(root, { recursive: true, force: true }); }
+  try { run({ root, input, output }); } finally { rmSync(root, { recursive: true, force: true }); }
 }
 
-test('one complete manifest retains all three signed platform entries', () => fixture(({ input, output, names }) => {
+test('one complete manifest preserves generic and bundle-specific updater targets', () => fixture(({ input, output }) => {
   const manifest = assembleArtifacts(input, output, '0.2.8', 'Zburgers/vibevoice', 'Reviewed notes');
-  assert.deepEqual(Object.keys(manifest.platforms), platforms);
-  for (let i = 0; i < platforms.length; i++) {
-    assert.equal(manifest.platforms[platforms[i]].url, `https://github.com/Zburgers/vibevoice/releases/download/v0.2.8/${names[i]}`);
-    assert.equal(readFileSync(join(output, names[i]))[3], i);
+  const expectedTargets = [
+    'windows-x86_64',
+    'windows-x86_64-msi',
+    'windows-x86_64-nsis',
+    'linux-x86_64',
+    'linux-x86_64-appimage',
+    'linux-x86_64-deb',
+    'linux-x86_64-rpm',
+    'darwin-aarch64',
+    'darwin-aarch64-app',
+  ];
+  assert.deepEqual(Object.keys(manifest.platforms).sort(), expectedTargets.sort());
+  for (const [platform, bundles] of Object.entries(bundleFiles)) {
+    for (const [bundle, name] of Object.entries(bundles)) {
+      const target = `${platform}-${bundle}`;
+      assert.equal(manifest.platforms[target].url, `https://github.com/Zburgers/vibevoice/releases/download/v0.2.8/${name}`);
+      assert.ok(manifest.platforms[target].signature.length >= 80);
+      assert.ok(readFileSync(join(output, name)).length > 0);
+    }
   }
-  assert.equal(readdirSync(output).length, 7);
+  assert.equal(manifest.platforms['windows-x86_64'], manifest.platforms['windows-x86_64-msi']);
+  assert.equal(manifest.platforms['linux-x86_64'], manifest.platforms['linux-x86_64-appimage']);
+  assert.equal(manifest.platforms['darwin-aarch64'], manifest.platforms['darwin-aarch64-app']);
+  assert.equal(readdirSync(output).length, 13);
 }));
 
-test('missing platform, signature, unsafe receipt or duplicate filename aborts assembly', () => {
-  for (const mutation of ['platform', 'signature', 'path', 'duplicate']) fixture(({ input, output }) => {
+test('missing platform, bundle, signature, unsafe receipt or duplicate filename aborts assembly', () => {
+  for (const mutation of ['platform', 'bundle', 'signature', 'path', 'duplicate']) fixture(({ input, output }) => {
     const dir = join(input, 'release-linux-x86_64');
     const receiptFile = join(dir, 'platform.json');
     const receipt = JSON.parse(readFileSync(receiptFile));
     if (mutation === 'platform') rmSync(dir, { recursive: true });
-    if (mutation === 'signature') rmSync(join(dir, `${receipt.updater}.sig`));
+    if (mutation === 'bundle') { delete receipt.updaters.rpm; writeFileSync(receiptFile, JSON.stringify(receipt)); }
+    if (mutation === 'signature') rmSync(join(dir, `${receipt.updaters.deb}.sig`));
     if (mutation === 'path') { receipt.files.push('../outside'); writeFileSync(receiptFile, JSON.stringify(receipt)); }
     if (mutation === 'duplicate') { receipt.files.push('VibeVoice_0.2.8_x64-setup.exe'); writeFileSync(receiptFile, JSON.stringify(receipt)); }
     assert.throws(() => assembleArtifacts(input, output, '0.2.8', 'Zburgers/vibevoice', 'notes'));
