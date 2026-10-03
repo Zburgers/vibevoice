@@ -1,28 +1,35 @@
 # VibeVoice issue tracker
 
-This file records repository-side release truth and points to the canonical GitHub backlog. The shipped items below are integrated in the `v0.2.7` tag and reconciled into `master`; open feature work remains tracked in GitHub rather than duplicated here.
+This file records repository-side release truth and points to the canonical GitHub backlog. The 0.2.7 stabilization below remains historical evidence; 0.2.8 additions are summarized separately. Open feature work remains tracked in GitHub rather than duplicated here.
 
 ## Current open GitHub backlog
 
-Audited 2026-09-19. GitHub issue bodies and acceptance criteria are authoritative; this index is intentionally concise and should be updated when an issue's status changes.
+Audited 2026-10-04 during 0.2.8 publication preparation. GitHub issue bodies and acceptance criteria are authoritative; this index is intentionally concise and should be updated when an issue's status changes.
 
 | Issue | Status | Scope |
 | --- | --- | --- |
 | [#10](https://github.com/Zburgers/vibevoice/issues/10) | Open future work | Deterministic cleanup presets and context-aware output profiles |
-| [#11](https://github.com/Zburgers/vibevoice/issues/11) | Open future work | Model selection, benchmarking, and engine-health UI |
+| [#11](https://github.com/Zburgers/vibevoice/issues/11) | Partially delivered | Automatic/Custom model selection and health checks in 0.2.8; model discovery, in-app benchmarking, and profile selection remain |
 | [#12](https://github.com/Zburgers/vibevoice/issues/12) | Open future work | Recording profiles for context-safe dictation workflows |
-| [#36](https://github.com/Zburgers/vibevoice/issues/36) | Partially delivered | Transactional insertion stabilization shipped in 0.2.7; broader acceptance criteria remain open |
+| [#36](https://github.com/Zburgers/vibevoice/issues/36) | Partially delivered | 0.2.8 adds native clipboard preservation checks, macOS paste, recovery and warning semantics; target/focus verification and desktop acceptance remain |
 | [#37](https://github.com/Zburgers/vibevoice/issues/37) | Open future work | Reviewable adaptive developer vocabulary and import/export |
 | [#38](https://github.com/Zburgers/vibevoice/issues/38) | Open future work | Explicit spoken punctuation, layout, and literal-mode commands |
-| [#39](https://github.com/Zburgers/vibevoice/issues/39) | Open future work | Microphone and audio-quality preflight feedback |
+| [#39](https://github.com/Zburgers/vibevoice/issues/39) | Partially delivered | Measured frequency feedback and bounded audio handoff in 0.2.8; silence/clipping preflight, input selection and overrides remain |
 | [#40](https://github.com/Zburgers/vibevoice/issues/40) | Open future work | Latest-transcript correction loop and safe dictionary suggestions |
-| [#41](https://github.com/Zburgers/vibevoice/issues/41) | Partially delivered | Installer-integrity subset shipped in 0.2.7; managed engine/model lifecycle remains open |
-| [#42](https://github.com/Zburgers/vibevoice/issues/42) | Open future work | Accessibility-first recording controls and safe hands-free operation |
+| [#41](https://github.com/Zburgers/vibevoice/issues/41) | Partially delivered | 0.2.8 adds verified Windows engine and cross-platform default model updates, progress/cancel and preserved old files; disk-space handling, explicit rollback/removal and wider installation acceptance remain |
+| [#42](https://github.com/Zburgers/vibevoice/issues/42) | Partially delivered | Preparation cancellation and clearer controls in 0.2.8; screen-reader/reduced-motion coverage, recording safeguards and complete keyboard acceptance remain |
 | [#43](https://github.com/Zburgers/vibevoice/issues/43) | Open future work | Bounded voice-command mode with preview and confirmation |
 | [#44](https://github.com/Zburgers/vibevoice/issues/44) | Open future work | Opt-in local privacy-preserving transcription telemetry |
 | [#45](https://github.com/Zburgers/vibevoice/issues/45) | Open cross-repository work | Lightweight VibeVoice and mdview profile demonstration assets |
+| [#68](https://github.com/Zburgers/vibevoice/issues/68) | Packaging fix integrated | RPM/DEB/AppImage icons and AppStream metadata from #70; inspect final tagged packages and verify Fedora graphical presentation |
 
 Completed stabilization issues are intentionally not recreated or duplicated in this backlog; their shipped status and evidence are recorded below and in their GitHub history.
+
+## 0.2.8 release work
+
+[Release notes](releases/v0.2.8.md) identify the delivered features and link merged PRs #69–#77. PR #77 merged into master at `02a1c58f457a1df701ad94c5afd2935096723cea`; all six checks passed on that exact merge. Release publication is tag-driven and separate from the merge.
+
+Issue #68's missing packaged metadata/icon is addressed by #70. The earlier Linux fixture reused a 0.2.7 binary and remains metadata evidence only; the protected 0.2.8 workflow produces current-source packages. Broader issues #11, #36, #39, #41, #42 and #44 are related to this release but are not closed by partial feature delivery. The canonical GitHub issue state takes precedence over this index.
 
 ## 0.2.7 stabilization
 
