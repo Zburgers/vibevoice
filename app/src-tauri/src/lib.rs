@@ -9,7 +9,7 @@ use std::os::unix::process::CommandExt;
 use std::os::windows::process::CommandExt;
 use std::{
     fs,
-    io::{self, Write},
+    io::{self, Read, Write},
     path::{Path, PathBuf},
     process::{Child, Command, ExitStatus, Stdio},
     str::FromStr,
@@ -26,9 +26,14 @@ use tauri::{
     tray::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent},
     AppHandle, Emitter, Manager, WebviewWindow,
 };
+use tauri_plugin_autostart::ManagerExt as AutostartExt;
 use tauri_plugin_clipboard_manager::ClipboardExt;
+use tauri_plugin_dialog::DialogExt;
 use tauri_plugin_global_shortcut::{Code, GlobalShortcutExt, Modifiers, Shortcut, ShortcutState};
 use tauri_plugin_opener::OpenerExt;
+#[cfg(target_os = "windows")]
+mod windows_startup;
+
 use uuid::Uuid;
 
 mod meter;
@@ -348,6 +353,9 @@ struct DiagnosticsCache {
 struct AppData {
     component_update_busy: Arc<AtomicBool>,
     component_update_cancel: Arc<AtomicBool>,
+    settings: Mutex<()>,
+    hotkey_capture: AtomicBool,
+    hotkey_down: AtomicBool,
     runtime: Mutex<RuntimeState>,
     diagnostics_cache: Mutex<Option<DiagnosticsCache>>,
     history: Mutex<()>,
@@ -380,7 +388,8 @@ fn get_app_state(
     window: WebviewWindow,
 ) -> Result<AppStateSnapshot, String> {
     authorize_window(&window, &["main", "pill"])?;
-    let settings = load_settings(&app)?;
+    let mut settings = load_settings(&app)?;
+    settings.start_on_login = app.autolaunch().is_enabled().map_err(|e| e.to_string())?;
     let dictionary = load_dictionary(&app)?;
     let history = load_history_for_settings(&app, &settings, &data.history)?;
     let runtime = data.runtime.lock().map_err(|error| error.to_string())?;
@@ -471,27 +480,210 @@ fn save_settings(
     data: tauri::State<AppData>,
     mut settings: Settings,
     window: WebviewWindow,
-) -> Result<(), String> {
+) -> Result<Settings, String> {
     authorize_window(&window, &["main"])?;
     let _lifecycle = data.lifecycle.lock().map_err(|e| e.to_string())?;
     if data.component_update_busy.load(Ordering::Acquire) {
         return Err("Wait for the Whisper update before changing settings.".into());
     }
+    let _guard = data.settings.lock().map_err(|error| error.to_string())?;
     settings.transcription_timeout_seconds = settings.transcription_timeout_seconds.clamp(
         MIN_TRANSCRIPTION_TIMEOUT_SECONDS,
         MAX_TRANSCRIPTION_TIMEOUT_SECONDS,
     );
     settings.transcription_threads = settings.transcription_threads.min(16);
-    let previous = load_settings(&app).unwrap_or_default();
-    if settings.hotkey != previous.hotkey {
-        register_global_hotkey(&app, &settings.hotkey)?;
+    let previous = load_settings(&app)?;
+    // Validate before touching working OS registrations or persisting anything.
+    if settings.whisper_binary_path != previous.whisper_binary_path {
+        settings.whisper_binary_path =
+            validate_engine_setting(&settings.whisper_binary_path, false)?;
     }
+    if settings.model_path != previous.model_path {
+        settings.model_path = validate_engine_setting(&settings.model_path, true)?;
+    }
+    parse_hotkey(&settings.hotkey)?;
+    let current_autostart = app.autolaunch().is_enabled().map_err(|e| e.to_string())?;
+    #[cfg(not(windows))]
+    let old_autostart = current_autostart;
+    #[cfg(windows)]
+    let startup_snapshot = windows_startup::snapshot()?;
     if DiagnosticsCacheKey::from_settings(&settings)
         != DiagnosticsCacheKey::from_settings(&previous)
     {
         invalidate_diagnostics_cache(&data)?;
     }
-    write_json(settings_path(&app)?, &settings)
+    let pill = app.get_webview_window("pill");
+    let old_topmost = pill
+        .as_ref()
+        .map(|w| w.is_always_on_top())
+        .transpose()
+        .map_err(|e| e.to_string())?;
+    let applied = (|| {
+        if settings.hotkey != previous.hotkey {
+            replace_global_hotkey(&app, &previous.hotkey, &settings.hotkey)?;
+        }
+        if settings.start_on_login != previous.start_on_login
+            || settings.start_on_login != current_autostart
+        {
+            set_start_on_login(&app, settings.start_on_login)?;
+        }
+        if let Some(pill) = &pill {
+            pill.set_always_on_top(settings.pill_always_on_top)
+                .map_err(|e| e.to_string())?;
+        }
+        write_json(settings_path(&app)?, &settings)
+    })();
+    if let Err(error) = applied {
+        let mut rollback_errors = Vec::new();
+        if settings.hotkey != previous.hotkey {
+            if let Err(e) = replace_global_hotkey(&app, &settings.hotkey, &previous.hotkey) {
+                rollback_errors.push(e);
+            }
+        }
+        #[cfg(not(windows))]
+        if let Err(e) = set_start_on_login(&app, old_autostart) {
+            rollback_errors.push(e);
+        }
+        #[cfg(windows)]
+        if let Err(e) = windows_startup::restore(startup_snapshot) {
+            rollback_errors.push(e);
+        }
+        if let (Some(pill), Some(topmost)) = (&pill, old_topmost) {
+            if let Err(e) = pill.set_always_on_top(topmost) {
+                rollback_errors.push(e.to_string());
+            }
+        }
+        return Err(if rollback_errors.is_empty() {
+            error
+        } else {
+            format!(
+                "{error} Could not restore all settings: {}",
+                rollback_errors.join("; ")
+            )
+        });
+    }
+    emit_state_changed(&app);
+    Ok(settings)
+}
+
+fn set_start_on_login(app: &AppHandle, enabled: bool) -> Result<(), String> {
+    let manager = app.autolaunch();
+    #[cfg(windows)]
+    windows_startup::set_enabled(enabled)
+        .map_err(|e| format!("Could not update login startup: {e}"))?;
+    #[cfg(not(windows))]
+    {
+        let current = manager
+            .is_enabled()
+            .map_err(|e| format!("Could not read login startup: {e}"))?;
+        if current == enabled {
+            return Ok(());
+        }
+        if enabled {
+            manager.enable()
+        } else {
+            manager.disable()
+        }
+        .map_err(|e| format!("Could not update login startup: {e}"))?;
+    }
+    if manager.is_enabled().map_err(|e| e.to_string())? != enabled {
+        return Err("Login startup registration did not change.".to_string());
+    }
+    Ok(())
+}
+
+#[tauri::command]
+fn set_hotkey_capture(
+    data: tauri::State<AppData>,
+    window: WebviewWindow,
+    capturing: bool,
+) -> Result<(), String> {
+    authorize_window(&window, &["main"])?;
+    data.hotkey_capture.store(capturing, Ordering::Release);
+    Ok(())
+}
+
+fn validate_engine_setting(value: &str, model: bool) -> Result<String, String> {
+    let value = value.trim();
+    if value.eq_ignore_ascii_case(AUTO_PATH) {
+        return Ok(AUTO_PATH.to_string());
+    }
+    let label = if model { "Model" } else { "Whisper binary" };
+    let path = expand_home(value);
+    if value.is_empty() || !path.is_absolute() || !path.is_file() {
+        return Err(format!(
+            "{label}: choose an existing file using an absolute path, or use Automatic."
+        ));
+    }
+    let mut header = [0; 4];
+    fs::File::open(&path)
+        .and_then(|mut file| file.read_exact(&mut header))
+        .map_err(|e| format!("{label}: cannot read this file: {e}"))?;
+    if model {
+        if header != *b"lmgg" {
+            return Err("Model: select a whisper.cpp GGML model (.bin). This file has an unsupported header.".to_string());
+        }
+    } else {
+        if path
+            .file_stem()
+            .is_none_or(|name| !name.eq_ignore_ascii_case("whisper-cli"))
+        {
+            return Err(
+                "Whisper binary: select whisper-cli, not another engine utility.".to_string(),
+            );
+        }
+        #[cfg(windows)]
+        if path
+            .extension()
+            .is_none_or(|ext| !ext.eq_ignore_ascii_case("exe"))
+            || &header[..2] != b"MZ"
+        {
+            return Err("Whisper binary: select the whisper-cli executable (.exe).".to_string());
+        }
+        #[cfg(unix)]
+        if fs::metadata(&path)
+            .map_err(|e| e.to_string())?
+            .permissions()
+            .mode()
+            & 0o111
+            == 0
+        {
+            return Err("Whisper binary: this file is not executable.".to_string());
+        }
+    }
+    Ok(path.to_string_lossy().into_owned())
+}
+
+#[tauri::command]
+async fn pick_engine_file(
+    app: AppHandle,
+    window: WebviewWindow,
+    model: bool,
+) -> Result<Option<String>, String> {
+    authorize_window(&window, &["main"])?;
+    async_runtime::spawn_blocking(move || {
+        let mut picker = app.dialog().file().set_parent(&window).set_title(if model {
+            "Choose whisper.cpp model"
+        } else {
+            "Choose Whisper CLI"
+        });
+        if model {
+            picker = picker.add_filter("Whisper GGML model", &["bin"]);
+        }
+        #[cfg(windows)]
+        if !model {
+            picker = picker.add_filter("Whisper CLI executable", &["exe"]);
+        }
+        picker
+            .blocking_pick_file()
+            .map(|file| {
+                let path = file.into_path().map_err(|e| e.to_string())?;
+                validate_engine_setting(&path.to_string_lossy(), model)
+            })
+            .transpose()
+    })
+    .await
+    .map_err(|e| e.to_string())?
 }
 
 #[tauri::command]
@@ -864,10 +1056,7 @@ fn finish_recording(
         .lock()
         .map_err(|e| e.to_string())?
         .last_transcription_metrics = Some(metrics);
-    let mut final_transcript = cleanup_transcript(&raw_transcript);
-    if settings.dictionary_cleanup {
-        final_transcript = apply_dictionary(&final_transcript, &dictionary);
-    }
+    let final_transcript = prepare_transcript(&raw_transcript, &settings, &dictionary);
 
     if final_transcript.is_empty() {
         let message = "Whisper returned an empty transcript.".to_string();
@@ -1160,6 +1349,7 @@ async fn update_whisper_component(
             // active lease. Activation is one atomic settings write; the old
             // engine/custom model is retained and never overwritten.
             let _lifecycle = data.lifecycle.lock().map_err(|e| e.to_string())?;
+            let _settings = data.settings.lock().map_err(|e| e.to_string())?;
             whisper_update::check_cancel(cancel, shutdown)?;
             components_idle(&*data.runtime.lock().map_err(|e| e.to_string())?)?;
             let mut settings = load_settings(&app)?;
@@ -2731,6 +2921,15 @@ fn apply_dictionary(text: &str, dictionary: &[DictionaryRule]) -> String {
     result
 }
 
+fn prepare_transcript(raw: &str, settings: &Settings, dictionary: &[DictionaryRule]) -> String {
+    let cleaned = cleanup_transcript(raw);
+    if settings.dictionary_cleanup {
+        apply_dictionary(&cleaned, dictionary)
+    } else {
+        cleaned
+    }
+}
+
 fn replace_case_insensitive(input: &str, needle: &str, replacement: &str) -> String {
     if needle.is_empty() {
         return input.to_string();
@@ -3269,14 +3468,18 @@ fn parse_hotkey(hotkey: &str) -> Result<Shortcut, String> {
 fn register_hotkey_handler(app: &AppHandle, shortcut: Shortcut) -> Result<(), String> {
     let app_handle = app.clone();
     app.global_shortcut()
-        .unregister_all()
-        .map_err(|error| format!("Hotkey unregister failed: {error}"))?;
-    app.global_shortcut()
         .on_shortcut(shortcut, move |_app, _shortcut, event| {
+            let state = app_handle.state::<AppData>();
             if event.state() != ShortcutState::Pressed {
+                state.hotkey_down.store(false, Ordering::Release);
                 return;
             }
-            let state = app_handle.state::<AppData>();
+            if state.hotkey_capture.load(Ordering::Acquire) {
+                return;
+            }
+            if state.hotkey_down.swap(true, Ordering::AcqRel) {
+                return;
+            }
             // Fast toggle during Preparing cancels the in-flight start (#50):
             // both Recording and Preparing route to stop.
             let should_stop = state
@@ -3309,6 +3512,28 @@ fn register_hotkey_handler(app: &AppHandle, shortcut: Shortcut) -> Result<(), St
 fn register_global_hotkey(app: &AppHandle, hotkey: &str) -> Result<(), String> {
     let shortcut = parse_hotkey(hotkey)?;
     register_hotkey_handler(app, shortcut)
+}
+
+fn replace_global_hotkey(app: &AppHandle, previous: &str, next: &str) -> Result<(), String> {
+    let previous = parse_hotkey(previous)?;
+    let next = parse_hotkey(next)?;
+    if previous == next && app.global_shortcut().is_registered(next) {
+        return Ok(());
+    }
+    // Keep the working shortcut until the OS accepts its replacement.
+    if !app.global_shortcut().is_registered(next) {
+        register_hotkey_handler(app, next)?;
+    }
+    if previous != next && app.global_shortcut().is_registered(previous) {
+        if let Err(error) = app.global_shortcut().unregister(previous) {
+            let _ = app.global_shortcut().unregister(next);
+            return Err(format!("Could not remove previous hotkey: {error}"));
+        }
+    }
+    app.state::<AppData>()
+        .hotkey_down
+        .store(false, Ordering::Release);
+    Ok(())
 }
 
 fn show_window(app: &AppHandle, label: &str) {
@@ -3471,6 +3696,12 @@ fn track_thread(threads: &Mutex<Vec<thread::JoinHandle<()>>>, thread: thread::Jo
 pub fn run() {
     let app = tauri::Builder::default()
         .plugin(tauri_plugin_global_shortcut::Builder::new().build())
+        .plugin(
+            tauri_plugin_autostart::Builder::new()
+                .app_name("VibeVoice")
+                .build(),
+        )
+        .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_clipboard_manager::init())
         .plugin(tauri_plugin_opener::init())
         .plugin(tauri_plugin_process::init())
@@ -3478,6 +3709,9 @@ pub fn run() {
         .manage(AppData {
             component_update_busy: Arc::new(AtomicBool::new(false)),
             component_update_cancel: Arc::new(AtomicBool::new(false)),
+            settings: Mutex::new(()),
+            hotkey_capture: AtomicBool::new(false),
+            hotkey_down: AtomicBool::new(false),
             runtime: Mutex::new(RuntimeState::default()),
             diagnostics_cache: Mutex::new(None),
             history: Mutex::new(()),
@@ -3495,6 +3729,8 @@ pub fn run() {
             get_diagnostics_report,
             copy_diagnostics_report,
             save_settings,
+            pick_engine_file,
+            set_hotkey_capture,
             start_recording,
             stop_recording,
             cancel_transcription,
@@ -3512,6 +3748,19 @@ pub fn run() {
             open_release_page,
             show_main_window
         ])
+        .on_window_event(|window, event| {
+            if window.label() == "main"
+                && matches!(
+                    event,
+                    tauri::WindowEvent::Focused(false) | tauri::WindowEvent::Destroyed
+                )
+            {
+                window
+                    .state::<AppData>()
+                    .hotkey_capture
+                    .store(false, Ordering::Release);
+            }
+        })
         .setup(|app| {
             // Best-effort reclaim of abnormal-termination artifacts. Failures
             // are logged (never logged with audio/transcript content) and do
@@ -3520,6 +3769,15 @@ pub fn run() {
                 eprintln!("Could not clean stale recording artifacts: {error}");
             }
             setup_tray(app.handle())?;
+            let settings = load_settings(app.handle())?;
+            if let Some(pill) = app.get_webview_window("pill") {
+                pill.set_always_on_top(settings.pill_always_on_top)?;
+            }
+            if let Err(error) = set_start_on_login(app.handle(), settings.start_on_login) {
+                if let Ok(mut runtime) = app.state::<AppData>().runtime.lock() {
+                    runtime.last_error = Some(error);
+                }
+            }
             let hotkey = load_settings(app.handle())
                 .map(|settings| settings.hotkey)
                 .unwrap_or_else(|_| Settings::default().hotkey);
@@ -3709,6 +3967,71 @@ mod tests {
         let receipt = serde_json::json!({ "engine_version": whisper_update::ENGINE_VERSION, "binary": engine.binary, "model": model, "transcript": text, "metrics": metrics });
         write_json(PathBuf::from(receipt_path), &receipt).unwrap();
         engine.activate();
+    }
+
+    #[test]
+    fn dictionary_cleanup_toggle_and_disabled_rules_are_honored() {
+        let rules = vec![
+            DictionaryRule {
+                id: "1".into(),
+                spoken: "github".into(),
+                replacement: "GitHub".into(),
+                enabled: true,
+            },
+            DictionaryRule {
+                id: "2".into(),
+                spoken: "actions".into(),
+                replacement: "WRONG".into(),
+                enabled: false,
+            },
+        ];
+        let mut settings = Settings::default();
+        assert_eq!(
+            prepare_transcript("github actions", &settings, &rules),
+            "GitHub actions"
+        );
+        settings.dictionary_cleanup = false;
+        assert_eq!(
+            prepare_transcript("github actions", &settings, &rules),
+            "github actions"
+        );
+    }
+
+    #[test]
+    fn custom_paths_reject_missing_files_directories_and_wrong_model_formats() {
+        assert_eq!(validate_engine_setting(" AUTO ", true).unwrap(), "auto");
+        assert!(validate_engine_setting("", false).is_err());
+        assert!(validate_engine_setting("relative.exe", false).is_err());
+        let root = std::env::temp_dir().join(format!("vv-settings-{}", Uuid::new_v4()));
+        fs::create_dir_all(&root).unwrap();
+        assert!(validate_engine_setting(&root.to_string_lossy(), true).is_err());
+        let model = root.join("model.bin");
+        fs::write(&model, b"not a model").unwrap();
+        assert!(validate_engine_setting(&model.to_string_lossy(), true).is_err());
+        fs::write(&model, b"lmggmodel fixture").unwrap();
+        assert!(validate_engine_setting(&model.to_string_lossy(), true).is_ok());
+        #[cfg(windows)]
+        {
+            let binary = root.join("whisper-cli.exe");
+            fs::write(&binary, b"not executable").unwrap();
+            assert!(validate_engine_setting(&binary.to_string_lossy(), false).is_err());
+            fs::write(&binary, b"MZ executable fixture").unwrap();
+            assert!(validate_engine_setting(&binary.to_string_lossy(), false).is_ok());
+        }
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn recorded_physical_hotkeys_parse_for_letters_and_punctuation() {
+        for hotkey in [
+            "K",
+            "Ctrl+Alt+K",
+            "Ctrl+Shift+Slash",
+            "Alt+ArrowUp",
+            "Ctrl+Alt+Space",
+        ] {
+            assert!(parse_hotkey(hotkey).is_ok(), "{hotkey}");
+        }
     }
     use super::*;
     use std::sync::atomic::AtomicBool;

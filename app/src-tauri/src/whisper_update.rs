@@ -4,7 +4,7 @@ use sha2::{Digest, Sha256};
 use std::{
     collections::HashSet,
     fs::{self, File},
-    io::{self, Read, Write},
+    io::{self, Cursor, Read, Write},
     path::{Path, PathBuf},
     sync::{
         atomic::{AtomicBool, Ordering},
@@ -155,6 +155,59 @@ fn copy_verified(
     check_cancel(cancel, shutdown)
 }
 
+#[derive(Clone, Copy)]
+struct DownloadTimeouts {
+    connect: Duration,
+    stall: Duration,
+    total: Duration,
+}
+
+const DOWNLOAD_TIMEOUTS: DownloadTimeouts = DownloadTimeouts {
+    connect: Duration::from_secs(15),
+    stall: Duration::from_secs(30),
+    total: Duration::from_secs(600),
+};
+
+fn download_client_builder(timeouts: DownloadTimeouts) -> reqwest::ClientBuilder {
+    // Another client may have already installed a provider; use that provider
+    // if this one-time initialization loses the race.
+    let _ = rustls::crypto::ring::default_provider().install_default();
+    reqwest::Client::builder()
+        .https_only(true)
+        .connect_timeout(timeouts.connect)
+        .read_timeout(timeouts.stall)
+        .timeout(timeouts.total)
+        .redirect(reqwest::redirect::Policy::limited(10))
+        .user_agent("VibeVoice/0.2.8")
+}
+
+// Drive the async HTTP client from the existing blocking update worker. This
+// keeps hashing/atomic file I/O outside async executor threads, while allowing
+// separate total-request and per-read timeouts through the async client API.
+struct ResponseReader {
+    response: reqwest::Response,
+    pending: Cursor<Vec<u8>>,
+}
+
+impl Read for ResponseReader {
+    fn read(&mut self, buffer: &mut [u8]) -> io::Result<usize> {
+        if buffer.is_empty() {
+            return Ok(0);
+        }
+        loop {
+            let count = self.pending.read(buffer)?;
+            if count != 0 {
+                return Ok(count);
+            }
+            match tauri::async_runtime::block_on(async { self.response.chunk().await }) {
+                Ok(Some(chunk)) => self.pending = Cursor::new(chunk.to_vec()),
+                Ok(None) => return Ok(0),
+                Err(error) => return Err(io::Error::other(error)),
+            }
+        }
+    }
+}
+
 fn download_verified(
     target: &Path,
     artifact: &Artifact<'_>,
@@ -163,21 +216,23 @@ fn download_verified(
     shutdown: &AtomicBool,
 ) -> Result<(), String> {
     check_cancel(cancel, shutdown)?;
-    // A provider may already be installed by the application updater. Losing
-    // this one-time initialization race means the existing provider is used.
-    let _ = rustls::crypto::ring::default_provider().install_default();
-    let client = reqwest::blocking::Client::builder()
-        .https_only(true)
-        .connect_timeout(Duration::from_secs(15))
-        .timeout(Duration::from_secs(30))
-        .redirect(reqwest::redirect::Policy::limited(10))
-        .user_agent("VibeVoice/0.2.8")
+    let client = download_client_builder(DOWNLOAD_TIMEOUTS)
         .build()
         .map_err(|e| format!("Download client unavailable: {e}"))?;
-    let mut response = client
-        .get(artifact.url)
-        .send()
-        .and_then(reqwest::blocking::Response::error_for_status)
+    download_with_client(&client, target, artifact, progress, cancel, shutdown)
+}
+
+fn download_with_client(
+    client: &reqwest::Client,
+    target: &Path,
+    artifact: &Artifact<'_>,
+    progress: impl FnMut(u64),
+    cancel: &AtomicBool,
+    shutdown: &AtomicBool,
+) -> Result<(), String> {
+    check_cancel(cancel, shutdown)?;
+    let response = tauri::async_runtime::block_on(async { client.get(artifact.url).send().await })
+        .and_then(reqwest::Response::error_for_status)
         .map_err(|e| format!("Could not download Whisper component: {e}"))?;
     if response
         .content_length()
@@ -188,6 +243,10 @@ fn download_verified(
     if let Some(parent) = target.parent() {
         fs::create_dir_all(parent).map_err(|e| e.to_string())?;
     }
+    let mut response = ResponseReader {
+        response,
+        pending: Cursor::new(Vec::new()),
+    };
     AtomicFile::new(target, AllowOverwrite)
         .write(|file| copy_verified(&mut response, file, artifact, progress, cancel, shutdown))
         .map_err(|error| format!("Could not install verified download: {error}"))
@@ -384,6 +443,165 @@ pub fn stage_engine(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::{net::TcpListener, thread};
+
+    fn slow_server(payload: Vec<u8>, delay: Duration) -> (String, thread::JoinHandle<()>) {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let url = format!("http://{}/component", listener.local_addr().unwrap());
+        let handle = thread::spawn(move || {
+            let (mut socket, _) = listener.accept().unwrap();
+            socket
+                .set_read_timeout(Some(Duration::from_secs(2)))
+                .unwrap();
+            let mut request = Vec::new();
+            while !request.ends_with(b"\r\n\r\n") {
+                let mut byte = [0u8; 1];
+                socket.read_exact(&mut byte).unwrap();
+                request.push(byte[0]);
+                assert!(
+                    request.len() < 16_384,
+                    "fixture request headers are bounded"
+                );
+            }
+            write!(
+                socket,
+                "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                payload.len()
+            )
+            .unwrap();
+            for byte in payload {
+                thread::sleep(delay);
+                if socket.write_all(&[byte]).is_err() {
+                    break;
+                }
+            }
+        });
+        (url, handle)
+    }
+
+    fn transfer_fixture(
+        stall: Duration,
+        total: Duration,
+        delay: Duration,
+        cancel_after_progress: bool,
+    ) -> (Result<(), String>, Vec<u8>, Duration) {
+        let root = fixture();
+        let target = root.join("component.bin");
+        fs::write(&target, b"working").unwrap();
+        let payload = b"new-version";
+        let (url, server) = slow_server(payload.to_vec(), delay);
+        let sha = format!("{:x}", Sha256::digest(payload));
+        let client = download_client_builder(DownloadTimeouts {
+            connect: Duration::from_secs(1),
+            stall,
+            total,
+        })
+        .https_only(false)
+        .build()
+        .unwrap();
+        let artifact = Artifact {
+            url: &url,
+            sha: &sha,
+            size: payload.len() as u64,
+        };
+        let cancel = AtomicBool::new(false);
+        let start = Instant::now();
+        let result = download_with_client(
+            &client,
+            &target,
+            &artifact,
+            |_| {
+                if cancel_after_progress {
+                    cancel.store(true, Ordering::Release);
+                }
+            },
+            &cancel,
+            &AtomicBool::new(false),
+        );
+        let elapsed = start.elapsed();
+        let contents = fs::read(&target).unwrap();
+        assert_eq!(
+            fs::read_dir(&root).unwrap().count(),
+            1,
+            "failed transfers leave no staging file"
+        );
+        server.join().unwrap();
+        fs::remove_dir_all(root).unwrap();
+        (result, contents, elapsed)
+    }
+
+    #[test]
+    fn healthy_slow_download_can_outlast_the_stall_timeout() {
+        let stall = Duration::from_millis(400);
+        let (result, contents, elapsed) = tauri::async_runtime::block_on(async {
+            tauri::async_runtime::spawn_blocking(move || {
+                transfer_fixture(
+                    stall,
+                    Duration::from_secs(5),
+                    Duration::from_millis(80),
+                    false,
+                )
+            })
+            .await
+            .unwrap()
+        });
+        result.unwrap();
+        assert_eq!(contents, b"new-version");
+        assert!(
+            elapsed > stall,
+            "the stall timeout must reset with incoming data"
+        );
+    }
+
+    #[test]
+    #[ignore = "takes 33 seconds to exercise the production 30-second stall limit"]
+    fn healthy_transfer_exceeds_thirty_seconds_with_production_timeouts() {
+        let (result, contents, elapsed) = transfer_fixture(
+            DOWNLOAD_TIMEOUTS.stall,
+            DOWNLOAD_TIMEOUTS.total,
+            Duration::from_secs(3),
+            false,
+        );
+        result.unwrap();
+        assert_eq!(contents, b"new-version");
+        assert!(elapsed > Duration::from_secs(30));
+    }
+
+    #[test]
+    fn stalled_download_times_out_and_preserves_working_file() {
+        let (result, contents, _) = transfer_fixture(
+            Duration::from_millis(100),
+            Duration::from_secs(5),
+            Duration::from_millis(350),
+            false,
+        );
+        assert!(result.is_err());
+        assert_eq!(contents, b"working");
+    }
+
+    #[test]
+    fn overall_budget_stops_a_continuously_progressing_download() {
+        let (result, contents, _) = transfer_fixture(
+            Duration::from_secs(2),
+            Duration::from_millis(180),
+            Duration::from_millis(80),
+            false,
+        );
+        assert!(result.is_err());
+        assert_eq!(contents, b"working");
+    }
+
+    #[test]
+    fn cancellation_during_real_http_transfer_preserves_working_file() {
+        let (result, contents, _) = transfer_fixture(
+            Duration::from_secs(2),
+            Duration::from_secs(5),
+            Duration::from_millis(40),
+            true,
+        );
+        assert!(result.unwrap_err().contains("cancelled"));
+        assert_eq!(contents, b"working");
+    }
     fn fixture() -> PathBuf {
         let root = std::env::temp_dir().join(format!("vibevoice-updater-{}", Uuid::new_v4()));
         fs::create_dir(&root).unwrap();

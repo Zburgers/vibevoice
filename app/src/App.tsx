@@ -98,6 +98,7 @@ function App() {
   const [pillFlipX, setPillFlipX] = useState(false);
   const [pillFlipY, setPillFlipY] = useState(false);
   const settingsRef = useRef(fallbackState.settings);
+  const settingsQueueRef = useRef<Promise<unknown>>(Promise.resolve());
   const pillExpansionRef = useRef({ flipX: false, flipY: false });
   const refreshSequence = useRef(0);
   const pillLayoutRequestRef = useRef(0);
@@ -118,10 +119,6 @@ function App() {
   const primaryDisabled = !canStartOrStop(state.voice_state) || whisperPending || Boolean(state.whisper_update?.busy);
   const ActionIcon = actionIcon(state.voice_state);
 
-  useEffect(() => {
-    settingsRef.current = state.settings;
-  }, [state.settings]);
-
   async function refresh(forceDiagnostics = false) {
     if (!inTauri) {
       setState(fallbackState);
@@ -133,6 +130,7 @@ function App() {
     const sequence = ++refreshSequence.current;
     const next = await invoke<AppState>("get_app_state");
     if (sequence !== refreshSequence.current) return;
+    settingsRef.current = next.settings;
     setState(next);
     setSelectedHistoryId((currentId) => {
       if (currentId && next.history.some((entry) => entry.id === currentId)) return currentId;
@@ -302,7 +300,6 @@ function App() {
     const isCurrentRequest = () => pillLayoutRequestRef.current === requestId;
 
     async function positionPill() {
-      await pillWindow.setAlwaysOnTop(state.settings.pill_always_on_top);
       const previousPosition = await pillWindow.outerPosition();
       const previousSize = await pillWindow.outerSize();
       if (!isCurrentRequest()) return;
@@ -365,7 +362,7 @@ function App() {
         pillLayoutRequestRef.current += 1;
       }
     };
-  }, [currentWindow, expanded, isPillWindow, state.settings.pill_always_on_top]);
+  }, [currentWindow, expanded, isPillWindow]);
 
   useEffect(() => {
     if (isPillWindow || activeTab !== "diagnostics" || updateStatus.state !== "idle") return;
@@ -465,24 +462,34 @@ function App() {
   }
 
   async function updateSettings(patch: Partial<Settings>) {
-    const settings = { ...settingsRef.current, ...patch };
-    settingsRef.current = settings;
     const enginePathChanged =
       patch.whisper_binary_path !== undefined || patch.model_path !== undefined;
     const retentionChanged =
       patch.max_history_entries !== undefined || patch.history_retention_days !== undefined;
-    setState((current) => ({ ...current, settings }));
-    if (!inTauri) return;
-    try {
-      await invoke("save_settings", { settings });
-      setCommandStatus("Settings saved");
-      if (enginePathChanged || retentionChanged) {
-        await refresh(enginePathChanged);
+    const task = settingsQueueRef.current.then(async () => {
+      const settings = { ...settingsRef.current, ...patch };
+      if (!inTauri) {
+        settingsRef.current = settings;
+        setState((current) => ({ ...current, settings }));
+        return true;
       }
-    } catch (error) {
-      setCommandStatus(errorMessage(error));
-      await refresh().catch(() => undefined);
-    }
+      try {
+        const saved = await invoke<Settings>("save_settings", { settings });
+        // Ignore snapshots started before this save completed.
+        refreshSequence.current += 1;
+        settingsRef.current = saved;
+        setState((current) => ({ ...current, settings: saved }));
+        setCommandStatus("Settings saved");
+        if (enginePathChanged || retentionChanged) await refresh(enginePathChanged);
+        return true;
+      } catch (error) {
+        setCommandStatus(errorMessage(error));
+        await refresh().catch(() => undefined);
+        return false;
+      }
+    });
+    settingsQueueRef.current = task;
+    return task;
   }
 
   async function handleSetup() {
@@ -793,6 +800,7 @@ function App() {
           {activeTab === "settings" && (
             <SettingsView
               componentManager={componentManager}
+              status={commandStatus}
               state={state}
               onUpdate={updateSettings}
               onSetup={handleSetup}

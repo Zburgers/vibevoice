@@ -1793,3 +1793,6 @@ body {
     grid-template-columns: repeat(2, minmax(0, 1fr));
   }
 }
+.engine-path-actions { display: flex; gap: 8px; flex-wrap: wrap; }
+.engine-path-field small { color: var(--text-muted, #a8afa3); line-height: 1.4; }
+.engine-path-field [role="alert"] { color: #ffb4a8; }
