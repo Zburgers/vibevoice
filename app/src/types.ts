@@ -135,7 +135,7 @@ export type UpdateStatus = {
 };
 
 export const fallbackState: AppState = {
-  app_version: "0.2.8",
+  app_version: "0.2.81",
   voice_state: "Ready",
   settings: {
     whisper_binary_path: "auto",

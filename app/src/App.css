@@ -1240,7 +1240,11 @@ select:focus {
 .pill-panel-top { justify-content: space-between; gap: 8px; }
 .pill-panel-top .icon-button { min-height: 28px; width: 28px; height: 28px; }
 .pill-panel-label { flex: 1; color: var(--muted); font-size: 12px; }
+.pill-transcript-heading { min-width: 0; display: flex; align-items: center; justify-content: space-between; gap: 8px; }
 .pill-transcript-label { color: var(--muted); font-size: 10px; letter-spacing: 0.06em; text-transform: uppercase; }
+.pill-copy-button { min-height: 26px; display: inline-flex; align-items: center; gap: 5px; padding: 2px 7px; border: 0; border-radius: 6px; color: var(--muted); background: transparent; font-size: 11px; cursor: pointer; }
+.pill-copy-button:hover:not(:disabled) { color: var(--text); background: var(--bg-soft); }
+.pill-copy-button:disabled { opacity: 0.45; cursor: default; }
 .icon-button.is-drag { cursor: move; }
 .pill-transcript { min-height: 0; overflow: auto; overflow-wrap: anywhere; padding: 10px; border: 1px solid var(--line); border-radius: var(--radius); color: var(--text); background: var(--bg-soft); font-size: 12px; line-height: 1.5; }
 .pill-actions { gap: 8px; display: grid; grid-template-columns: minmax(0, 1fr) minmax(0, 0.8fr) 40px; }

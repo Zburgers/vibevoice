@@ -1,4 +1,4 @@
-import { ChevronDown, GripVertical, Home, RotateCcw } from "lucide-react";
+import { ChevronDown, Copy, GripVertical, Home, RotateCcw } from "lucide-react";
 import type { LucideIcon } from "lucide-react";
 import type { MouseEvent } from "react";
 import vibevoiceIcon from "./assets/vibevoice-icon.png";
@@ -20,6 +20,7 @@ export function PillWindow({
   onCollapse,
   onDrag,
   onPrimary,
+  onCopy,
   onPaste,
   onOpenMain,
 }: {
@@ -38,6 +39,7 @@ export function PillWindow({
   onCollapse: () => void;
   onDrag: (event: MouseEvent<HTMLElement>) => void;
   onPrimary: () => void;
+  onCopy: () => void;
   onPaste: () => void;
   onOpenMain: () => void;
 }) {
@@ -95,7 +97,14 @@ export function PillWindow({
             </button>
           </div>
 
-          <div className="pill-transcript-label">Latest transcript</div><div className="pill-transcript" tabIndex={0}>{lastText}</div>
+          <div className="pill-transcript-heading">
+            <div className="pill-transcript-label">Latest transcript</div>
+            <button type="button" className="pill-copy-button" disabled={!state.last_transcript} onClick={onCopy} aria-label="Copy transcript" title="Copy transcript">
+              <Copy size={14} />
+              <span>Copy</span>
+            </button>
+          </div>
+          <div className="pill-transcript" tabIndex={0}>{lastText}</div>
 
           <div className="pill-actions">
             <button type="button" className={`primary-action tone-${tone}`} disabled={primaryDisabled} onClick={onPrimary}>
