@@ -3204,7 +3204,13 @@ fn insert_with_windows_unicode_input(text: &str) -> Result<InsertionReport, Stri
             paste_status: "failed".to_string(),
             clipboard_restored: true,
             error: Some(format!(
-                "Windows could not type the transcript directly: {error}. Your clipboard was left untouched; use Copy transcript or retry insertion."
+                "Windows could not type the transcript directly: {}. Your clipboard was left untouched; {}",
+                error.message(),
+                if error.may_have_inserted_text() {
+                    "some text may already be inserted, so do not retry; use Copy transcript to recover the full transcript."
+                } else {
+                    "no input was inserted, so you can retry insertion or use Copy transcript."
+                }
             )),
             ..InsertionReport::default()
         },

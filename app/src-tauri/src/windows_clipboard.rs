@@ -33,6 +33,33 @@ struct Input {
     data: InputData,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum UnicodeInputError {
+    EmptyTranscript,
+    TranscriptTooLong,
+    InvalidInputRecordSize,
+    SendInput { sent: u32, requested: u32 },
+}
+
+impl UnicodeInputError {
+    pub(super) fn may_have_inserted_text(self) -> bool {
+        matches!(self, Self::SendInput { sent, .. } if sent > 0)
+    }
+
+    pub(super) fn message(self) -> String {
+        match self {
+            Self::EmptyTranscript => "Cannot insert an empty transcript.".into(),
+            Self::TranscriptTooLong => {
+                "Transcript is too long to insert in one Windows input batch.".into()
+            }
+            Self::InvalidInputRecordSize => "Windows input record size is invalid.".into(),
+            Self::SendInput { sent, requested } => {
+                format!("Windows accepted {sent} of {requested} transcript keyboard events.")
+            }
+        }
+    }
+}
+
 #[link(name = "user32")]
 extern "system" {
     fn OpenClipboard(owner: *mut c_void) -> i32;
@@ -45,7 +72,7 @@ extern "system" {
 /// Types UTF-16 text directly into the current foreground window without
 /// changing the clipboard. Used when Windows reports clipboard formats that
 /// cannot be safely snapshotted and restored.
-pub fn type_text(text: &str) -> Result<String, String> {
+pub fn type_text(text: &str) -> Result<String, UnicodeInputError> {
     const INPUT_KEYBOARD: u32 = 1;
     const KEYEVENTF_KEYUP: u32 = 0x0002;
     const KEYEVENTF_UNICODE: u32 = 0x0004;
@@ -68,21 +95,21 @@ pub fn type_text(text: &str) -> Result<String, String> {
         }
     }
     if inputs.is_empty() {
-        return Err("Cannot insert an empty transcript.".into());
+        return Err(UnicodeInputError::EmptyTranscript);
     }
-    let count = u32::try_from(inputs.len())
-        .map_err(|_| "Transcript is too long to insert in one Windows input batch.")?;
+    let count = u32::try_from(inputs.len()).map_err(|_| UnicodeInputError::TranscriptTooLong)?;
     let input_size = i32::try_from(std::mem::size_of::<Input>())
-        .map_err(|_| "Windows input record size is invalid.")?;
+        .map_err(|_| UnicodeInputError::InvalidInputRecordSize)?;
     // SAFETY: `inputs` is a contiguous array of correctly laid out Win32
     // INPUT records and remains alive for the duration of SendInput.
     let sent = unsafe { SendInput(count, inputs.as_ptr(), input_size) };
     if sent == count {
         Ok("windows:unicode-input".into())
     } else {
-        Err(format!(
-            "Windows inserted {sent} of {count} transcript keystrokes."
-        ))
+        Err(UnicodeInputError::SendInput {
+            sent,
+            requested: count,
+        })
     }
 }
 
@@ -156,6 +183,21 @@ fn can_preserve_formats(formats: &[u32]) -> Result<(), String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn unicode_input_errors_distinguish_partial_sends_from_safe_retries() {
+        assert!(!UnicodeInputError::SendInput {
+            sent: 0,
+            requested: 20,
+        }
+        .may_have_inserted_text());
+        assert!(UnicodeInputError::SendInput {
+            sent: 1,
+            requested: 20,
+        }
+        .may_have_inserted_text());
+        assert!(!UnicodeInputError::TranscriptTooLong.may_have_inserted_text());
+    }
 
     #[test]
     fn accepts_empty_and_single_payload_with_synthesized_formats() {
