@@ -3159,11 +3159,23 @@ fn coordinate_insertion(
     should_paste: bool,
 ) -> InsertionReport {
     with_insertion_lock(&data.insertion, || {
+        let clipboard_snapshot = should_paste.then(|| snapshot_text_clipboard(app));
+        #[cfg(target_os = "windows")]
+        if let Some(Err(error)) = &clipboard_snapshot {
+            if error.starts_with(
+                "Auto paste cannot safely restore rich, mixed, or private clipboard formats",
+            ) {
+                return insert_with_windows_unicode_input(text);
+            }
+        }
         Ok(execute_insertion_transaction(
             text,
             should_copy,
             should_paste,
-            || snapshot_text_clipboard(app),
+            || {
+                clipboard_snapshot
+                    .unwrap_or_else(|| Err("Clipboard snapshot was not requested.".to_string()))
+            },
             || copy_to_clipboard(app, text),
             paste_from_clipboard,
             |snapshot| restore_text_clipboard(app, snapshot),
@@ -3173,6 +3185,35 @@ fn coordinate_insertion(
         outcome: InsertionOutcome::Failed,
         error: Some(format!("Insertion lock failed: {error}")),
         ..InsertionReport::default()
+    })
+}
+
+#[cfg(target_os = "windows")]
+fn insert_with_windows_unicode_input(text: &str) -> Result<InsertionReport, String> {
+    Ok(match windows_clipboard::type_text(text) {
+        Ok(tool) => InsertionReport {
+            outcome: InsertionOutcome::Inserted,
+            copy_status: "not_attempted".to_string(),
+            paste_status: format!("pasted:{tool}"),
+            clipboard_restored: true,
+            ..InsertionReport::default()
+        },
+        Err(error) => InsertionReport {
+            outcome: InsertionOutcome::Failed,
+            copy_status: "not_attempted".to_string(),
+            paste_status: "failed".to_string(),
+            clipboard_restored: true,
+            error: Some(format!(
+                "Windows could not type the transcript directly: {}. Your clipboard was left untouched; {}",
+                error.message(),
+                if error.may_have_inserted_text() {
+                    "some text may already be inserted, so do not retry; use Copy transcript to recover the full transcript."
+                } else {
+                    "no input was inserted, so you can retry insertion or use Copy transcript."
+                }
+            )),
+            ..InsertionReport::default()
+        },
     })
 }
 

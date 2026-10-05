@@ -1,11 +1,116 @@
 use std::ffi::c_void;
 
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct KeyboardInput {
+    virtual_key: u16,
+    scan: u16,
+    flags: u32,
+    time: u32,
+    extra_info: usize,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct MouseInput {
+    dx: i32,
+    dy: i32,
+    mouse_data: u32,
+    flags: u32,
+    time: u32,
+    extra_info: usize,
+}
+
+#[repr(C)]
+union InputData {
+    keyboard: KeyboardInput,
+    mouse: MouseInput,
+}
+
+#[repr(C)]
+struct Input {
+    kind: u32,
+    data: InputData,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum UnicodeInputError {
+    EmptyTranscript,
+    TranscriptTooLong,
+    InvalidInputRecordSize,
+    SendInput { sent: u32, requested: u32 },
+}
+
+impl UnicodeInputError {
+    pub(super) fn may_have_inserted_text(self) -> bool {
+        matches!(self, Self::SendInput { sent, .. } if sent > 0)
+    }
+
+    pub(super) fn message(self) -> String {
+        match self {
+            Self::EmptyTranscript => "Cannot insert an empty transcript.".into(),
+            Self::TranscriptTooLong => {
+                "Transcript is too long to insert in one Windows input batch.".into()
+            }
+            Self::InvalidInputRecordSize => "Windows input record size is invalid.".into(),
+            Self::SendInput { sent, requested } => {
+                format!("Windows accepted {sent} of {requested} transcript keyboard events.")
+            }
+        }
+    }
+}
+
 #[link(name = "user32")]
 extern "system" {
     fn OpenClipboard(owner: *mut c_void) -> i32;
     fn CloseClipboard() -> i32;
     fn CountClipboardFormats() -> i32;
     fn EnumClipboardFormats(format: u32) -> u32;
+    fn SendInput(count: u32, inputs: *const Input, input_size: i32) -> u32;
+}
+
+/// Types UTF-16 text directly into the current foreground window without
+/// changing the clipboard. Used when Windows reports clipboard formats that
+/// cannot be safely snapshotted and restored.
+pub fn type_text(text: &str) -> Result<String, UnicodeInputError> {
+    const INPUT_KEYBOARD: u32 = 1;
+    const KEYEVENTF_KEYUP: u32 = 0x0002;
+    const KEYEVENTF_UNICODE: u32 = 0x0004;
+
+    let mut inputs = Vec::with_capacity(text.encode_utf16().count().saturating_mul(2));
+    for unit in text.encode_utf16() {
+        for flags in [KEYEVENTF_UNICODE, KEYEVENTF_UNICODE | KEYEVENTF_KEYUP] {
+            inputs.push(Input {
+                kind: INPUT_KEYBOARD,
+                data: InputData {
+                    keyboard: KeyboardInput {
+                        virtual_key: 0,
+                        scan: unit,
+                        flags,
+                        time: 0,
+                        extra_info: 0,
+                    },
+                },
+            });
+        }
+    }
+    if inputs.is_empty() {
+        return Err(UnicodeInputError::EmptyTranscript);
+    }
+    let count = u32::try_from(inputs.len()).map_err(|_| UnicodeInputError::TranscriptTooLong)?;
+    let input_size = i32::try_from(std::mem::size_of::<Input>())
+        .map_err(|_| UnicodeInputError::InvalidInputRecordSize)?;
+    // SAFETY: `inputs` is a contiguous array of correctly laid out Win32
+    // INPUT records and remains alive for the duration of SendInput.
+    let sent = unsafe { SendInput(count, inputs.as_ptr(), input_size) };
+    if sent == count {
+        Ok("windows:unicode-input".into())
+    } else {
+        Err(UnicodeInputError::SendInput {
+            sent,
+            requested: count,
+        })
+    }
 }
 
 #[link(name = "kernel32")]
@@ -78,6 +183,21 @@ fn can_preserve_formats(formats: &[u32]) -> Result<(), String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn unicode_input_errors_distinguish_partial_sends_from_safe_retries() {
+        assert!(!UnicodeInputError::SendInput {
+            sent: 0,
+            requested: 20,
+        }
+        .may_have_inserted_text());
+        assert!(UnicodeInputError::SendInput {
+            sent: 1,
+            requested: 20,
+        }
+        .may_have_inserted_text());
+        assert!(!UnicodeInputError::TranscriptTooLong.may_have_inserted_text());
+    }
 
     #[test]
     fn accepts_empty_and_single_payload_with_synthesized_formats() {

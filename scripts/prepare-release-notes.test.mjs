@@ -13,6 +13,7 @@ function fixture(run) {
     'app/src-tauri/Cargo.toml': '[package]\nversion = "0.2.8"',
     'app/src-tauri/Cargo.lock': 'name = "vibevoice"\nversion = "0.2.8"',
     'app/src-tauri/tauri.conf.json': '{"version":"0.2.8"}',
+    'app/src-tauri/linux/dev.zburgers.vibevoice.metainfo.xml': '<releases>\n<release version="0.2.8" date="2026-10-03" type="development" />\n</releases>',
     'app/src/types.ts': 'app_version: "0.2.8",',
     'docs/releases/v0.2.8.md': '# VibeVoice 0.2.8\nStatus: unreleased\n<!-- release-notes:start -->\n## Fixes\n\n- Keep transcripts.\n<!-- release-notes:end -->\nOwner acceptance pending.',
   };
@@ -27,7 +28,7 @@ test('publication uses only reviewed user notes, preserving Markdown', () => fix
   assert.equal(prepareReleaseNotes(root, 'v0.2.8'), '## Fixes\n\n- Keep transcripts.');
 }));
 
-test('each of the seven version declarations fails closed when inconsistent or absent', () => fixture((root, files) => {
+test('version declarations and the AppStream release entry fail closed when inconsistent or absent', () => fixture((root, files) => {
   for (const [file, original] of Object.entries(files).filter(([file]) => file.startsWith('app/'))) {
     const occurrences = [...original.matchAll(/0\.2\.8/g)];
     for (const match of occurrences) {
@@ -37,6 +38,18 @@ test('each of the seven version declarations fails closed when inconsistent or a
       }
       writeFileSync(join(root, file), original);
     }
+  }
+}));
+
+test('release consistency requires exactly one matching AppStream entry', () => fixture((root, files) => {
+  const file = 'app/src-tauri/linux/dev.zburgers.vibevoice.metainfo.xml';
+  const original = files[file];
+  for (const xml of [
+    '<releases></releases>',
+    original.replace('</releases>', '<release version="0.2.8" />\n</releases>'),
+  ]) {
+    writeFileSync(join(root, file), xml);
+    assert.throws(() => prepareReleaseNotes(root, 'v0.2.8'), /version mismatch/);
   }
 }));
 

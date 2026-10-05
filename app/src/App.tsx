@@ -700,6 +700,7 @@ function App() {
         onCollapse={() => setExpanded(false)}
         onDrag={dragPillWindow}
         onPrimary={handlePrimaryAction}
+        onCopy={() => handleCopyText(state.last_transcript)}
         onPaste={() => handleReinsert(state.last_transcript)}
         onOpenMain={showMainWindow}
       />

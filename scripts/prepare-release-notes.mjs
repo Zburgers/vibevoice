@@ -10,6 +10,7 @@ export function prepareReleaseNotes(root, tag) {
   const read = path => readFileSync(resolve(root, path), 'utf8');
   const pkg = JSON.parse(read('app/package.json'));
   const npmLock = JSON.parse(read('app/package-lock.json'));
+  const appstreamReleases = [...read('app/src-tauri/linux/dev.zburgers.vibevoice.metainfo.xml').matchAll(/<release\s+[^>]*\bversion="([^"]+)"[^>]*\/>/g)];
   const values = {
     package: pkg.version,
     npmLock: npmLock.version,
@@ -18,9 +19,10 @@ export function prepareReleaseNotes(root, tag) {
     cargoLock: read('app/src-tauri/Cargo.lock').match(/name = "vibevoice"\s+version = "([^"]+)"/)?.[1],
     tauri: JSON.parse(read('app/src-tauri/tauri.conf.json')).version,
     fallback: read('app/src/types.ts').match(/app_version:\s*"([^"]+)"/)?.[1],
+    appstream: appstreamReleases.length === 1 ? appstreamReleases[0][1] : undefined,
   };
   if (Object.values(values).some(version => version !== tag.slice(1))) {
-    throw new Error(`Release version mismatch: ${JSON.stringify(values)}; tag=${tag}`);
+    throw new Error(`Release version mismatch (including AppStream): ${JSON.stringify(values)}; tag=${tag}`);
   }
   const notes = read(`docs/releases/${tag}.md`);
   if (notes.split('\n')[0].trim() !== `# VibeVoice ${pkg.version}`) {
@@ -43,7 +45,7 @@ if (process.argv[1] && import.meta.url === pathToFileURL(resolve(process.argv[1]
     : process.argv[2];
   const body = prepareReleaseNotes(root, tag);
   if (process.argv[2] === '--check') {
-    console.log(`All seven version declarations and release notes match ${tag}.`);
+    console.log(`All seven version declarations, the AppStream release entry, and release notes match ${tag}.`);
   } else {
     if (!process.env.GITHUB_OUTPUT) throw new Error('GITHUB_OUTPUT is required to prepare publication notes.');
     const delimiter = `notes_${randomUUID()}`;

@@ -5,6 +5,33 @@ import { PillWindow } from "./PillWindow";
 import { fallbackState, stateToPhase } from "./types";
 
 describe("pill renderer regressions", () => {
+  it("copies the latest transcript directly from the expanded pill", () => {
+    const onCopy = vi.fn();
+    const view = render(
+      <PillWindow
+        state={{ ...fallbackState, last_transcript: "Copied from the pill" }}
+        phase={stateToPhase.Ready}
+        expanded
+        lastText="Copied from the pill"
+        recordingSeconds={0}
+        primaryDisabled={false}
+        ActionIcon={Mic}
+        onToggleExpanded={vi.fn()}
+        onCollapse={vi.fn()}
+        onDrag={vi.fn()}
+        onPrimary={vi.fn()}
+        onCopy={onCopy}
+        onPaste={vi.fn()}
+        onOpenMain={vi.fn()}
+      />,
+    );
+    const copy = screen.getByRole("button", { name: "Copy transcript" });
+    expect(copy).toBeEnabled();
+    fireEvent.click(copy);
+    expect(onCopy).toHaveBeenCalledOnce();
+    view.unmount();
+  });
+
   it("blocks browser image dragging and context menus while retaining pill controls", () => {
     const onDrag = vi.fn();
     const onToggleExpanded = vi.fn();
@@ -12,7 +39,7 @@ describe("pill renderer regressions", () => {
       state={fallbackState} phase={stateToPhase.Ready} expanded={false}
       lastText="" recordingSeconds={0} primaryDisabled={false} ActionIcon={Mic}
       onToggleExpanded={onToggleExpanded} onCollapse={vi.fn()} onDrag={onDrag}
-      onPrimary={vi.fn()} onPaste={vi.fn()} onOpenMain={vi.fn()}
+      onPrimary={vi.fn()} onCopy={vi.fn()} onPaste={vi.fn()} onOpenMain={vi.fn()}
     />);
     const image = view.container.querySelector("img")!;
     expect(image.draggable).toBe(false);
@@ -43,6 +70,7 @@ describe("pill renderer regressions", () => {
         onCollapse={vi.fn()}
         onDrag={vi.fn()}
         onPrimary={onPrimary}
+        onCopy={vi.fn()}
         onPaste={vi.fn()}
         onOpenMain={vi.fn()}
       />,
@@ -68,6 +96,7 @@ describe("pill renderer regressions", () => {
         onCollapse={vi.fn()}
         onDrag={vi.fn()}
         onPrimary={vi.fn()}
+        onCopy={vi.fn()}
         onPaste={vi.fn()}
         onOpenMain={vi.fn()}
       />,
@@ -88,6 +117,7 @@ describe("pill renderer regressions", () => {
           onCollapse={vi.fn()}
           onDrag={vi.fn()}
           onPrimary={vi.fn()}
+          onCopy={vi.fn()}
           onPaste={vi.fn()}
           onOpenMain={vi.fn()}
         />,

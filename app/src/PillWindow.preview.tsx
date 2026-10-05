@@ -12,7 +12,7 @@ function Preview() {
     phase: stateToPhase[voice_state], lastText: voice_state === "Error" ? "Could not transcribe. Try recording again." : "A transcript that stays readable in the compact menu. ".repeat(10),
     recordingSeconds: 12, primaryDisabled: false, ActionIcon: actionIcon(voice_state),
     onToggleExpanded: () => setExpanded(value => !value), onCollapse: () => setExpanded(false),
-    onDrag: () => {}, onPrimary: () => {}, onPaste: () => {}, onOpenMain: () => {},
+    onDrag: () => {}, onPrimary: () => {}, onCopy: () => {}, onPaste: () => {}, onOpenMain: () => {},
   });
   return <div style={{ height: "100%", overflow: "auto", background: "var(--bg)", padding: 24 }}>
     <h1>Pill preview</h1><div style={{ width: expanded ? 340 : 196, height: expanded ? 280 : 80 }}><PillWindow {...props("Ready")} expanded={expanded} /></div>
