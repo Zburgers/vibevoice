@@ -921,7 +921,7 @@ async fn stop_recording_impl(
         }
         // Repeated Stop calls must not clear Processing and admit a second
         // recording while the first worker still owns transcription/insertion.
-        if stop_is_already_processing(&runtime) {
+        if stop_is_idempotent_noop(&runtime) {
             drop(runtime);
             drop(lifecycle);
             return Ok(());
@@ -933,10 +933,12 @@ async fn stop_recording_impl(
                 session
             }
             None => {
-                let message = "No active recording to stop.".to_string();
-                runtime.voice_state = VoiceState::Ready;
-                runtime.last_error = Some(message.clone());
-                return Err(message);
+                // A stale UI snapshot can issue Stop after another request
+                // already cancelled preparation or completed the recording.
+                // Preserve the current result and treat Stop as idempotent.
+                drop(runtime);
+                drop(lifecycle);
+                return Ok(());
             }
         }
     };
@@ -1010,11 +1012,12 @@ fn request_transcription_cancel(current: &Mutex<Option<Arc<AtomicBool>>>) -> Res
     Ok(true)
 }
 
-fn stop_is_already_processing(runtime: &RuntimeState) -> bool {
+fn stop_is_idempotent_noop(runtime: &RuntimeState) -> bool {
     // Stop is idempotent once the recording has been handed to the
-    // transcription worker. A stale UI snapshot or a repeated click must not
-    // turn an in-progress transcription into a user-visible failure.
-    matches!(runtime.voice_state, VoiceState::Processing)
+    // transcription worker or no recording session remains. A stale UI
+    // snapshot or a repeated click must not turn a completed/cancelled action
+    // into a user-visible failure.
+    matches!(runtime.voice_state, VoiceState::Processing) || runtime.recording.is_none()
 }
 
 fn claim_transcription_result(
@@ -4010,9 +4013,21 @@ mod tests {
             voice_state: VoiceState::Processing,
             ..RuntimeState::default()
         };
-        assert!(stop_is_already_processing(&runtime));
+        assert!(stop_is_idempotent_noop(&runtime));
         assert!(matches!(runtime.voice_state, VoiceState::Processing));
         assert!(try_claim_preparation_slot(&mut runtime, 99).is_err());
+    }
+
+    #[test]
+    fn repeated_stop_after_preparation_cancel_is_a_no_op() {
+        let runtime = RuntimeState {
+            voice_state: VoiceState::Ready,
+            last_error: None,
+            ..RuntimeState::default()
+        };
+        assert!(stop_is_idempotent_noop(&runtime));
+        assert!(matches!(runtime.voice_state, VoiceState::Ready));
+        assert!(runtime.last_error.is_none());
     }
 
     #[test]
