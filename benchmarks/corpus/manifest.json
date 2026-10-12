@@ -1,0 +1,223 @@
+{
+  "dataset": "LibriSpeech test-clean/test-other",
+  "license": "CC BY 4.0",
+  "source": "https://www.openslr.org/12/",
+  "sample_rate": 16000,
+  "samples": [
+    {
+      "id": "librispeech-clean-02-1",
+      "audio_path": "librispeech-clean-02-1.wav",
+      "reference": "SUPPOSE IT'S A FRIEND",
+      "duration_seconds": 1.955,
+      "duration_bucket_s": 2,
+      "category": "LibriSpeech test-clean",
+      "source_ids": [
+        "8555-284447-0011"
+      ]
+    },
+    {
+      "id": "librispeech-clean-02-2",
+      "audio_path": "librispeech-clean-02-2.wav",
+      "reference": "BUT THAT IS KAFFAR'S KNIFE",
+      "duration_seconds": 2.16,
+      "duration_bucket_s": 2,
+      "category": "LibriSpeech test-clean",
+      "source_ids": [
+        "6930-81414-0016"
+      ]
+    },
+    {
+      "id": "librispeech-clean-02-3",
+      "audio_path": "librispeech-clean-02-3.wav",
+      "reference": "WHY ARE WE TO BE DIVIDED",
+      "duration_seconds": 2.11,
+      "duration_bucket_s": 2,
+      "category": "LibriSpeech test-clean",
+      "source_ids": [
+        "3575-170457-0002"
+      ]
+    },
+    {
+      "id": "librispeech-clean-05-1",
+      "audio_path": "librispeech-clean-05-1.wav",
+      "reference": "THE SALIENT FEATURES OF THIS DEVELOPMENT OF DOMESTIC SERVICE HAVE ALREADY BEEN INDICATED",
+      "duration_seconds": 4.7,
+      "duration_bucket_s": 5,
+      "category": "LibriSpeech test-clean",
+      "source_ids": [
+        "3570-5696-0004"
+      ]
+    },
+    {
+      "id": "librispeech-clean-05-2",
+      "audio_path": "librispeech-clean-05-2.wav",
+      "reference": "MOST PEOPLE TALK TOO MUCH SO IT IS A RELIEF TO FIND ONE WHO TALKS TOO LITTLE",
+      "duration_seconds": 5.115,
+      "duration_bucket_s": 5,
+      "category": "LibriSpeech test-clean",
+      "source_ids": [
+        "1284-1181-0015"
+      ]
+    },
+    {
+      "id": "librispeech-clean-05-3",
+      "audio_path": "librispeech-clean-05-3.wav",
+      "reference": "AND IN THIS LAST ACTION HE FALLS INTO THE CLASSIC SIN OF PRIDE",
+      "duration_seconds": 4.58,
+      "duration_bucket_s": 5,
+      "category": "LibriSpeech test-clean",
+      "source_ids": [
+        "8463-294825-0010"
+      ]
+    },
+    {
+      "id": "librispeech-clean-10-1",
+      "audio_path": "librispeech-clean-10-1.wav",
+      "reference": "I SUPPOSE THAT'S THE WET SEASON TOO THEN IT'S EXCITING TO SEE EVERYTHING GROWING SO FAST AND TO GET THE GRASS CUT AREN'T YOU SPLASHED LOOK AT THE SPIDER WEBS ALL OVER THE GRASS",
+      "duration_seconds": 10.065,
+      "duration_bucket_s": 10,
+      "category": "LibriSpeech test-clean",
+      "source_ids": [
+        "237-134500-0009",
+        "237-134500-0010",
+        "237-134500-0011"
+      ]
+    },
+    {
+      "id": "librispeech-clean-10-2",
+      "audio_path": "librispeech-clean-10-2.wav",
+      "reference": "ALEXANDER PACED UP AND DOWN THE HALLWAY BUTTONING AND UNBUTTONING HIS OVERCOAT UNTIL SHE RETURNED AND TOOK HIM UP TO HILDA'S LIVING ROOM THE ROOM WAS EMPTY WHEN HE ENTERED",
+      "duration_seconds": 9.985,
+      "duration_bucket_s": 10,
+      "category": "LibriSpeech test-clean",
+      "source_ids": [
+        "4446-2275-0002",
+        "4446-2275-0003"
+      ]
+    },
+    {
+      "id": "librispeech-clean-10-3",
+      "audio_path": "librispeech-clean-10-3.wav",
+      "reference": "AS TO ANY OTHER KIND OF DISCIPLINE WHETHER ADDRESSED TO HER MIND OR HEART LITTLE PEARL MIGHT OR MIGHT NOT BE WITHIN ITS REACH IN ACCORDANCE WITH THE CAPRICE THAT RULED THE MOMENT",
+      "duration_seconds": 10.19,
+      "duration_bucket_s": 10,
+      "category": "LibriSpeech test-clean",
+      "source_ids": [
+        "1221-135766-0009"
+      ]
+    },
+    {
+      "id": "librispeech-clean-20-1",
+      "audio_path": "librispeech-clean-20-1.wav",
+      "reference": "ALEXANDRA LETS YOU SLEEP LATE SHE GATHERED UP HER REINS PLEASE WAIT FOR ME MARIE EMIL COAXED I NEVER SEE LOU'S SCYTHE OVER HERE HOW BROWN YOU'VE GOT SINCE YOU CAME HOME I WISH I HAD AN ATHLETE TO MOW MY ORCHARD I GET WET TO MY KNEES WHEN I GO DOWN TO PICK CHERRIES",
+      "duration_seconds": 20.135,
+      "duration_bucket_s": 20,
+      "category": "LibriSpeech test-clean",
+      "source_ids": [
+        "237-134493-0007",
+        "237-134493-0008",
+        "237-134493-0009",
+        "237-134493-0010",
+        "237-134493-0011",
+        "237-134493-0012"
+      ]
+    },
+    {
+      "id": "librispeech-clean-20-2",
+      "audio_path": "librispeech-clean-20-2.wav",
+      "reference": "THOU GENTLE MAID OF SILENT VALLEYS AND OF MODEST BROOKS FOR THOU SHALL BE CLOTHED IN LIGHT AND FED WITH MORNING MANNA TILL SUMMERS HEAT MELTS THEE BESIDE THE FOUNTAINS AND THE SPRINGS TO FLOURISH IN ETERNAL VALES THEY WHY SHOULD THEL COMPLAIN",
+      "duration_seconds": 19.95,
+      "duration_bucket_s": 20,
+      "category": "LibriSpeech test-clean",
+      "source_ids": [
+        "908-157963-0008"
+      ]
+    },
+    {
+      "id": "librispeech-clean-20-3",
+      "audio_path": "librispeech-clean-20-3.wav",
+      "reference": "THE REVELATION OF HIS LOVE LIGHTED AND BRIGHTENED SLOWLY TILL IT FLAMED LIKE A SUNRISE OVER HIM AND LEFT HIM IN BURNING WONDER HE PANTED TO KNOW IF SHE TOO KNEW OR KNEW AND CARED NOT OR CARED AND KNEW NOT SHE WAS SO STRANGE AND HUMAN A CREATURE THE WORLD WAS WATER VEILED IN MISTS",
+      "duration_seconds": 20.06,
+      "duration_bucket_s": 20,
+      "category": "LibriSpeech test-clean",
+      "source_ids": [
+        "1995-1837-0003",
+        "1995-1837-0004",
+        "1995-1837-0005",
+        "1995-1837-0006"
+      ]
+    },
+    {
+      "id": "librispeech-clean-30-1",
+      "audio_path": "librispeech-clean-30-1.wav",
+      "reference": "SHE TAUGHT HER DAUGHTER THEN BY HER OWN AFFECTION FOR IT THAT LOVE FOR A COUNTRY WHERE THEY HAD BOTH BEEN HOSPITABLY RECEIVED AND WHERE A BRILLIANT FUTURE OPENED BEFORE THEM THE COUNT HAD THROWN HIMSELF BACK ON HIS SEAT LEANING HIS SHOULDERS AGAINST THE PARTITION OF THE TENT AND REMAINED THUS HIS FACE BURIED IN HIS HANDS WITH HEAVING CHEST AND RESTLESS LIMBS THIS HAS INDEED BEEN A HARASSING DAY CONTINUED THE YOUNG MAN HIS EYES FIXED UPON HIS FRIEND",
+      "duration_seconds": 30.575,
+      "duration_bucket_s": 30,
+      "category": "LibriSpeech test-clean",
+      "source_ids": [
+        "6930-75918-0004",
+        "6930-75918-0005",
+        "6930-75918-0006"
+      ]
+    },
+    {
+      "id": "librispeech-clean-30-2",
+      "audio_path": "librispeech-clean-30-2.wav",
+      "reference": "ANGOR PAIN PAINFUL TO HEAR HAY FEVER A HEART TROUBLE CAUSED BY FALLING IN LOVE WITH A GRASS WIDOW HEAVEN A GOOD PLACE TO BE RAISED TO HEDGE A FENCE HEREDITY THE CAUSE OF ALL OUR FAULTS HORSE SENSE A DEGREE OF WISDOM THAT KEEPS ONE FROM BETTING ON THE RACES",
+      "duration_seconds": 30.16,
+      "duration_bucket_s": 30,
+      "category": "LibriSpeech test-clean",
+      "source_ids": [
+        "121-121726-0002",
+        "121-121726-0003",
+        "121-121726-0004",
+        "121-121726-0005",
+        "121-121726-0006",
+        "121-121726-0007"
+      ]
+    },
+    {
+      "id": "librispeech-clean-30-3",
+      "audio_path": "librispeech-clean-30-3.wav",
+      "reference": "WITH ONE JUMP ANDERS GOT OUT OF HIS CHAIR HE DARTED LIKE AN ARROW THROUGH ALL THE HALLS DOWN ALL THE STAIRS AND ACROSS THE YARD HE STILL HELD ON TO IT WITH BOTH HANDS AS HE RUSHED INTO HIS MOTHER'S COTTAGE AND ALL HIS BROTHERS AND SISTERS STOOD ROUND AND LISTENED WITH THEIR MOUTHS OPEN BUT WHEN HIS BIG BROTHER HEARD THAT HE HAD REFUSED TO GIVE HIS CAP FOR A KING'S GOLDEN CROWN HE SAID THAT ANDERS WAS A STUPID",
+      "duration_seconds": 30.245,
+      "duration_bucket_s": 30,
+      "category": "LibriSpeech test-clean",
+      "source_ids": [
+        "7021-85628-0019",
+        "7021-85628-0020",
+        "7021-85628-0021",
+        "7021-85628-0022",
+        "7021-85628-0023"
+      ]
+    },
+    {
+      "id": "librispeech-other-difficult",
+      "audio_path": "librispeech-other-difficult.wav",
+      "reference": "WELL DO IT FOR ME FOR I SWEAR TO YOU THAT I DON'T LOVE YOU AS THE OTHERS HAVE LOVED YOU THERE ARE BOLTS ON THE DOOR WRETCH",
+      "duration_seconds": 9.925,
+      "duration_bucket_s": 10,
+      "category": "LibriSpeech test-other",
+      "source_ids": [
+        "3997-180294-0002",
+        "3997-180294-0003"
+      ]
+    },
+    {
+      "id": "synthetic-developer-dictation",
+      "audio_path": "developer-dictation.wav",
+      "reference": "Um, I think TypeScript useEffect should call FastAPI before PostgreSQL changes. Then git rebase, Convex, and Tauri can update app slash src tauri slash src slash lib dot r s.",
+      "duration_seconds": 15.017,
+      "duration_bucket_s": null,
+      "category": "synthetic-developer-dictation"
+    },
+    {
+      "id": "silence-5s",
+      "audio_path": "silence-5s.wav",
+      "reference": "",
+      "duration_seconds": 5.0,
+      "duration_bucket_s": null,
+      "category": "silence"
+    }
+  ]
+}

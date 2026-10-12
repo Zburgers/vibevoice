@@ -1,0 +1,259 @@
+{
+  "schema_version": 1,
+  "manifest_sha256": "0f2e0390ad20749667924ac9d84c83ac2805f3d0d297c01917495207f2b68569",
+  "candidates": {
+    "whisper-cli-base-q5_0": {
+      "engine": {
+        "sha256": "43fba390cf963ce548d0c48742049e5bcee161867a13e43c9bfeb5a9e83dd74d",
+        "lifecycle": "one process per request"
+      },
+      "model": {
+        "sha256": "ab8c5e525f2f38ca53ab6d7410cd805880e3598a9e9e6814bf81ad5469ec95fe",
+        "bytes": 55308851
+      },
+      "summary": {
+        "all": {
+          "sample_count": 54,
+          "wall_ms_p50": 2171.23,
+          "wall_ms_p95": 4692.27,
+          "wall_ms_spread": 3479.74,
+          "rtf_p50": 0.2237,
+          "rtf_p95": 0.8128,
+          "cpu_ms_p50": 6916.96,
+          "average_cpu_percent_p50": 79.61,
+          "peak_memory_mb_p50": 194.42,
+          "wer": 0.0602,
+          "silence_false_positive_words": 3
+        },
+        "by_category": {
+          "LibriSpeech test-clean": {
+            "sample_count": 45,
+            "wall_ms_p50": 2228.73,
+            "wall_ms_p95": 4692.27,
+            "wall_ms_spread": 3479.74,
+            "rtf_p50": 0.2232,
+            "rtf_p95": 0.8128,
+            "cpu_ms_p50": 7019.59,
+            "average_cpu_percent_p50": 79.53,
+            "peak_memory_mb_p50": 194.45,
+            "wer": 0.0306,
+            "silence_false_positive_words": 0
+          },
+          "LibriSpeech test-other": {
+            "sample_count": 3,
+            "wall_ms_p50": 2225.38,
+            "wall_ms_p95": 2280.24,
+            "wall_ms_spread": 122.87,
+            "rtf_p50": 0.2242,
+            "rtf_p95": 0.2297,
+            "cpu_ms_p50": 6879.16,
+            "average_cpu_percent_p50": 77.65,
+            "peak_memory_mb_p50": 194.29,
+            "wer": 0.0357,
+            "silence_false_positive_words": 0
+          },
+          "synthetic-developer-dictation": {
+            "sample_count": 3,
+            "wall_ms_p50": 2176.64,
+            "wall_ms_p95": 2189.37,
+            "wall_ms_spread": 126.36,
+            "rtf_p50": 0.1449,
+            "rtf_p95": 0.1458,
+            "cpu_ms_p50": 6974.95,
+            "average_cpu_percent_p50": 79.65,
+            "peak_memory_mb_p50": 194.88,
+            "wer": 0.6,
+            "silence_false_positive_words": 0
+          },
+          "silence": {
+            "sample_count": 3,
+            "wall_ms_p50": 1531.42,
+            "wall_ms_p95": 1532.94,
+            "wall_ms_spread": 87.48,
+            "rtf_p50": 0.3063,
+            "rtf_p95": 0.3066,
+            "cpu_ms_p50": 4915.07,
+            "average_cpu_percent_p50": 80.31,
+            "peak_memory_mb_p50": 193.59,
+            "wer": null,
+            "silence_false_positive_words": 3
+          }
+        }
+      },
+      "repeats": 3
+    },
+    "moonshine-medium-streaming": {
+      "engine": {
+        "name": "Moonshine Voice Python C-API wrapper",
+        "model_arch": "MEDIUM_STREAMING",
+        "model_sha256": "39d61fba3dce96100fe8f41b9a9a509fa6394e5da4a2a0a267efb5e5ba6d693c",
+        "lifecycle": "one resident model per benchmark process"
+      },
+      "model": null,
+      "summary": {
+        "all": {
+          "sample_count": 18,
+          "wall_ms_p50": 9879.82,
+          "wall_ms_p95": 28214.91,
+          "wall_ms_spread": 28160.88,
+          "rtf_p50": 0.9026,
+          "rtf_p95": 1.378,
+          "cpu_ms_p50": 36279.56,
+          "average_cpu_percent_p50": 91.66,
+          "peak_memory_mb_p50": 874.71,
+          "wer": 0.074,
+          "silence_false_positive_words": 0
+        },
+        "by_category": {
+          "LibriSpeech test-clean": {
+            "sample_count": 15,
+            "wall_ms_p50": 10104.76,
+            "wall_ms_p95": 28214.91,
+            "wall_ms_spread": 26432.19,
+            "rtf_p50": 0.9119,
+            "rtf_p95": 1.378,
+            "cpu_ms_p50": 37212.69,
+            "average_cpu_percent_p50": 91.66,
+            "peak_memory_mb_p50": 836.51,
+            "wer": 0.0306,
+            "silence_false_positive_words": 0
+          },
+          "LibriSpeech test-other": {
+            "sample_count": 1,
+            "wall_ms_p50": 8197.36,
+            "wall_ms_p95": 8197.36,
+            "wall_ms_spread": 0.0,
+            "rtf_p50": 0.8259,
+            "rtf_p95": 0.8259,
+            "cpu_ms_p50": 30211.01,
+            "average_cpu_percent_p50": 92.14,
+            "peak_memory_mb_p50": 911.49,
+            "wer": 0.0357,
+            "silence_false_positive_words": 0
+          },
+          "synthetic-developer-dictation": {
+            "sample_count": 1,
+            "wall_ms_p50": 13655.89,
+            "wall_ms_p95": 13655.89,
+            "wall_ms_spread": 0.0,
+            "rtf_p50": 0.9094,
+            "rtf_p95": 0.9094,
+            "cpu_ms_p50": 50271.83,
+            "average_cpu_percent_p50": 92.03,
+            "peak_memory_mb_p50": 911.49,
+            "wer": 0.8667,
+            "silence_false_positive_words": 0
+          },
+          "silence": {
+            "sample_count": 1,
+            "wall_ms_p50": 54.03,
+            "wall_ms_p95": 54.03,
+            "wall_ms_spread": 0.0,
+            "rtf_p50": 0.0108,
+            "rtf_p95": 0.0108,
+            "cpu_ms_p50": 53.4,
+            "average_cpu_percent_p50": 24.71,
+            "peak_memory_mb_p50": 911.49,
+            "wer": null,
+            "silence_false_positive_words": 0
+          }
+        }
+      },
+      "model_load_ms": 437.99,
+      "model_peak_memory_mb": 741.72,
+      "chunk_ms": 500,
+      "repeats": 1,
+      "first_partial_ms_p50": 410.79
+    },
+    "sherpa-onnx-zipformer-20m": {
+      "engine": {
+        "name": "sherpa-onnx 1.13.8 streaming Zipformer",
+        "model_sha256": "7f34f673d165f77edced7adc4b0d702f3468396781985226887c5a65ba7f4df9",
+        "threads": 4,
+        "model_format": "int8"
+      },
+      "model": null,
+      "summary": {
+        "all": {
+          "sample_count": 18,
+          "wall_ms_p50": 549.49,
+          "wall_ms_p95": 2891.11,
+          "wall_ms_spread": 2801.34,
+          "rtf_p50": 0.0676,
+          "rtf_p95": 0.1111,
+          "cpu_ms_p50": 1903.61,
+          "average_cpu_percent_p50": 91.93,
+          "peak_memory_mb_p50": 564.43,
+          "wer": 0.1618,
+          "silence_false_positive_words": 0
+        },
+        "by_category": {
+          "LibriSpeech test-clean": {
+            "sample_count": 15,
+            "wall_ms_p50": 527.93,
+            "wall_ms_p95": 2891.11,
+            "wall_ms_spread": 2801.34,
+            "rtf_p50": 0.0748,
+            "rtf_p95": 0.1111,
+            "cpu_ms_p50": 1843.79,
+            "average_cpu_percent_p50": 91.4,
+            "peak_memory_mb_p50": 564.43,
+            "wer": 0.1033,
+            "silence_false_positive_words": 0
+          },
+          "LibriSpeech test-other": {
+            "sample_count": 1,
+            "wall_ms_p50": 597.62,
+            "wall_ms_p95": 597.62,
+            "wall_ms_spread": 0.0,
+            "rtf_p50": 0.0602,
+            "rtf_p95": 0.0602,
+            "cpu_ms_p50": 2294.09,
+            "average_cpu_percent_p50": 95.97,
+            "peak_memory_mb_p50": 564.43,
+            "wer": 0.5,
+            "silence_false_positive_words": 0
+          },
+          "synthetic-developer-dictation": {
+            "sample_count": 1,
+            "wall_ms_p50": 979.37,
+            "wall_ms_p95": 979.37,
+            "wall_ms_spread": 0.0,
+            "rtf_p50": 0.0652,
+            "rtf_p95": 0.0652,
+            "cpu_ms_p50": 3521.07,
+            "average_cpu_percent_p50": 89.88,
+            "peak_memory_mb_p50": 564.43,
+            "wer": 0.8667,
+            "silence_false_positive_words": 0
+          },
+          "silence": {
+            "sample_count": 1,
+            "wall_ms_p50": 350.43,
+            "wall_ms_p95": 350.43,
+            "wall_ms_spread": 0.0,
+            "rtf_p50": 0.0701,
+            "rtf_p95": 0.0701,
+            "cpu_ms_p50": 1301.89,
+            "average_cpu_percent_p50": 92.88,
+            "peak_memory_mb_p50": 564.43,
+            "wer": null,
+            "silence_false_positive_words": 0
+          }
+        }
+      },
+      "model_load_ms": 637.15,
+      "model_peak_memory_mb": 564.43,
+      "chunk_ms": 500,
+      "repeats": 1,
+      "first_partial_ms_p50": 103.94
+    }
+  },
+  "hardware": {
+    "os": "Linux-7.2.5-200.fc44.x86_64-x86_64-with-glibc2.43",
+    "machine": "x86_64",
+    "cpu": "Intel(R) Core(TM) i5-7600T CPU @ 2.80GHz",
+    "logical_cpus": 4,
+    "ram_total_mb": 31959
+  }
+}
