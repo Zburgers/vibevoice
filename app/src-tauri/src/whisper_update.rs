@@ -413,7 +413,8 @@ fn disk_space_available(directory: &Path) -> Result<u64, String> {
         ));
     }
     let stats = unsafe { stats.assume_init() };
-    Ok(stats.f_bavail.saturating_mul(stats.f_frsize))
+    let available = u128::from(stats.f_bavail) * u128::from(stats.f_frsize);
+    Ok(available.min(u128::from(u64::MAX)) as u64)
 }
 
 #[cfg(windows)]
