@@ -921,7 +921,11 @@ async fn stop_recording_impl(
         }
         // Repeated Stop calls must not clear Processing and admit a second
         // recording while the first worker still owns transcription/insertion.
-        ensure_stop_allowed(&runtime)?;
+        if stop_is_already_processing(&runtime) {
+            drop(runtime);
+            drop(lifecycle);
+            return Ok(());
+        }
         match runtime.recording.take() {
             Some(session) => {
                 runtime.preparing_generation = None;
@@ -988,25 +992,29 @@ fn cancel_transcription(
     window: WebviewWindow,
 ) -> Result<(), String> {
     authorize_window(&window, &["main", "pill"])?;
-    let current = data
-        .transcription_cancel
-        .lock()
-        .map_err(|error| error.to_string())?;
-    let cancel = current
-        .as_ref()
-        .ok_or_else(|| "No cancellable transcription is running.".to_string())?;
-    cancel.store(true, Ordering::Relaxed);
-    drop(current);
+    request_transcription_cancel(&data.transcription_cancel)?;
     emit_state_changed(&app);
     Ok(())
 }
 
-fn ensure_stop_allowed(runtime: &RuntimeState) -> Result<(), String> {
-    if matches!(runtime.voice_state, VoiceState::Processing) {
-        Err("Recording is still processing. Please wait or cancel transcription.".to_string())
-    } else {
-        Ok(())
-    }
+fn request_transcription_cancel(current: &Mutex<Option<Arc<AtomicBool>>>) -> Result<bool, String> {
+    let mut current = current.lock().map_err(|error| error.to_string())?;
+    // Cancellation can race with the worker claiming its result for insertion.
+    // In that case the operation has already crossed its commit boundary, so
+    // treat the late request as a harmless no-op instead of surfacing an error
+    // after the transcript has otherwise completed successfully.
+    let Some(cancel) = current.take() else {
+        return Ok(false);
+    };
+    cancel.store(true, Ordering::Relaxed);
+    Ok(true)
+}
+
+fn stop_is_already_processing(runtime: &RuntimeState) -> bool {
+    // Stop is idempotent once the recording has been handed to the
+    // transcription worker. A stale UI snapshot or a repeated click must not
+    // turn an in-progress transcription into a user-visible failure.
+    matches!(runtime.voice_state, VoiceState::Processing)
 }
 
 fn claim_transcription_result(
@@ -4002,9 +4010,27 @@ mod tests {
             voice_state: VoiceState::Processing,
             ..RuntimeState::default()
         };
-        assert!(ensure_stop_allowed(&runtime).is_err());
+        assert!(stop_is_already_processing(&runtime));
         assert!(matches!(runtime.voice_state, VoiceState::Processing));
         assert!(try_claim_preparation_slot(&mut runtime, 99).is_err());
+    }
+
+    #[test]
+    fn late_cancel_after_transcription_commit_is_a_no_op() {
+        let current = Mutex::new(None);
+        // The worker clears the slot when it claims insertion. A Cancel that
+        // arrives after that point must not undo completed work or error.
+        assert!(!request_transcription_cancel(&current).unwrap());
+        assert!(current.lock().unwrap().is_none());
+    }
+
+    #[test]
+    fn cancel_request_marks_the_current_transcription() {
+        let cancel = Arc::new(AtomicBool::new(false));
+        let current = Mutex::new(Some(Arc::clone(&cancel)));
+        assert!(request_transcription_cancel(&current).unwrap());
+        assert!(cancel.load(Ordering::Relaxed));
+        assert!(current.lock().unwrap().is_none());
     }
 
     #[test]
