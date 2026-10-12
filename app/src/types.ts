@@ -21,6 +21,9 @@ export type Tone = "good" | "warn" | "bad" | "neutral" | "accent";
 export type Settings = {
   whisper_binary_path: string;
   model_path: string;
+  fast_model_path: string;
+  model_strategy: "auto" | "base_only";
+  output_mode: "verbatim" | "clean" | "polished";
   transcription_timeout_seconds: number;
   transcription_threads: number;
   hotkey: string;
@@ -99,6 +102,11 @@ export type AppState = {
     transcription_ms: number;
     session_ms: number;
     threads: number;
+    preprocessing_ms: number;
+    postprocess_ms: number;
+    insertion_ms: number;
+    stop_to_insert_ms: number;
+    model_variant: string;
     cpu_time_ms: number | null;
     average_cpu_percent: number | null;
     peak_memory_mb: number | null;
@@ -110,11 +118,13 @@ export type WhisperCatalog = {
   engine_supported: boolean;
   model_name: string;
   model_bytes: number;
+  fast_model_name: string;
+  fast_model_bytes: number;
   busy: boolean;
 };
 
 export type WhisperProgress = {
-  component: "engine" | "model";
+  component: "engine" | "model" | "fast_model";
   stage: string;
   downloaded_bytes: number;
   total_bytes: number;
@@ -140,6 +150,9 @@ export const fallbackState: AppState = {
   settings: {
     whisper_binary_path: "auto",
     model_path: "auto",
+    fast_model_path: "auto",
+    model_strategy: "base_only",
+    output_mode: "clean",
     transcription_timeout_seconds: 900,
     transcription_threads: 0,
     hotkey: "Ctrl+Alt+Space",

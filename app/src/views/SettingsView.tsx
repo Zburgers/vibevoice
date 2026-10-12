@@ -238,6 +238,25 @@ export function SettingsView({
           onSave={(whisper_binary_path) => onUpdate({ whisper_binary_path })} />
         <EnginePathField label="Model path" value={state.settings.model_path} model={true}
           onSave={(model_path) => onUpdate({ model_path })} />
+        <label className="field">
+          <span>Short recording model</span>
+          <select aria-label="Short recording model" value={state.settings.model_strategy}
+            onChange={(event) => onUpdate({ model_strategy: event.target.value as Settings["model_strategy"] })}>
+            <option value="auto">Auto — faster model up to 5.5 seconds</option>
+            <option value="base_only">Base model only</option>
+          </select>
+          <small>Auto uses the optional tiny.en model for short recordings and falls back to base.en when needed.</small>
+        </label>
+        <label className="field">
+          <span>Output mode</span>
+          <select aria-label="Output mode" value={state.settings.output_mode}
+            onChange={(event) => onUpdate({ output_mode: event.target.value as Settings["output_mode"] })}>
+            <option value="verbatim">Verbatim</option>
+            <option value="clean">Clean</option>
+            <option value="polished">Polished</option>
+          </select>
+          <small>Polished changes only safe casing and terminal punctuation. Dictionary corrections apply in every mode when enabled.</small>
+        </label>
         <HotkeyField
           value={state.settings.hotkey}
           onChange={(hotkey) => onUpdate({ hotkey })}

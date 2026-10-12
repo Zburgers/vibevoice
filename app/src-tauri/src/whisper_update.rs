@@ -19,6 +19,10 @@ pub const MODEL_NAME: &str = "base.en";
 pub const MODEL_SHA: &str = "a03779c86df3323075f5e796cb2ce5029f00ec8869eee3fdfb897afe36c6d002";
 pub const MODEL_SIZE: u64 = 147_964_211;
 const MODEL_URL: &str = "https://huggingface.co/ggerganov/whisper.cpp/resolve/5359861c739e955e79d9a303bcbc70fb988958b1/ggml-base.en.bin";
+pub const FAST_MODEL_NAME: &str = "tiny.en";
+pub const FAST_MODEL_SHA: &str = "921e4cf8686fdd993dcd081a5da5b6c365bfde1162e72b08d75ac75289920b1f";
+pub const FAST_MODEL_SIZE: u64 = 77_704_715;
+const FAST_MODEL_URL: &str = "https://huggingface.co/ggerganov/whisper.cpp/resolve/5359861c739e955e79d9a303bcbc70fb988958b1/ggml-tiny.en.bin";
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Catalog {
@@ -26,6 +30,8 @@ pub struct Catalog {
     pub engine_supported: bool,
     pub model_name: String,
     pub model_bytes: u64,
+    pub fast_model_name: String,
+    pub fast_model_bytes: u64,
     pub busy: bool,
 }
 pub fn catalog(busy: bool) -> Catalog {
@@ -34,6 +40,8 @@ pub fn catalog(busy: bool) -> Catalog {
         engine_supported: engine_artifact().is_some(),
         model_name: MODEL_NAME.into(),
         model_bytes: MODEL_SIZE,
+        fast_model_name: FAST_MODEL_NAME.into(),
+        fast_model_bytes: FAST_MODEL_SIZE,
         busy,
     }
 }
@@ -276,20 +284,68 @@ fn download_with_client(
 pub fn ensure_model(
     root: &Path,
     current_model: Option<&Path>,
+    notify: impl FnMut(Progress),
+    cancel: &AtomicBool,
+    shutdown: &AtomicBool,
+) -> Result<PathBuf, String> {
+    ensure_model_variant(
+        root,
+        current_model,
+        "model",
+        MODEL_NAME,
+        MODEL_URL,
+        MODEL_SHA,
+        MODEL_SIZE,
+        notify,
+        cancel,
+        shutdown,
+    )
+}
+
+pub fn ensure_fast_model(
+    root: &Path,
+    current_model: Option<&Path>,
+    notify: impl FnMut(Progress),
+    cancel: &AtomicBool,
+    shutdown: &AtomicBool,
+) -> Result<PathBuf, String> {
+    ensure_model_variant(
+        root,
+        current_model,
+        "fast_model",
+        FAST_MODEL_NAME,
+        FAST_MODEL_URL,
+        FAST_MODEL_SHA,
+        FAST_MODEL_SIZE,
+        notify,
+        cancel,
+        shutdown,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn ensure_model_variant(
+    root: &Path,
+    current_model: Option<&Path>,
+    component: &str,
+    name: &str,
+    url: &str,
+    expected_sha: &str,
+    expected_size: u64,
     mut notify: impl FnMut(Progress),
     cancel: &AtomicBool,
     shutdown: &AtomicBool,
 ) -> Result<PathBuf, String> {
     check_cancel(cancel, shutdown)?;
     notify(Progress {
-        component: "model".into(),
+        component: component.into(),
         stage: "checking".into(),
         downloaded_bytes: 0,
-        total_bytes: MODEL_SIZE,
-        message: "Verifying the current base.en model…".into(),
+        total_bytes: expected_size,
+        message: format!("Verifying the current {name} model…"),
     });
     if let Some(model) = current_model {
-        if file_matches(model, MODEL_SHA, MODEL_SIZE)? {
+        if file_matches(model, expected_sha, expected_size)? {
             return Ok(model.to_path_buf());
         }
     }
@@ -297,29 +353,33 @@ pub fn ensure_model(
     // custom model or modify its containing engine checkout.
     let target = root
         .join("models")
-        .join(format!("ggml-base.en-{MODEL_SHA}.bin"));
-    if file_matches(&target, MODEL_SHA, MODEL_SIZE)? {
+        .join(format!("ggml-{name}-{expected_sha}.bin"));
+    if file_matches(&target, expected_sha, expected_size)? {
         return Ok(target);
     }
     let artifact = Artifact {
-        url: MODEL_URL,
-        sha: MODEL_SHA,
-        size: MODEL_SIZE,
+        url,
+        sha: expected_sha,
+        size: expected_size,
     };
+    if let Some(parent) = target.parent() {
+        fs::create_dir_all(parent).map_err(|e| e.to_string())?;
+        require_disk_space(parent, expected_size)?;
+    }
     let mut last_percent = u64::MAX;
     download_verified(
         &target,
         &artifact,
         |bytes| {
-            let percent = bytes * 100 / MODEL_SIZE;
+            let percent = bytes * 100 / expected_size;
             if percent != last_percent {
                 last_percent = percent;
                 notify(Progress {
-                    component: "model".into(),
+                    component: component.into(),
                     stage: "downloading".into(),
                     downloaded_bytes: bytes,
-                    total_bytes: MODEL_SIZE,
-                    message: format!("Downloading base.en model: {percent}%"),
+                    total_bytes: expected_size,
+                    message: format!("Downloading {name} model: {percent}%"),
                 });
             }
         },
@@ -327,6 +387,74 @@ pub fn ensure_model(
         shutdown,
     )?;
     Ok(target)
+}
+
+fn require_disk_space(directory: &Path, required: u64) -> Result<(), String> {
+    let required = required.saturating_add((required / 100).max(4 * 1024 * 1024));
+    let available = disk_space_available(directory)?;
+    if available < required {
+        return Err(format!(
+            "Not enough disk space for this Whisper model: {available} bytes free, about {required} required."
+        ));
+    }
+    Ok(())
+}
+
+#[cfg(unix)]
+fn disk_space_available(directory: &Path) -> Result<u64, String> {
+    use std::{ffi::CString, os::unix::ffi::OsStrExt};
+    let path = CString::new(directory.as_os_str().as_bytes()).map_err(|e| e.to_string())?;
+    let mut stats = std::mem::MaybeUninit::<libc::statvfs>::uninit();
+    let result = unsafe { libc::statvfs(path.as_ptr(), stats.as_mut_ptr()) };
+    if result != 0 {
+        return Err(format!(
+            "Could not check available disk space: {}",
+            io::Error::last_os_error()
+        ));
+    }
+    let stats = unsafe { stats.assume_init() };
+    Ok(stats.f_bavail.saturating_mul(stats.f_frsize))
+}
+
+#[cfg(windows)]
+fn disk_space_available(directory: &Path) -> Result<u64, String> {
+    use std::os::windows::ffi::OsStrExt;
+    #[link(name = "kernel32")]
+    unsafe extern "system" {
+        fn GetDiskFreeSpaceExW(
+            path: *const u16,
+            available_to_caller: *mut u64,
+            total_bytes: *mut u64,
+            total_free_bytes: *mut u64,
+        ) -> i32;
+    }
+    let path = directory
+        .as_os_str()
+        .encode_wide()
+        .chain(Some(0))
+        .collect::<Vec<_>>();
+    let mut available = 0;
+    let success = unsafe {
+        GetDiskFreeSpaceExW(
+            path.as_ptr(),
+            &mut available,
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+        )
+    };
+    if success == 0 {
+        Err(format!(
+            "Could not check available disk space: {}",
+            io::Error::last_os_error()
+        ))
+    } else {
+        Ok(available)
+    }
+}
+
+#[cfg(not(any(unix, windows)))]
+fn disk_space_available(_directory: &Path) -> Result<u64, String> {
+    Err("Disk-space checks are unavailable on this platform.".into())
 }
 
 fn extract_engine(archive: &Path, target: &Path) -> Result<PathBuf, String> {
@@ -623,6 +751,18 @@ mod tests {
         assert!(result.unwrap_err().contains("cancelled"));
         assert_eq!(contents, b"working");
     }
+
+    #[test]
+    fn model_install_checks_space_on_the_target_filesystem() {
+        let root = fixture();
+        assert!(disk_space_available(&root).unwrap() > 0);
+        require_disk_space(&root, 1).unwrap();
+        assert!(require_disk_space(&root, u64::MAX)
+            .unwrap_err()
+            .contains("Not enough disk space"));
+        fs::remove_dir_all(root).unwrap();
+    }
+
     fn fixture() -> PathBuf {
         let root = std::env::temp_dir().join(format!("vibevoice-updater-{}", Uuid::new_v4()));
         fs::create_dir(&root).unwrap();

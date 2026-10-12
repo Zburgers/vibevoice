@@ -165,6 +165,7 @@ jobs:
           shellcheck scripts/*.sh vp
           bash scripts/test-vp.sh
           node --test scripts/*.test.mjs
+          python3 -m unittest discover -s benchmarks -v
 
       - name: Parse PowerShell scripts
         shell: pwsh

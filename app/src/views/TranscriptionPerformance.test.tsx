@@ -15,9 +15,21 @@ describe("transcription performance controls", () => {
     expect(onUpdate).toHaveBeenCalledWith({ transcription_threads: 2 });
   });
 
+  it("exposes the short model strategy and output modes", () => {
+    const onUpdate = vi.fn();
+    render(<SettingsView state={fallbackState} onUpdate={onUpdate}
+      onSetup={vi.fn()} onOpenReleasePage={vi.fn()} onOpenDiagnostics={vi.fn()} />);
+    fireEvent.change(screen.getByLabelText("Short recording model"), { target: { value: "base_only" } });
+    fireEvent.change(screen.getByLabelText("Output mode"), { target: { value: "polished" } });
+    expect(onUpdate).toHaveBeenCalledWith({ model_strategy: "base_only" });
+    expect(onUpdate).toHaveBeenCalledWith({ output_mode: "polished" });
+  });
+
   it("shows actual elapsed time and Windows CPU measurement", () => {
     render(<DiagnosticsView state={{ ...fallbackState, last_transcription_metrics: {
       audio_ms: 11000, transcription_ms: 4000, session_ms: 15000, threads: 4,
+      preprocessing_ms: 12, postprocess_ms: 2, insertion_ms: 25, stop_to_insert_ms: 4040,
+      model_variant: "base.en",
       cpu_time_ms: 16000, average_cpu_percent: 50, peak_memory_mb: 300,
     } }} updateStatus={{ state: "idle", latestVersion: null, releaseUrl: "", message: "", canInstall: false }}
       setupMessage="" commandStatus="Idle" onRefresh={vi.fn()} onCheckUpdates={vi.fn()}
@@ -26,5 +38,7 @@ describe("transcription performance controls", () => {
     expect(screen.getByText("4.00 s (4 threads)")).toBeInTheDocument();
     expect(screen.getByText("50.0%")).toBeInTheDocument();
     expect(screen.getByText("16.00 CPU-seconds")).toBeInTheDocument();
+    expect(screen.getByText("4.04 s")).toBeInTheDocument();
+    expect(screen.getByText("base.en")).toBeInTheDocument();
   });
 });
