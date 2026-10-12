@@ -30,7 +30,7 @@ Across all 54 mixed-length runs, base WER was 6.54%; tiny WER was 11.53%. The hy
 | Resident `whisper-rs`, OpenMP | One 18-sample pass: p50 1,970 ms, p95 4,423 ms, higher CPU; not a full repeated comparison | Rejected; inconclusive and no broad p95 gain |
 | `base.en` Q5_0 | 54 runs: p50 2,171 ms and p95 4,692 ms; peak memory 194 MB vs 285 MB | Rejected for default; memory and disk savings did not offset slower inference |
 | Moonshine Voice Medium Streaming | One pass over 18 samples: p50 9,880 ms, p95 28,215 ms, about 875 MB process peak; p50 first partial 411 ms | Rejected; partials arrived early, but final CPU inference was slower and memory use was high |
-| sherpa-onnx 20M streaming Zipformer | One pass over 18 samples: p50 549 ms, p95 2,891 ms, about 564 MB peak; LibriSpeech clean WER 10.33%, test-other 50% | Rejected; latency is attractive, but quality fails the guardrail |
+| sherpa-onnx 20M streaming Zipformer | One pass over 18 samples: p50 549 ms, p95 2,891 ms, about 564 MB peak; LibriSpeech clean WER 10.33%, test-other 50%; benchmark model card is [Apache-2.0](https://huggingface.co/csukuangfj/sherpa-onnx-streaming-zipformer-en-20M-2023-02-17) | Rejected; latency is attractive, but quality fails the guardrail. Neither the sherpa runtime nor model is shipped |
 | VAD and incremental Whisper chunks | Not selected for this change | No correctness-preserving app-level measurement established; adds another model and could clip or duplicate speech |
 
 ## Consequences and limits
