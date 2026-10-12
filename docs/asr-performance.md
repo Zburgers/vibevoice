@@ -62,4 +62,4 @@ Diagnostics records transcription wall time, preprocessing, cleanup, insertion, 
 
 ## Platform and qualification limits
 
-This implementation and benchmark were built and tested on Linux only. Windows and macOS runtime behavior, package installation, model download, global hotkeys, microphone capture, and text insertion were not executed on this host. The verified downloader and existing clipboard/paste code remain shared, but this is not cross-platform qualification. Hardware acceleration, VAD, reliable partial transcripts, sustained idle power, application memory lifecycle, and full stop-to-insert performance have not been measured here.
+Local implementation and benchmark runs used Linux only. Final PR CI also passed native Rust tests, Clippy, and release builds on Windows and macOS. Those jobs do not exercise live microphone capture, package installation, model download, global hotkeys, or insertion into a target application on those platforms. Hardware acceleration, VAD, reliable partial transcripts, sustained idle power, application memory lifecycle, and full stop-to-insert performance have not been measured.
