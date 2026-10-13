@@ -47,12 +47,13 @@ export function DiagnosticsView({
       { label: "Last transcription time", value: `${(metrics.transcription_ms / 1000).toFixed(2)} s (${metrics.threads} threads)`, tone: "neutral" },
       { label: "Stop to insert", value: `${(metrics.stop_to_insert_ms / 1000).toFixed(2)} s`, tone: "neutral" },
       { label: "Selected model", value: metrics.model_variant || "Unknown", tone: "neutral" },
+      { label: "Tiny model fallback", value: metrics.fast_model_fallback ? "Failed; using base.en. Replace the tiny model or restart after repair to retry." : "No", tone: metrics.fast_model_fallback ? "warn" : "neutral" },
       { label: "Audio preparation", value: `${metrics.preprocessing_ms} ms`, tone: "neutral" },
       { label: "Text cleanup", value: `${metrics.postprocess_ms} ms`, tone: "neutral" },
       { label: "Text insertion", value: `${metrics.insertion_ms} ms`, tone: "neutral" },
-      { label: "Whisper average CPU", value: metrics.average_cpu_percent == null ? "Unavailable on this platform" : `${metrics.average_cpu_percent.toFixed(1)}%`, tone: "neutral" },
-      { label: "Whisper CPU time", value: metrics.cpu_time_ms == null ? "Unavailable on this platform" : `${(metrics.cpu_time_ms / 1000).toFixed(2)} CPU-seconds`, tone: "neutral" },
-      { label: "Whisper peak memory", value: metrics.peak_memory_mb == null ? "Unavailable on this platform" : `${metrics.peak_memory_mb.toFixed(1)} MB`, tone: "neutral" },
+      { label: "Whisper average CPU", value: metrics.average_cpu_percent == null ? (metrics.fast_model_fallback ? "Unavailable after fallback" : "Unavailable on this platform") : `${metrics.average_cpu_percent.toFixed(1)}%`, tone: "neutral" },
+      { label: "Whisper CPU time", value: metrics.cpu_time_ms == null ? (metrics.fast_model_fallback ? "Unavailable after fallback" : "Unavailable on this platform") : `${(metrics.cpu_time_ms / 1000).toFixed(2)} CPU-seconds`, tone: "neutral" },
+      { label: "Whisper peak memory", value: metrics.peak_memory_mb == null ? (metrics.fast_model_fallback ? "Unavailable after fallback" : "Unavailable on this platform") : `${metrics.peak_memory_mb.toFixed(1)} MB`, tone: "neutral" },
     );
   }
 

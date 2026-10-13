@@ -8,6 +8,7 @@ use std::os::unix::process::CommandExt;
 #[cfg(target_os = "windows")]
 use std::os::windows::process::CommandExt;
 use std::{
+    collections::HashSet,
     fs,
     io::{self, Read, Write},
     path::{Path, PathBuf},
@@ -15,10 +16,10 @@ use std::{
     str::FromStr,
     sync::{
         atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering},
-        Arc, Mutex,
+        Arc, Mutex, OnceLock,
     },
     thread::{self},
-    time::{Duration, Instant},
+    time::{Duration, Instant, SystemTime},
 };
 use tauri::{
     async_runtime,
@@ -2179,41 +2180,92 @@ fn transcribe(
     cancel: &AtomicBool,
     shutdown: &AtomicBool,
 ) -> Result<(String, TranscriptionMetrics), String> {
+    let started = Instant::now();
     let paths = resolve_engine_paths(settings)?;
     let fast_model = preferred_fast_model(settings, audio_ms);
+    let mut fast_model_fallback = false;
     if let Some(fast_model) = fast_model {
-        match transcribe_with_model(
-            settings,
-            &paths.whisper_binary,
-            &fast_model,
-            "tiny.en",
-            audio_path,
-            output_prefix,
-            cancel,
-            shutdown,
-        ) {
-            Ok((transcript, metrics)) if !transcript.trim().is_empty() => {
-                return Ok((transcript, metrics));
-            }
-            _ if cancel.load(Ordering::Acquire) || shutdown.load(Ordering::Acquire) => {
-                return Err("Transcription cancelled.".into());
-            }
-            _ => {
-                // A failed fast model must not leave a stale transcript for the base retry.
-                let _ = fs::remove_file(output_prefix.with_extension("txt"));
+        fast_model_fallback = is_known_broken_fast_model(&fast_model);
+        if !fast_model_fallback {
+            match transcribe_with_model(
+                settings,
+                &paths.whisper_binary,
+                &fast_model,
+                "tiny.en",
+                audio_path,
+                output_prefix,
+                cancel,
+                shutdown,
+            ) {
+                Ok((transcript, metrics)) if !transcript.trim().is_empty() => {
+                    return Ok((transcript, metrics));
+                }
+                _ if cancel.load(Ordering::Acquire) || shutdown.load(Ordering::Acquire) => {
+                    return Err("Transcription cancelled.".into());
+                }
+                _ => {
+                    // A failed fast model must not leave a stale transcript for the base retry.
+                    let _ = fs::remove_file(output_prefix.with_extension("txt"));
+                    remember_broken_fast_model(&fast_model);
+                    fast_model_fallback = true;
+                }
             }
         }
     }
-    transcribe_with_model(
+    let (transcript, mut metrics) = transcribe_with_model(
         settings,
         &paths.whisper_binary,
         &paths.model,
-        "base.en",
+        &model_diagnostic_name(&paths.model),
         audio_path,
         output_prefix,
         cancel,
         shutdown,
-    )
+    )?;
+    metrics.transcription_ms = started.elapsed().as_millis() as u64;
+    metrics.fast_model_fallback = fast_model_fallback;
+    if fast_model_fallback {
+        metrics.cpu_time_ms = None;
+        metrics.average_cpu_percent = None;
+        metrics.peak_memory_mb = None;
+    }
+    Ok((transcript, metrics))
+}
+
+type FastModelFingerprint = (PathBuf, u64, Option<SystemTime>);
+static BROKEN_FAST_MODELS: OnceLock<Mutex<HashSet<FastModelFingerprint>>> = OnceLock::new();
+
+fn fast_model_fingerprint(path: &Path) -> Option<FastModelFingerprint> {
+    let metadata = fs::metadata(path).ok()?;
+    Some((path.to_path_buf(), metadata.len(), metadata.modified().ok()))
+}
+
+fn is_known_broken_fast_model(path: &Path) -> bool {
+    fast_model_fingerprint(path).is_some_and(|fingerprint| {
+        BROKEN_FAST_MODELS
+            .get_or_init(Default::default)
+            .lock()
+            .is_ok_and(|broken| broken.contains(&fingerprint))
+    })
+}
+
+fn remember_broken_fast_model(path: &Path) {
+    if let Some(fingerprint) = fast_model_fingerprint(path) {
+        if let Ok(mut broken) = BROKEN_FAST_MODELS.get_or_init(Default::default).lock() {
+            broken.insert(fingerprint);
+        }
+    }
+}
+
+fn model_diagnostic_name(path: &Path) -> String {
+    if is_managed_base_model_path(path) {
+        "base.en".into()
+    } else {
+        path.file_name()
+            .unwrap_or_default()
+            .to_string_lossy()
+            .into_owned()
+    }
 }
 
 fn preferred_fast_model(settings: &Settings, audio_ms: u64) -> Option<PathBuf> {
@@ -2309,6 +2361,7 @@ fn transcribe_with_model(
             insertion_ms: 0,
             stop_to_insert_ms: 0,
             model_variant: model_variant.to_string(),
+            fast_model_fallback: false,
             threads,
             cpu_time_ms: usage.cpu_time_ms,
             average_cpu_percent: performance::cpu_percent(
@@ -3195,24 +3248,7 @@ fn prepare_transcript(raw: &str, settings: &Settings, dictionary: &[DictionaryRu
 }
 
 fn clean_transcript(raw: &str) -> String {
-    let cleaned = cleanup_transcript(raw);
-    let mut words: Vec<String> = Vec::new();
-    for word in cleaned.split_whitespace() {
-        let spoken = word.trim_matches(|character: char| character.is_ascii_punctuation());
-        if matches!(
-            spoken.to_ascii_lowercase().as_str(),
-            "um" | "uh" | "erm" | "uhm"
-        ) {
-            if let Some(previous) = words.last_mut() {
-                if previous.ends_with(',') {
-                    previous.pop();
-                }
-            }
-        } else {
-            words.push(word.to_string());
-        }
-    }
-    words.join(" ")
+    cleanup_transcript(raw)
 }
 
 fn polish_transcript(text: &str) -> String {
@@ -4587,7 +4623,7 @@ mod tests {
         fs::write(&audio, b"test audio").unwrap();
         fs::write(
             &engine,
-            "#!/bin/sh\nmodel=\nprefix=\nwhile [ $# -gt 0 ]; do\n  case \"$1\" in\n    -m) model=$2; shift 2 ;;\n    -of) prefix=$2; shift 2 ;;\n    *) shift ;;\n  esac\ndone\ncase \"$model\" in *tiny.en.bin) exit 7 ;; esac\nprintf 'base transcript' > \"$prefix.txt\"\n",
+            format!("#!/bin/sh\nmodel=\nprefix=\nwhile [ $# -gt 0 ]; do\n  case \"$1\" in\n    -m) model=$2; shift 2 ;;\n    -of) prefix=$2; shift 2 ;;\n    *) shift ;;\n  esac\ndone\ncase \"$model\" in *tiny.en.bin) printf 'tiny\\n' >> '{}' ; sleep 0.1; exit 7 ;; esac\nsleep 0.1\nprintf 'base transcript' > \"$prefix.txt\"\n", root.join("calls").display()),
         )
         .unwrap();
         fs::set_permissions(&engine, fs::Permissions::from_mode(0o755)).unwrap();
@@ -4610,6 +4646,54 @@ mod tests {
         .unwrap();
         assert_eq!(transcript, "base transcript");
         assert_eq!(metrics.model_variant, "base.en");
+        assert!(metrics.fast_model_fallback);
+        assert!(
+            metrics.transcription_ms >= 180,
+            "failed tiny time was excluded: {} ms",
+            metrics.transcription_ms
+        );
+        assert_eq!(
+            fs::read_to_string(root.join("calls"))
+                .unwrap()
+                .lines()
+                .count(),
+            1
+        );
+        let (_, metrics) = transcribe(
+            &settings,
+            &audio,
+            &prefix,
+            2_000,
+            &AtomicBool::new(false),
+            &AtomicBool::new(false),
+        )
+        .unwrap();
+        assert!(metrics.fast_model_fallback);
+        assert_eq!(
+            fs::read_to_string(root.join("calls"))
+                .unwrap()
+                .lines()
+                .count(),
+            1
+        );
+        fs::write(&fast, b"replaced tiny model fixture").unwrap();
+        let (_, metrics) = transcribe(
+            &settings,
+            &audio,
+            &prefix,
+            2_000,
+            &AtomicBool::new(false),
+            &AtomicBool::new(false),
+        )
+        .unwrap();
+        assert!(metrics.fast_model_fallback);
+        assert_eq!(
+            fs::read_to_string(root.join("calls"))
+                .unwrap()
+                .lines()
+                .count(),
+            2
+        );
         fs::remove_dir_all(root).unwrap();
     }
 
@@ -4638,7 +4722,11 @@ mod tests {
                 &settings,
                 &dictionary
             ),
-            "I useEffect with PostgreSQL"
+            "I, um, useEffect, uh, with PostgreSQL"
+        );
+        assert_eq!(
+            prepare_transcript("Um, Ubuntu is our product.", &settings, &[]),
+            "Um, Ubuntu is our product."
         );
         settings.output_mode = OutputMode::Polished;
         assert_eq!(
@@ -4648,6 +4736,14 @@ mod tests {
         assert_eq!(
             prepare_transcript("hello world", &settings, &[]),
             "Hello world."
+        );
+    }
+
+    #[test]
+    fn model_diagnostics_use_custom_model_filename() {
+        assert_eq!(
+            model_diagnostic_name(Path::new("/models/my-finetuned-whisper.bin")),
+            "my-finetuned-whisper.bin"
         );
     }
 

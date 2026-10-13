@@ -107,6 +107,7 @@ export type AppState = {
     insertion_ms: number;
     stop_to_insert_ms: number;
     model_variant: string;
+    fast_model_fallback: boolean;
     cpu_time_ms: number | null;
     average_cpu_percent: number | null;
     peak_memory_mb: number | null;
