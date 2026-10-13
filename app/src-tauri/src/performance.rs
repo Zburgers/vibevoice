@@ -6,6 +6,13 @@ pub struct TranscriptionMetrics {
     pub audio_ms: u64,
     pub transcription_ms: u64,
     pub session_ms: u64,
+    pub preprocessing_ms: u64,
+    pub postprocess_ms: u64,
+    pub insertion_ms: u64,
+    pub stop_to_insert_ms: u64,
+    pub model_variant: String,
+    #[serde(default)]
+    pub fast_model_fallback: bool,
     pub threads: usize,
     pub cpu_time_ms: Option<u64>,
     pub average_cpu_percent: Option<f64>,

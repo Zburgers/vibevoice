@@ -5,7 +5,8 @@ import { fallbackState } from "./types";
 
 afterEach(cleanup);
 const state = { ...fallbackState, whisper_update: {
-  engine_version: "1.9.4", engine_supported: true, model_name: "base.en", model_bytes: 147964211, busy: false,
+  engine_version: "1.9.4", engine_supported: true, model_name: "base.en", model_bytes: 147964211,
+  fast_model_name: "tiny.en", fast_model_bytes: 77704715, busy: false,
 } };
 
 it("dispatches engine and model updates separately", () => {
@@ -13,13 +14,15 @@ it("dispatches engine and model updates separately", () => {
   render(<WhisperUpdatePanel state={state} progress={null} pending={false} onUpdate={onUpdate} onCancel={vi.fn()} />);
   fireEvent.click(screen.getByRole("button", { name: "Update Whisper engine" }));
   fireEvent.click(screen.getByRole("button", { name: "Verify / repair model" }));
-  expect(onUpdate.mock.calls).toEqual([["engine"], ["model"]]);
+  fireEvent.click(screen.getByRole("button", { name: "Install short model" }));
+  expect(onUpdate.mock.calls).toEqual([["engine"], ["model"], ["fast_model"]]);
 });
 
 it("blocks both actions during recording", () => {
   render(<WhisperUpdatePanel state={{ ...state, voice_state: "Recording" }} progress={null} pending={false} onUpdate={vi.fn()} onCancel={vi.fn()} />);
   expect(screen.getByRole("button", { name: "Update Whisper engine" })).toBeDisabled();
   expect(screen.getByRole("button", { name: "Verify / repair model" })).toBeDisabled();
+  expect(screen.getByRole("button", { name: "Install short model" })).toBeDisabled();
 });
 
 it("shows download progress and allows cancellation while busy", () => {

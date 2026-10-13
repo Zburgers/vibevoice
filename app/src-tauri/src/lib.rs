@@ -8,6 +8,7 @@ use std::os::unix::process::CommandExt;
 #[cfg(target_os = "windows")]
 use std::os::windows::process::CommandExt;
 use std::{
+    collections::HashSet,
     fs,
     io::{self, Read, Write},
     path::{Path, PathBuf},
@@ -15,10 +16,10 @@ use std::{
     str::FromStr,
     sync::{
         atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering},
-        Arc, Mutex,
+        Arc, Mutex, OnceLock,
     },
     thread::{self},
-    time::{Duration, Instant},
+    time::{Duration, Instant, SystemTime},
 };
 use tauri::{
     async_runtime,
@@ -75,6 +76,7 @@ const PASTE_HELPER_TIMEOUT: Duration = Duration::from_secs(2);
 #[cfg(any(not(target_os = "macos"), test))]
 const PASTE_HELPER_POLL_INTERVAL: Duration = Duration::from_millis(20);
 const DEFAULT_TRANSCRIPTION_TIMEOUT_SECONDS: u64 = 900;
+const FAST_MODEL_MAX_AUDIO_MS: u64 = 5_500;
 const MIN_TRANSCRIPTION_TIMEOUT_SECONDS: u64 = 30;
 const MAX_TRANSCRIPTION_TIMEOUT_SECONDS: u64 = 1800;
 
@@ -107,6 +109,9 @@ enum VoiceState {
 struct Settings {
     whisper_binary_path: String,
     model_path: String,
+    fast_model_path: String,
+    model_strategy: ModelStrategy,
+    output_mode: OutputMode,
     transcription_timeout_seconds: u64,
     transcription_threads: usize,
     hotkey: String,
@@ -121,11 +126,31 @@ struct Settings {
     start_on_login: bool,
 }
 
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+enum ModelStrategy {
+    Auto,
+    #[default]
+    BaseOnly,
+}
+
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+enum OutputMode {
+    Verbatim,
+    #[default]
+    Clean,
+    Polished,
+}
+
 impl Default for Settings {
     fn default() -> Self {
         Self {
             whisper_binary_path: AUTO_PATH.to_string(),
             model_path: AUTO_PATH.to_string(),
+            fast_model_path: AUTO_PATH.to_string(),
+            model_strategy: ModelStrategy::BaseOnly,
+            output_mode: OutputMode::Clean,
             transcription_timeout_seconds: DEFAULT_TRANSCRIPTION_TIMEOUT_SECONDS,
             transcription_threads: 0,
             hotkey: "Ctrl+Alt+Space".to_string(),
@@ -506,6 +531,9 @@ fn save_settings(
     }
     if settings.model_path != previous.model_path {
         settings.model_path = validate_engine_setting(&settings.model_path, true)?;
+    }
+    if settings.fast_model_path != previous.fast_model_path {
+        settings.fast_model_path = validate_engine_setting(&settings.fast_model_path, true)?;
     }
     parse_hotkey(&settings.hotkey)?;
     let current_autostart = app.autolaunch().is_enabled().map_err(|e| e.to_string())?;
@@ -902,6 +930,7 @@ async fn stop_recording_impl(
     app: AppHandle,
     data: tauri::State<'_, AppData>,
 ) -> Result<(), String> {
+    let stop_started = Instant::now();
     let lifecycle = data.lifecycle.lock().map_err(|error| error.to_string())?;
     if data.shutdown.load(Ordering::Acquire) {
         return Err("VibeVoice is shutting down.".to_string());
@@ -954,6 +983,7 @@ async fn stop_recording_impl(
             &mut session,
             &transcription_cancel,
             &shutdown,
+            stop_started,
         );
         cleanup_recording_artifacts(&session);
         if let Err(error) = result {
@@ -1050,10 +1080,13 @@ fn finish_recording(
     session: &mut RecordingSession,
     transcription_cancel: &AtomicBool,
     shutdown: &AtomicBool,
+    stop_started: Instant,
 ) -> Result<HistoryItem, String> {
+    let preprocessing_started = Instant::now();
     stop_audio_capture(session)?;
     let audio_ms = recording_audio_duration_ms(&session.audio_path)?;
     validate_recording_audio(&session.audio_path)?;
+    let preprocessing_ms = preprocessing_started.elapsed().as_millis() as u64;
     if shutdown.load(Ordering::Acquire) {
         return Err("Recording cancelled during shutdown.".to_string());
     }
@@ -1063,17 +1096,21 @@ fn finish_recording(
         &settings,
         &session.audio_path,
         &session.output_prefix,
+        audio_ms,
         transcription_cancel,
         shutdown,
     )?;
     metrics.audio_ms = audio_ms;
     metrics.session_ms = session.started.elapsed().as_millis() as u64;
+    metrics.preprocessing_ms = preprocessing_ms;
+    let postprocess_started = Instant::now();
+    let final_transcript = prepare_transcript(&raw_transcript, &settings, &dictionary);
+    metrics.postprocess_ms = postprocess_started.elapsed().as_millis() as u64;
     app.state::<AppData>()
         .runtime
         .lock()
         .map_err(|e| e.to_string())?
-        .last_transcription_metrics = Some(metrics);
-    let final_transcript = prepare_transcript(&raw_transcript, &settings, &dictionary);
+        .last_transcription_metrics = Some(metrics.clone());
 
     if final_transcript.is_empty() {
         let message = "Whisper returned an empty transcript.".to_string();
@@ -1089,6 +1126,7 @@ fn finish_recording(
     // Cancel reports that transcription is no longer cancellable; a Cancel
     // acknowledged before this boundary prevents clipboard/paste side effects.
     claim_transcription_result(&data.transcription_cancel, transcription_cancel, shutdown)?;
+    let insertion_started = Instant::now();
     let insertion_report = coordinate_insertion(
         &app,
         &data,
@@ -1096,6 +1134,8 @@ fn finish_recording(
         settings.clipboard_fallback,
         settings.auto_paste,
     );
+    metrics.insertion_ms = insertion_started.elapsed().as_millis() as u64;
+    metrics.stop_to_insert_ms = stop_started.elapsed().as_millis() as u64;
     let action_status = insert_action_status(&insertion_report);
     let mut item = HistoryItem {
         id: Uuid::new_v4().to_string(),
@@ -1122,6 +1162,7 @@ fn finish_recording(
         .runtime
         .lock()
         .map_err(|lock_error| lock_error.to_string())?;
+    runtime.last_transcription_metrics = Some(metrics);
     runtime.voice_state = voice_state_for_insertion_report(&insertion_report);
     runtime.last_transcript = Some(final_transcript);
     runtime.last_error = insertion_report
@@ -1354,7 +1395,7 @@ async fn update_whisper_component(
     window: WebviewWindow,
 ) -> Result<String, String> {
     authorize_window(&window, &["main"])?;
-    if component != "model" && component != "engine" {
+    if component != "model" && component != "fast_model" && component != "engine" {
         return Err("Unknown Whisper component.".into());
     }
     let lease = {
@@ -1379,9 +1420,12 @@ async fn update_whisper_component(
             let root = app.path().app_local_data_dir().map_err(|e| e.to_string())?.join("whisper-components");
             let settings = load_settings(&app)?;
             let previous_model = resolve_engine_paths(&settings).ok().map(|paths| paths.model);
+            let previous_fast_model = explicit_path(&settings.fast_model_path);
             let mut staged = None;
             let updated_path = if component == "model" {
                 whisper_update::ensure_model(&root, previous_model.as_deref(), notify, cancel, shutdown)?
+            } else if component == "fast_model" {
+                whisper_update::ensure_fast_model(&root, previous_fast_model.as_deref(), notify, cancel, shutdown)?
             } else {
                 let engine = whisper_update::stage_engine(&root, notify, cancel, shutdown)?;
                 let mut command = Command::new(&engine.binary);
@@ -1398,6 +1442,7 @@ async fn update_whisper_component(
             components_idle(&*data.runtime.lock().map_err(|e| e.to_string())?)?;
             let mut settings = load_settings(&app)?;
             if component == "model" { settings.model_path = updated_path.display().to_string(); }
+            else if component == "fast_model" { settings.fast_model_path = updated_path.display().to_string(); }
             else {
                 settings.whisper_binary_path = updated_path.display().to_string();
                 if explicit_path(&settings.model_path).is_none() {
@@ -1411,6 +1456,8 @@ async fn update_whisper_component(
             if let Some(engine) = staged.as_mut() { engine.activate(); }
             Ok(if component == "model" {
                 "base.en model is verified and up to date. The verified model is active.".to_string()
+            } else if component == "fast_model" {
+                "tiny.en short-utterance model is verified. Auto mode will use it for recordings up to 5.5 seconds.".to_string()
             } else {
                 format!("Whisper {} is installed and active. Your previous engine is preserved.", whisper_update::ENGINE_VERSION)
             })
@@ -2129,11 +2176,144 @@ fn transcribe(
     settings: &Settings,
     audio_path: &Path,
     output_prefix: &Path,
+    audio_ms: u64,
     cancel: &AtomicBool,
     shutdown: &AtomicBool,
 ) -> Result<(String, TranscriptionMetrics), String> {
+    let started = Instant::now();
     let paths = resolve_engine_paths(settings)?;
-    let mut command = Command::new(paths.whisper_binary);
+    let fast_model = preferred_fast_model(settings, audio_ms);
+    let mut fast_model_fallback = false;
+    if let Some(fast_model) = fast_model {
+        fast_model_fallback = is_known_broken_fast_model(&fast_model);
+        if !fast_model_fallback {
+            match transcribe_with_model(
+                settings,
+                &paths.whisper_binary,
+                &fast_model,
+                "tiny.en",
+                audio_path,
+                output_prefix,
+                cancel,
+                shutdown,
+            ) {
+                Ok((transcript, metrics)) if !transcript.trim().is_empty() => {
+                    return Ok((transcript, metrics));
+                }
+                _ if cancel.load(Ordering::Acquire) || shutdown.load(Ordering::Acquire) => {
+                    return Err("Transcription cancelled.".into());
+                }
+                _ => {
+                    // A failed fast model must not leave a stale transcript for the base retry.
+                    let _ = fs::remove_file(output_prefix.with_extension("txt"));
+                    remember_broken_fast_model(&fast_model);
+                    fast_model_fallback = true;
+                }
+            }
+        }
+    }
+    let (transcript, mut metrics) = transcribe_with_model(
+        settings,
+        &paths.whisper_binary,
+        &paths.model,
+        &model_diagnostic_name(&paths.model),
+        audio_path,
+        output_prefix,
+        cancel,
+        shutdown,
+    )?;
+    metrics.transcription_ms = started.elapsed().as_millis() as u64;
+    metrics.fast_model_fallback = fast_model_fallback;
+    if fast_model_fallback {
+        metrics.cpu_time_ms = None;
+        metrics.average_cpu_percent = None;
+        metrics.peak_memory_mb = None;
+    }
+    Ok((transcript, metrics))
+}
+
+type FastModelFingerprint = (PathBuf, u64, Option<SystemTime>);
+static BROKEN_FAST_MODELS: OnceLock<Mutex<HashSet<FastModelFingerprint>>> = OnceLock::new();
+
+fn fast_model_fingerprint(path: &Path) -> Option<FastModelFingerprint> {
+    let metadata = fs::metadata(path).ok()?;
+    Some((path.to_path_buf(), metadata.len(), metadata.modified().ok()))
+}
+
+fn is_known_broken_fast_model(path: &Path) -> bool {
+    fast_model_fingerprint(path).is_some_and(|fingerprint| {
+        BROKEN_FAST_MODELS
+            .get_or_init(Default::default)
+            .lock()
+            .is_ok_and(|broken| broken.contains(&fingerprint))
+    })
+}
+
+fn remember_broken_fast_model(path: &Path) {
+    if let Some(fingerprint) = fast_model_fingerprint(path) {
+        if let Ok(mut broken) = BROKEN_FAST_MODELS.get_or_init(Default::default).lock() {
+            broken.insert(fingerprint);
+        }
+    }
+}
+
+fn model_diagnostic_name(path: &Path) -> String {
+    if is_managed_base_model_path(path) {
+        "base.en".into()
+    } else {
+        path.file_name()
+            .unwrap_or_default()
+            .to_string_lossy()
+            .into_owned()
+    }
+}
+
+fn preferred_fast_model(settings: &Settings, audio_ms: u64) -> Option<PathBuf> {
+    let selected_model_is_standard =
+        explicit_path(&settings.model_path).is_none_or(|path| is_managed_base_model_path(&path));
+    if settings.model_strategy != ModelStrategy::Auto
+        || !selected_model_is_standard
+        || audio_ms > FAST_MODEL_MAX_AUDIO_MS
+    {
+        return None;
+    }
+    explicit_path(&settings.fast_model_path).filter(|path| path.is_file())
+}
+
+fn is_managed_base_model_path(path: &Path) -> bool {
+    let Some(models_dir) = path.parent() else {
+        return false;
+    };
+    let Some(component_dir) = models_dir.parent() else {
+        return false;
+    };
+    path.file_name().is_some_and(|name| {
+        name.to_string_lossy() == format!("ggml-base.en-{}.bin", whisper_update::MODEL_SHA)
+    }) && models_dir
+        .file_name()
+        .is_some_and(|name| name.to_string_lossy() == "models")
+        && component_dir
+            .file_name()
+            .is_some_and(|name| name.to_string_lossy() == "whisper-components")
+}
+
+#[allow(clippy::too_many_arguments)]
+fn transcribe_with_model(
+    settings: &Settings,
+    whisper_binary: &Path,
+    model: &Path,
+    model_variant: &str,
+    audio_path: &Path,
+    output_prefix: &Path,
+    cancel: &AtomicBool,
+    shutdown: &AtomicBool,
+) -> Result<(String, TranscriptionMetrics), String> {
+    match fs::remove_file(output_prefix.with_extension("txt")) {
+        Ok(()) => {}
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+        Err(error) => return Err(format!("Could not clear previous transcript: {error}")),
+    }
+    let mut command = Command::new(whisper_binary);
     let available = thread::available_parallelism()
         .map(|n| n.get())
         .unwrap_or(1);
@@ -2145,7 +2325,7 @@ fn transcribe(
         .arg("-t")
         .arg(threads.to_string())
         .arg("-m")
-        .arg(paths.model)
+        .arg(model)
         .arg("-f")
         .arg(audio_path)
         .args(["-otxt", "-nt", "-np"])
@@ -2176,6 +2356,12 @@ fn transcribe(
             audio_ms: 0,
             transcription_ms,
             session_ms: 0,
+            preprocessing_ms: 0,
+            postprocess_ms: 0,
+            insertion_ms: 0,
+            stop_to_insert_ms: 0,
+            model_variant: model_variant.to_string(),
+            fast_model_fallback: false,
             threads,
             cpu_time_ms: usage.cpu_time_ms,
             average_cpu_percent: performance::cpu_percent(
@@ -3037,12 +3223,67 @@ fn apply_dictionary(text: &str, dictionary: &[DictionaryRule]) -> String {
 }
 
 fn prepare_transcript(raw: &str, settings: &Settings, dictionary: &[DictionaryRule]) -> String {
-    let cleaned = cleanup_transcript(raw);
+    let cleaned = match settings.output_mode {
+        OutputMode::Verbatim => raw
+            .lines()
+            .filter_map(|line| {
+                let trimmed = line.trim();
+                (!(trimmed.is_empty() || trimmed.starts_with('[') && trimmed.contains("-->")))
+                    .then_some(trimmed)
+            })
+            .collect::<Vec<_>>()
+            .join("\n"),
+        OutputMode::Clean | OutputMode::Polished => clean_transcript(raw),
+    };
+    let cleaned = if settings.output_mode == OutputMode::Polished {
+        polish_transcript(&cleaned)
+    } else {
+        cleaned
+    };
     if settings.dictionary_cleanup {
         apply_dictionary(&cleaned, dictionary)
     } else {
         cleaned
     }
+}
+
+fn clean_transcript(raw: &str) -> String {
+    cleanup_transcript(raw)
+}
+
+fn polish_transcript(text: &str) -> String {
+    let mut words = text.split_whitespace();
+    let Some(first) = words.next() else {
+        return String::new();
+    };
+    let first_is_plain_word =
+        first.chars().all(char::is_alphabetic) && !first.chars().skip(1).any(char::is_uppercase);
+    let first = if first_is_plain_word {
+        let mut characters = first.chars();
+        let initial = characters
+            .next()
+            .unwrap()
+            .to_uppercase()
+            .collect::<String>();
+        format!("{initial}{}", characters.as_str())
+    } else {
+        first.to_string()
+    };
+    let mut result = std::iter::once(first)
+        .chain(words.map(str::to_string))
+        .collect::<Vec<_>>()
+        .join(" ");
+    let last_is_plain_word = result.split_whitespace().last().is_some_and(|word| {
+        word.chars().all(char::is_alphabetic) && !word.chars().skip(1).any(char::is_uppercase)
+    });
+    if last_is_plain_word
+        && !result.ends_with('.')
+        && !result.ends_with('?')
+        && !result.ends_with('!')
+    {
+        result.push('.');
+    }
+    result
 }
 
 fn replace_case_insensitive(input: &str, needle: &str, replacement: &str) -> String {
@@ -4107,6 +4348,7 @@ mod tests {
             &settings,
             &root.join("samples/jfk.wav"),
             &prefix,
+            11000,
             &AtomicBool::new(false),
             &AtomicBool::new(false),
         )
@@ -4193,7 +4435,8 @@ mod tests {
         };
         let prefix =
             std::env::temp_dir().join(format!("vibevoice-updater-live-{}", Uuid::new_v4()));
-        let (text, metrics) = transcribe(&settings, &sample, &prefix, &cancel, &shutdown).unwrap();
+        let (text, metrics) =
+            transcribe(&settings, &sample, &prefix, 11000, &cancel, &shutdown).unwrap();
         assert!(text.contains("country"));
         fs::remove_file(prefix.with_extension("txt")).unwrap();
         let receipt_path =
@@ -4325,6 +4568,231 @@ mod tests {
             prepare_transcript("github actions", &settings, &rules),
             "github actions"
         );
+    }
+
+    #[test]
+    fn fast_model_selection_is_bounded_and_respects_custom_models() {
+        let root = std::env::temp_dir().join(format!("vv-fast-model-{}", Uuid::new_v4()));
+        fs::create_dir_all(&root).unwrap();
+        let fast_model = root.join("tiny.en.bin");
+        fs::write(&fast_model, b"model fixture").unwrap();
+        let mut settings = Settings {
+            fast_model_path: fast_model.display().to_string(),
+            model_strategy: ModelStrategy::Auto,
+            ..Settings::default()
+        };
+        assert_eq!(
+            preferred_fast_model(&settings, 5_500),
+            Some(fast_model.clone())
+        );
+        assert_eq!(preferred_fast_model(&settings, 5_501), None);
+        settings.model_strategy = ModelStrategy::BaseOnly;
+        assert_eq!(preferred_fast_model(&settings, 2_000), None);
+        settings.model_strategy = ModelStrategy::Auto;
+        settings.model_path = root
+            .join("whisper-components/models")
+            .join(format!("ggml-base.en-{}.bin", whisper_update::MODEL_SHA))
+            .display()
+            .to_string();
+        assert_eq!(
+            preferred_fast_model(&settings, 2_000),
+            Some(fast_model.clone())
+        );
+        settings.model_path = root.join("custom-model.bin").display().to_string();
+        assert_eq!(preferred_fast_model(&settings, 2_000), None);
+        settings.model_path = AUTO_PATH.into();
+        fs::remove_file(&fast_model).unwrap();
+        assert_eq!(preferred_fast_model(&settings, 2_000), None);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn failed_short_model_retries_base_and_discards_stale_output() {
+        let root = std::env::temp_dir().join(format!("vv-fast-fallback-{}", Uuid::new_v4()));
+        fs::create_dir_all(root.join("whisper-components/models")).unwrap();
+        let base = root
+            .join("whisper-components/models")
+            .join(format!("ggml-base.en-{}.bin", whisper_update::MODEL_SHA));
+        let fast = root.join("tiny.en.bin");
+        let audio = root.join("audio.wav");
+        let engine = root.join("whisper-cli");
+        let prefix = root.join("result");
+        fs::write(&base, b"base model fixture").unwrap();
+        fs::write(&fast, b"tiny model fixture").unwrap();
+        fs::write(&audio, b"test audio").unwrap();
+        fs::write(
+            &engine,
+            format!("#!/bin/sh\nmodel=\nprefix=\nwhile [ $# -gt 0 ]; do\n  case \"$1\" in\n    -m) model=$2; shift 2 ;;\n    -of) prefix=$2; shift 2 ;;\n    *) shift ;;\n  esac\ndone\ncase \"$model\" in *tiny.en.bin) printf 'tiny\\n' >> '{}' ; sleep 0.1; exit 7 ;; esac\nsleep 0.1\nprintf 'base transcript' > \"$prefix.txt\"\n", root.join("calls").display()),
+        )
+        .unwrap();
+        fs::set_permissions(&engine, fs::Permissions::from_mode(0o755)).unwrap();
+        fs::write(prefix.with_extension("txt"), "stale transcript").unwrap();
+        let settings = Settings {
+            whisper_binary_path: engine.display().to_string(),
+            model_path: base.display().to_string(),
+            fast_model_path: fast.display().to_string(),
+            model_strategy: ModelStrategy::Auto,
+            ..Settings::default()
+        };
+        let (transcript, metrics) = transcribe(
+            &settings,
+            &audio,
+            &prefix,
+            2_000,
+            &AtomicBool::new(false),
+            &AtomicBool::new(false),
+        )
+        .unwrap();
+        assert_eq!(transcript, "base transcript");
+        assert_eq!(metrics.model_variant, "base.en");
+        assert!(metrics.fast_model_fallback);
+        assert!(
+            metrics.transcription_ms >= 180,
+            "failed tiny time was excluded: {} ms",
+            metrics.transcription_ms
+        );
+        assert_eq!(
+            fs::read_to_string(root.join("calls"))
+                .unwrap()
+                .lines()
+                .count(),
+            1
+        );
+        let (_, metrics) = transcribe(
+            &settings,
+            &audio,
+            &prefix,
+            2_000,
+            &AtomicBool::new(false),
+            &AtomicBool::new(false),
+        )
+        .unwrap();
+        assert!(metrics.fast_model_fallback);
+        assert_eq!(
+            fs::read_to_string(root.join("calls"))
+                .unwrap()
+                .lines()
+                .count(),
+            1
+        );
+        fs::write(&fast, b"replaced tiny model fixture").unwrap();
+        let (_, metrics) = transcribe(
+            &settings,
+            &audio,
+            &prefix,
+            2_000,
+            &AtomicBool::new(false),
+            &AtomicBool::new(false),
+        )
+        .unwrap();
+        assert!(metrics.fast_model_fallback);
+        assert_eq!(
+            fs::read_to_string(root.join("calls"))
+                .unwrap()
+                .lines()
+                .count(),
+            2
+        );
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn output_modes_preserve_identifiers_and_apply_dictionary_after_cleanup() {
+        let mut settings = Settings::default();
+        assert_eq!(settings.output_mode, OutputMode::Clean);
+        let dictionary = vec![DictionaryRule {
+            id: "1".into(),
+            spoken: "postgresql".into(),
+            replacement: "PostgreSQL".into(),
+            enabled: true,
+        }];
+        settings.output_mode = OutputMode::Verbatim;
+        assert_eq!(
+            prepare_transcript(
+                "um, I useEffect\n  \n[00:01.0 --> 00:02.0] discarded\n  ",
+                &settings,
+                &[]
+            ),
+            "um, I useEffect"
+        );
+        settings.output_mode = OutputMode::Clean;
+        assert_eq!(
+            prepare_transcript(
+                "I, um, useEffect, uh, with postgresql",
+                &settings,
+                &dictionary
+            ),
+            "I, um, useEffect, uh, with PostgreSQL"
+        );
+        assert_eq!(
+            prepare_transcript("Um, Ubuntu is our product.", &settings, &[]),
+            "Um, Ubuntu is our product."
+        );
+        settings.output_mode = OutputMode::Polished;
+        assert_eq!(
+            prepare_transcript("hello useEffect 42", &settings, &[]),
+            "Hello useEffect 42"
+        );
+        assert_eq!(
+            prepare_transcript("hello world", &settings, &[]),
+            "Hello world."
+        );
+    }
+
+    #[test]
+    fn model_diagnostics_use_custom_model_filename() {
+        assert_eq!(
+            model_diagnostic_name(Path::new("/models/my-finetuned-whisper.bin")),
+            "my-finetuned-whisper.bin"
+        );
+        assert_eq!(
+            model_diagnostic_name(Path::new(&format!(
+                "/whisper-components/models/ggml-base.en-{}.bin",
+                whisper_update::MODEL_SHA
+            ))),
+            "base.en"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn transcription_metrics_identify_the_custom_model_actually_used() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let root = std::env::temp_dir().join(format!("vv-custom-model-{}", Uuid::new_v4()));
+        fs::create_dir_all(&root).unwrap();
+        let model = root.join("my-finetuned-whisper.bin");
+        let engine = root.join("whisper-cli");
+        let audio = root.join("audio.wav");
+        fs::write(&model, b"custom model fixture").unwrap();
+        fs::write(&audio, b"test audio").unwrap();
+        fs::write(
+            &engine,
+            "#!/bin/sh\nmodel=\nprefix=\nwhile [ $# -gt 0 ]; do\n  case \"$1\" in\n    -m) model=$2; shift 2 ;;\n    -of) prefix=$2; shift 2 ;;\n    *) shift ;;\n  esac\ndone\ntest -f \"$model\" || exit 8\nprintf 'custom transcript' > \"$prefix.txt\"\n",
+        )
+        .unwrap();
+        fs::set_permissions(&engine, fs::Permissions::from_mode(0o755)).unwrap();
+        let settings = Settings {
+            whisper_binary_path: engine.display().to_string(),
+            model_path: model.display().to_string(),
+            ..Settings::default()
+        };
+
+        let (transcript, metrics) = transcribe(
+            &settings,
+            &audio,
+            &root.join("result"),
+            10_000,
+            &AtomicBool::new(false),
+            &AtomicBool::new(false),
+        )
+        .unwrap();
+
+        assert_eq!(transcript, "custom transcript");
+        assert_eq!(metrics.model_variant, "my-finetuned-whisper.bin");
+        assert!(!metrics.fast_model_fallback);
+        fs::remove_dir_all(root).unwrap();
     }
 
     #[test]
@@ -4677,6 +5145,9 @@ mod tests {
             settings.transcription_timeout_seconds,
             DEFAULT_TRANSCRIPTION_TIMEOUT_SECONDS
         );
+        assert_eq!(settings.fast_model_path, AUTO_PATH);
+        assert_eq!(settings.model_strategy, ModelStrategy::BaseOnly);
+        assert_eq!(settings.output_mode, OutputMode::Clean);
     }
 
     #[test]

@@ -5,7 +5,7 @@ export function WhisperUpdatePanel({ state, progress, pending, onUpdate, onCance
   state: AppState;
   progress: WhisperProgress | null;
   pending: boolean;
-  onUpdate: (component: "engine" | "model") => void;
+  onUpdate: (component: "engine" | "model" | "fast_model") => void;
   onCancel: () => void;
 }) {
   const catalog = state.whisper_update;
@@ -16,13 +16,16 @@ export function WhisperUpdatePanel({ state, progress, pending, onUpdate, onCance
     <article className="detail-block whisper-components">
       <div className="block-head"><span>Whisper components</span><ShieldCheck size={16} /></div>
       <p>Recommended engine: {catalog ? `Whisper ${catalog.engine_version}` : "Open the desktop app"}. Default model: {catalog?.model_name ?? "base.en"}.</p>
-      <p>Update the engine separately from the model. Model verification repairs or selects the default English model; valid weights need no download.</p>
+      <p>Update the engine separately from the models. The optional {catalog?.fast_model_name ?? "tiny.en"} model is about {Math.round((catalog?.fast_model_bytes ?? 77_704_715) / 1_000_000)} MB and is downloaded only when requested.</p>
       <div className="action-row">
         <button type="button" className="secondary-action" disabled={disabled || !catalog?.engine_supported} onClick={() => onUpdate("engine")}>
           <Download size={16} /><span>Update Whisper engine</span>
         </button>
         <button type="button" className="secondary-action" disabled={disabled} onClick={() => onUpdate("model")}>
           <ShieldCheck size={16} /><span>Verify / repair model</span>
+        </button>
+        <button type="button" className="secondary-action" disabled={disabled} onClick={() => onUpdate("fast_model")}>
+          <Download size={16} /><span>{state.settings.fast_model_path === "auto" ? "Install short model" : "Verify short model"}</span>
         </button>
         {busy && <button type="button" className="secondary-action" onClick={onCancel}>Cancel update</button>}
       </div>

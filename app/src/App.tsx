@@ -258,7 +258,7 @@ function App() {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [inTauri]);
 
-  async function handleWhisperUpdate(component: "engine" | "model") {
+  async function handleWhisperUpdate(component: "engine" | "model" | "fast_model") {
     if (!inTauri || whisperPending) return;
     setWhisperPending(true);
     setWhisperProgress({ component, stage: "checking", downloaded_bytes: 0, total_bytes: 0, message: "Checking Whisper components…" });
