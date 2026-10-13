@@ -15,7 +15,7 @@ Return to **Base model only** to immediately restore the previous inference beha
 ## Output modes
 
 - **Verbatim** removes Whisper timestamp rows and blank rows, while retaining the remaining line breaks and words.
-- **Clean** collapses whitespace and removes standalone `um`, `uh`, `erm`, and `uhm` fillers. It preserves mixed-case identifiers such as `useEffect`.
+- **Clean** removes Whisper timestamp rows, trims and collapses whitespace, and preserves spoken words, including `um`, `uh`, `erm`, and `uhm`. It preserves mixed-case identifiers such as `useEffect`.
 - **Polished** applies Clean, uppercases a plain first word, and adds a final period only when the final token is a plain alphabetic word. It avoids changing numbers, paths, and mixed-case identifiers.
 
 Enabled dictionary rules run after the selected mode. No LLM, cloud formatter, or network request is used.
@@ -53,9 +53,9 @@ The production path does not emit partial transcript text. Whisper CLI has no st
 
 ## Diagnostics, troubleshooting, rollback
 
-Diagnostics records transcription wall time, preprocessing, cleanup, insertion, stop-to-insert, model variant, thread count, child CPU time, and peak memory when the platform exposes it. The in-app stop-to-insert counters have not been measured on a physical microphone/target-app run in this change; the benchmark table excludes capture and insertion.
+Diagnostics records transcription wall time (including a failed tiny attempt before base fallback), whether tiny fallback occurred, preprocessing, cleanup, insertion, stop-to-insert, the model actually used, thread count, child CPU time, and peak memory when the platform exposes it. A tiny model that fails is skipped for the rest of the app process; replacing its file or restarting after repair lets Auto retry it. The in-app stop-to-insert counters have not been measured on a physical microphone/target-app run in this change; the benchmark table excludes capture and insertion.
 
-- If the short model cannot load, keep **Auto** selected; the request falls back to base. Check Diagnostics for the model variant and error.
+- If the short model cannot load, the request falls back to the configured base model. Check Diagnostics for the fallback warning and the model actually used.
 - If the download fails for space, network, checksum, or cancellation, the old model and configured settings remain active. Retry with enough free disk space.
 - To roll back, switch to **Base model only**. The installed optional file remains unused and can be removed manually after closing VibeVoice.
 - If an existing installation has a custom model, Auto keeps that model selected. If model selection behaves unexpectedly, choose Base model only and verify the Model path in Settings.

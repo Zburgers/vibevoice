@@ -4700,6 +4700,7 @@ mod tests {
     #[test]
     fn output_modes_preserve_identifiers_and_apply_dictionary_after_cleanup() {
         let mut settings = Settings::default();
+        assert_eq!(settings.output_mode, OutputMode::Clean);
         let dictionary = vec![DictionaryRule {
             id: "1".into(),
             spoken: "postgresql".into(),
@@ -4745,6 +4746,53 @@ mod tests {
             model_diagnostic_name(Path::new("/models/my-finetuned-whisper.bin")),
             "my-finetuned-whisper.bin"
         );
+        assert_eq!(
+            model_diagnostic_name(Path::new(&format!(
+                "/whisper-components/models/ggml-base.en-{}.bin",
+                whisper_update::MODEL_SHA
+            ))),
+            "base.en"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn transcription_metrics_identify_the_custom_model_actually_used() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let root = std::env::temp_dir().join(format!("vv-custom-model-{}", Uuid::new_v4()));
+        fs::create_dir_all(&root).unwrap();
+        let model = root.join("my-finetuned-whisper.bin");
+        let engine = root.join("whisper-cli");
+        let audio = root.join("audio.wav");
+        fs::write(&model, b"custom model fixture").unwrap();
+        fs::write(&audio, b"test audio").unwrap();
+        fs::write(
+            &engine,
+            "#!/bin/sh\nmodel=\nprefix=\nwhile [ $# -gt 0 ]; do\n  case \"$1\" in\n    -m) model=$2; shift 2 ;;\n    -of) prefix=$2; shift 2 ;;\n    *) shift ;;\n  esac\ndone\ntest -f \"$model\" || exit 8\nprintf 'custom transcript' > \"$prefix.txt\"\n",
+        )
+        .unwrap();
+        fs::set_permissions(&engine, fs::Permissions::from_mode(0o755)).unwrap();
+        let settings = Settings {
+            whisper_binary_path: engine.display().to_string(),
+            model_path: model.display().to_string(),
+            ..Settings::default()
+        };
+
+        let (transcript, metrics) = transcribe(
+            &settings,
+            &audio,
+            &root.join("result"),
+            10_000,
+            &AtomicBool::new(false),
+            &AtomicBool::new(false),
+        )
+        .unwrap();
+
+        assert_eq!(transcript, "custom transcript");
+        assert_eq!(metrics.model_variant, "my-finetuned-whisper.bin");
+        assert!(!metrics.fast_model_fallback);
+        fs::remove_dir_all(root).unwrap();
     }
 
     #[test]

@@ -245,7 +245,7 @@ export function SettingsView({
             <option value="auto">Auto — faster model up to 5.5 seconds</option>
             <option value="base_only">Base model only</option>
           </select>
-          <small>Auto uses the optional tiny.en model for short recordings. If it fails, base.en is used for this session; replace the tiny model or restart after repair to retry.</small>
+          <small>Auto uses the optional tiny.en model for short recordings. If it fails, the configured base model is used for this session; replace the tiny model or restart after repair to retry.</small>
         </label>
         <label className="field">
           <span>Output mode</span>

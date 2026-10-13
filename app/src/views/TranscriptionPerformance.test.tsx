@@ -29,7 +29,7 @@ describe("transcription performance controls", () => {
     render(<DiagnosticsView state={{ ...fallbackState, last_transcription_metrics: {
       audio_ms: 11000, transcription_ms: 4000, session_ms: 15000, threads: 4,
       preprocessing_ms: 12, postprocess_ms: 2, insertion_ms: 25, stop_to_insert_ms: 4040,
-      model_variant: "base.en", fast_model_fallback: true,
+      model_variant: "my-finetuned-whisper.bin", fast_model_fallback: true,
       cpu_time_ms: null, average_cpu_percent: null, peak_memory_mb: null,
     } }} updateStatus={{ state: "idle", latestVersion: null, releaseUrl: "", message: "", canInstall: false }}
       setupMessage="" commandStatus="Idle" onRefresh={vi.fn()} onCheckUpdates={vi.fn()}
@@ -38,7 +38,7 @@ describe("transcription performance controls", () => {
     expect(screen.getByText("4.00 s (4 threads)")).toBeInTheDocument();
     expect(screen.getAllByText("Unavailable after fallback")).toHaveLength(3);
     expect(screen.getByText("4.04 s")).toBeInTheDocument();
-    expect(screen.getByText("base.en")).toBeInTheDocument();
-    expect(screen.getByText("Failed; using base.en. Replace the tiny model or restart after repair to retry.")).toBeInTheDocument();
+    expect(screen.getByText("my-finetuned-whisper.bin")).toBeInTheDocument();
+    expect(screen.getByText("tiny.en failed; using my-finetuned-whisper.bin. Replace the tiny model or restart after repair to retry.")).toBeInTheDocument();
   });
 });
